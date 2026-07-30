@@ -33,15 +33,15 @@ def show_all_members():
 
 
 def search_member():
-    query = input("\nВведите ID, username или игровой ник для поиска: ").strip().lstrip("@")
+    query = input("\nВведите ID, username, игровой ник или тег для поиска: ").strip().lstrip("@")
     conn = get_connection()
     if not conn: return
     cursor = conn.cursor()
     cursor.execute("""
-        SELECT user_id, username, game_nick, role, clan 
+        SELECT user_id, username, game_nick, role, clan, player_tag 
         FROM members 
-        WHERE user_id LIKE ? OR username LIKE ? OR game_nick LIKE ?
-    """, (f"%{query}%", f"%{query}%", f"%{query}%"))
+        WHERE user_id LIKE ? OR username LIKE ? OR game_nick LIKE ? OR player_tag LIKE ?
+    """, (f"%{query}%", f"%{query}%", f"%{query}%", f"%{query}%"))
     rows = cursor.fetchall()
     conn.close()
 
@@ -51,8 +51,13 @@ def search_member():
 
     print("\nРезультаты поиска:")
     for r in rows:
-        print(f"ID: {r[0]} | Tag: @{r[1]} | Nick: {r[2]} | Role: {r[3]} | Clan: {r[4]}")
-
+        uid = str(r[0]) if r[0] else "N/A"
+        uname = f"@{r[1]}" if r[1] else "NONE"
+        gnick = r[2] if r[2] else "N/A"
+        role = r[3] if r[3] else "N/A"
+        clan = r[4] if r[4] else "N/A"
+        ptag = r[5] if r[5] else "N/A"
+        print(f"ID: {uid} | Tag: {uname} | Nick: {gnick} | Role: {role} | Clan: {clan} | BS Tag: {ptag}")
 
 def add_member():
     print("\n➕ ДОБАВЛЕНИЕ НОВОГО УЧАСТНИКА")
