@@ -153,7 +153,6 @@ async def main():
     dp.include_router(clan_list_router)
     dp.include_router(admin_main_router)
     dp.include_router(change_name_router)
-    dp.include_router(admin_router)
 
     # ─── НАСТРОЙКА ПЛАНИРОВЩИКА ЗАДАЧ (APScheduler) ───────────────────────────
     scheduler = AsyncIOScheduler()
