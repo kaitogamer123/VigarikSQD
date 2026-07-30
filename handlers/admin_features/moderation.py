@@ -1,17 +1,19 @@
 """ Модуль модерации: управление ролями администрации и синхронизация с admins.txt """
 import logging
 import os
-from aiogram import Router, F, Bot
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+
+from aiogram import Bot, F, Router
 from aiogram.fsm.context import FSMContext
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from aiogram.utils.markdown import html_decoration as hd
 
-from database import get_member, upsert_member, get_all_members
-from utils.permissions import can_appoint_admins
-from utils.keyboards import appoint_role_keyboard, admin_panel_keyboard
 import config
-from .base import AdminStates
+from database import get_all_members, get_member, upsert_member
+from utils.keyboards import admin_panel_keyboard, appoint_role_keyboard
+from utils.permissions import can_appoint_admins
+from utils.username_monitor import check_and_update_usernames
 
+from .base import AdminStates
 logger = logging.getLogger(__name__)
 router = Router()
 
@@ -355,3 +357,13 @@ async def appoint_cancel(call: CallbackQuery):
     except Exception:
         pass
     await call.answer()
+
+# Используй тот router, который объявлен в этом файле (например, router = Router())
+@router.message(F.text == "🔄 Проверить юзернеймы")
+async def cmd_check_usernames(message: Message, bot):
+    await message.answer("🔄 Запускаю ручную проверку юзернеймов...")
+
+    # Вызываем ту же функцию, что и в планировщике
+    await check_and_update_usernames(bot)
+
+    await message.answer("✅ Проверка юзернеймов успешно завершена!")
