@@ -1,14 +1,44 @@
 import sqlite3
 import os
+import asyncio
+import aiohttp
 
 DB_PATH = "vigarik.db"
-
 
 def get_connection():
     if not os.path.exists(DB_PATH):
         print(f"❌ Файл базы данных '{DB_PATH}' не найден!")
         return None
     return sqlite3.connect(DB_PATH)
+
+
+async def fetch_player_from_api(player_tag: str):
+    """Асинхронно забирает ник и кубки из официального API Brawl Stars."""
+    clean_tag = player_tag.strip().upper().replace("#", "")
+    # Берем токен из config.py, если он там есть
+    try:
+        from config import BS_API_TOKEN
+        headers = {"Authorization": f"Bearer {BS_API_TOKEN}"}
+    except ImportError:
+        headers = {}
+
+    url = f"https://api.brawlstars.com/v1/players/%23{clean_tag}"
+    
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.get(url, headers=headers, timeout=10) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    return {
+                        "name": data.get("name"),
+                        "trophies": data.get("trophies", 0),
+                        "tag": f"#{clean_tag}"
+                    }
+                else:
+                    print(f"⚠️ Ошибка API Brawl Stars: статус {response.status}")
+        except Exception as e:
+            print(f"⚠️ Не удалось подключиться к API: {e}")
+    return None
 
 
 def show_all_members():
@@ -62,27 +92,42 @@ def search_member():
         reg = str(r[6]) if r[6] is not None else "0"
         print(f"ID: {uid} | Tag: {uname} | Nick: {gnick} | Role: {role} | Clan: {clan} | BS Tag: {ptag} | Reg: {reg}")
 
+
 def add_member():
-    print("\n➕ ДОБАВЛЕНИЕ НОВОГО УЧАСТНИКА")
+    print("\n➕ ДОБАВЛЕНИЕ НОВОГО УЧАСТНИКА ПО ТЕГУ ИЗ API")
     user_id = input("Введите Telegram user_id: ").strip()
     username = input("Введите Telegram username (без @, можно пропустить): ").strip().lstrip("@")
-    game_nick = input("Введите игровой ник: ").strip()
-    player_tag = input("Введите тег Brawl Stars (например, #9VJGR8VV8V): ").strip().upper()
+    player_tag = input("Введите тег Brawl Stars (например, #9VJGR8VV8V): ").strip()
     role = input("Введите роль (например, member / president / helper): ").strip() or "member"
     clan = input("Введите название клана (например, squad / academy): ").strip()
     reg_input = input("Статус регистрации (1 - активен в списках, 0 - нет) [по умолчанию 1]: ").strip()
     registered = int(reg_input) if reg_input in ("0", "1") else 1
+
+    print("⏳ Запрашиваем данные игрока из Brawl Stars API...")
+    api_data = asyncio.run(fetch_player_from_api(player_tag))
+
+    if api_data:
+        game_nick = api_data["name"]
+        trophies = api_data["trophies"]
+        clean_tag = api_data["tag"]
+        print(f"✅ Найдено в API! Ник: {game_nick} | Кубки: {trophies}")
+    else:
+        print("⚠️ Не удалось получить данные из API (тег введен верно?). Записываем без авто-ника.")
+        game_nick = "Игрок"
+        trophies = 0
+        clean_tag = player_tag.upper()
 
     conn = get_connection()
     if not conn: return
     cursor = conn.cursor()
     try:
         cursor.execute("""
-            INSERT OR REPLACE INTO members (user_id, username, game_nick, player_tag, role, clan, registered, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
-        """, (user_id, username if username else None, game_nick, player_tag, role, clan, registered))
+            INSERT OR REPLACE INTO members 
+            (user_id, username, game_nick, player_tag, trophies, role, clan, registered, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+        """, (user_id, username if username else None, game_nick, clean_tag, trophies, role, clan, registered))
         conn.commit()
-        print(f"✅ Участник {game_nick} (ID: {user_id}) успешно добавлен/обновлен в базе!")
+        print(f"✅ Участник {game_nick} (ID: {user_id}) успешно сохранен в базе с актуальным ником и кубками!")
     except Exception as e:
         print(f"❌ Ошибка при добавлении: {e}")
     conn.close()
@@ -94,18 +139,18 @@ def update_member_field():
     print("\nКакое поле изменить?")
     print("1. username (Телеграм юзернейм)")
     print("2. game_nick (Игровой ник)")
-    print("3. player_tag (Тег Brawl Stars)")
+    print("3. player_tag (Тег Brawl Stars - подтянет ник и кубки из API)")
     print("4. role (Роль)")
     print("5. clan (Клан)")
     print("6. registered (Статус верификации: 1 или 0)")
 
     field_choice = input("Выбор (1-6): ").strip()
     fields_map = {
-        "1": "username",
-        "2": "game_nick",
-        "3": "player_tag",
-        "4": "role",
-        "5": "clan",
+        "1": "username", 
+        "2": "game_nick", 
+        "3": "player_tag", 
+        "4": "role", 
+        "5": "clan", 
         "6": "registered"
     }
 
@@ -118,20 +163,36 @@ def update_member_field():
 
     if field_name == "username":
         new_value = new_value.lstrip("@") if new_value else None
-    elif field_name == "player_tag":
-        new_value = new_value.upper()
     elif field_name == "registered":
         new_value = int(new_value) if new_value in ("0", "1") else 1
 
     conn = get_connection()
     if not conn: return
     cursor = conn.cursor()
-    cursor.execute(f"UPDATE members SET {field_name} = ?, updated_at = datetime('now') WHERE user_id = ?",
-                   (new_value, user_id))
-    conn.commit()
 
+    # Особенность: если меняем тег через пункт 3, автоматически обновляем и ник с кубками из API!
+    if field_name == "player_tag":
+        clean_tag = new_value.upper()
+        print("⏳ Запрашиваем новые данные из Brawl Stars API...")
+        api_data = asyncio.run(fetch_player_from_api(clean_tag))
+        
+        if api_data:
+            cursor.execute("""
+                UPDATE members 
+                SET player_tag = ?, game_nick = ?, trophies = ?, updated_at = datetime('now') 
+                WHERE user_id = ?
+            """, (api_data["tag"], api_data["name"], api_data["trophies"], user_id))
+            print(f"✅ Тег обновлен, а ник автоматически сменен на '{api_data['name']}' ({api_data['trophies']} кубков)!")
+        else:
+            cursor.execute("UPDATE members SET player_tag = ?, updated_at = datetime('now') WHERE user_id = ?", (clean_tag, user_id))
+            print("⚠️ Тег обновлен, но из API данные не подтянулись.")
+    else:
+        cursor.execute(f"UPDATE members SET {field_name} = ?, updated_at = datetime('now') WHERE user_id = ?",
+                       (new_value, user_id))
+
+    conn.commit()
     if cursor.rowcount > 0:
-        print(f"✅ Поле '{field_name}' для ID {user_id} успешно обновлено на '{new_value}'!")
+        print(f"✅ Данные для ID {user_id} успешно обновлены!")
     else:
         print(f"❌ Игрок с ID {user_id} не найден.")
     conn.close()
@@ -163,7 +224,7 @@ def main():
         print("\n🛠️ МИНИ-ПАНЕЛЬ БАЗЫ ДАННЫХ VIGARIK")
         print("1. 📋 Показать всех участников")
         print("2. 🔍 Найти игрока (по ID/тегу/нику)")
-        print("3. ➕ Добавить нового участника вручную")
+        print("3. ➕ Добавить нового участника по тегу (авто-ник из API)")
         print("4. ✏️ Изменить данные игрока")
         print("5. ❌ Удалить игрока из базы")
         print("0. 🚪 Выход из панели")
