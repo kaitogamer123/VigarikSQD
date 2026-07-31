@@ -15,33 +15,35 @@ def show_all_members():
     conn = get_connection()
     if not conn: return
     cursor = conn.cursor()
-    cursor.execute("SELECT user_id, username, game_nick, role, clan FROM members")
+    cursor.execute("SELECT user_id, username, game_nick, role, clan, player_tag, registered FROM members")
     rows = cursor.fetchall()
     conn.close()
 
-    print("\n" + "=" * 80)
-    print(f"{'ID':<12} | {'USERNAME':<18} | {'GAME NICK':<18} | {'ROLE':<10} | {'CLAN'}")
-    print("=" * 80)
+    print("\n" + "=" * 105)
+    print(f"{'ID':<12} | {'USERNAME':<16} | {'GAME NICK':<16} | {'ROLE':<10} | {'CLAN':<10} | {'TAG':<12} | {'REG'}")
+    print("=" * 105)
     for r in rows:
         uid = str(r[0]) if r[0] else "N/A"
         uname = f"@{r[1]}" if r[1] else "NONE"
         gnick = r[2] if r[2] else "N/A"
         role = r[3] if r[3] else "N/A"
         clan = r[4] if r[4] else "N/A"
-        print(f"{uid:<12} | {uname:<18} | {gnick:<18} | {role:<10} | {clan}")
-    print("=" * 80)
+        ptag = r[5] if r[5] else "N/A"
+        reg = str(r[6]) if r[6] is not None else "0"
+        print(f"{uid:<12} | {uname:<16} | {gnick:<16} | {role:<10} | {clan:<10} | {ptag:<12} | {reg}")
+    print("=" * 105)
 
 
 def search_member():
-    query = input("\nВведите ID, username или игровой ник для поиска: ").strip().lstrip("@")
+    query = input("\nВведите ID, username, игровой ник или тег для поиска: ").strip().lstrip("@")
     conn = get_connection()
     if not conn: return
     cursor = conn.cursor()
     cursor.execute("""
-        SELECT user_id, username, game_nick, role, clan 
+        SELECT user_id, username, game_nick, role, clan, player_tag, registered 
         FROM members 
-        WHERE user_id LIKE ? OR username LIKE ? OR game_nick LIKE ?
-    """, (f"%{query}%", f"%{query}%", f"%{query}%"))
+        WHERE user_id LIKE ? OR username LIKE ? OR game_nick LIKE ? OR player_tag LIKE ?
+    """, (f"%{query}%", f"%{query}%", f"%{query}%", f"%{query}%"))
     rows = cursor.fetchall()
     conn.close()
 
@@ -51,25 +53,34 @@ def search_member():
 
     print("\nРезультаты поиска:")
     for r in rows:
-        print(f"ID: {r[0]} | Tag: @{r[1]} | Nick: {r[2]} | Role: {r[3]} | Clan: {r[4]}")
-
+        uid = str(r[0]) if r[0] else "N/A"
+        uname = f"@{r[1]}" if r[1] else "NONE"
+        gnick = r[2] if r[2] else "N/A"
+        role = r[3] if r[3] else "N/A"
+        clan = r[4] if r[4] else "N/A"
+        ptag = r[5] if r[5] else "N/A"
+        reg = str(r[6]) if r[6] is not None else "0"
+        print(f"ID: {uid} | Tag: {uname} | Nick: {gnick} | Role: {role} | Clan: {clan} | BS Tag: {ptag} | Reg: {reg}")
 
 def add_member():
     print("\n➕ ДОБАВЛЕНИЕ НОВОГО УЧАСТНИКА")
     user_id = input("Введите Telegram user_id: ").strip()
     username = input("Введите Telegram username (без @, можно пропустить): ").strip().lstrip("@")
     game_nick = input("Введите игровой ник: ").strip()
-    role = input("Введите роль (например, member / president / mod): ").strip() or "member"
-    clan = input("Введите название клана: ").strip()
+    player_tag = input("Введите тег Brawl Stars (например, #9VJGR8VV8V): ").strip().upper()
+    role = input("Введите роль (например, member / president / helper): ").strip() or "member"
+    clan = input("Введите название клана (например, squad / academy): ").strip()
+    reg_input = input("Статус регистрации (1 - активен в списках, 0 - нет) [по умолчанию 1]: ").strip()
+    registered = int(reg_input) if reg_input in ("0", "1") else 1
 
     conn = get_connection()
     if not conn: return
     cursor = conn.cursor()
     try:
         cursor.execute("""
-            INSERT OR REPLACE INTO members (user_id, username, game_nick, role, clan, updated_at)
-            VALUES (?, ?, ?, ?, ?, datetime('now'))
-        """, (user_id, username if username else None, game_nick, role, clan))
+            INSERT OR REPLACE INTO members (user_id, username, game_nick, player_tag, role, clan, registered, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+        """, (user_id, username if username else None, game_nick, player_tag, role, clan, registered))
         conn.commit()
         print(f"✅ Участник {game_nick} (ID: {user_id}) успешно добавлен/обновлен в базе!")
     except Exception as e:
@@ -81,13 +92,22 @@ def update_member_field():
     user_id = input("\nВведите user_id игрока, которого хотите изменить: ").strip()
 
     print("\nКакое поле изменить?")
-    print("1. username (Тег)")
+    print("1. username (Телеграм юзернейм)")
     print("2. game_nick (Игровой ник)")
-    print("3. role (Роль: member / president / mod)")
-    print("4. clan (Клан)")
+    print("3. player_tag (Тег Brawl Stars)")
+    print("4. role (Роль)")
+    print("5. clan (Клан)")
+    print("6. registered (Статус верификации: 1 или 0)")
 
-    field_choice = input("Выбор (1-4): ").strip()
-    fields_map = {"1": "username", "2": "game_nick", "3": "role", "4": "clan"}
+    field_choice = input("Выбор (1-6): ").strip()
+    fields_map = {
+        "1": "username",
+        "2": "game_nick",
+        "3": "player_tag",
+        "4": "role",
+        "5": "clan",
+        "6": "registered"
+    }
 
     if field_choice not in fields_map:
         print("❌ Неверный выбор поля.")
@@ -98,6 +118,10 @@ def update_member_field():
 
     if field_name == "username":
         new_value = new_value.lstrip("@") if new_value else None
+    elif field_name == "player_tag":
+        new_value = new_value.upper()
+    elif field_name == "registered":
+        new_value = int(new_value) if new_value in ("0", "1") else 1
 
     conn = get_connection()
     if not conn: return
