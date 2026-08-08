@@ -835,3 +835,111 @@ async def view_league_invites(message: Message, state: FSMContext):
     builder.adjust(1)
 
     await message.answer("📥 Список полученных приглашений в лиги:", reply_markup=builder.as_markup())
+
+
+@router.callback_query(F.data.startswith("league:invite_view:"))
+async def view_invite_details(callback: CallbackQuery, state: FSMContext):
+    invite_id = int(callback.data.split(":")[-1])
+    conn = get_db()
+    cursor = conn.cursor()
+
+    invite = cursor.execute("""
+        SELECT i.*, l.name as league_name, l.tag as league_tag 
+        FROM league_invites i
+        JOIN leagues l ON i.league_id = l.id
+        WHERE i.id = ?
+    """, (invite_id,)).fetchone()
+    conn.close()
+
+    if not invite:
+        await callback.answer("Приглашение не найдено или уже неактуально.", show_alert=True)
+        return
+
+    text = f"📥 Приглашение в лигу <b>{invite['league_name']} [{invite['league_tag']}]</b>\n\nХотите принять приглашение?"
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Принять", callback_data=f"league:invite_accept:{invite_id}"),
+            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"league:invite_reject:{invite_id}")
+        ],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="league:back_invites")]
+    ])
+
+    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("league:invite_accept:"))
+async def accept_invite(callback: CallbackQuery, state: FSMContext):
+    invite_id = int(callback.data.split(":")[-1])
+    user_id = callback.from_user.id
+
+    # Проверяем, не вступил ли уже куда-то
+    existing_league = get_user_league(user_id)
+    if existing_league:
+        await callback.answer("❌ Вы уже состоите в лиге! Сначала выйдите из текущей.", show_alert=True)
+        return
+
+    conn = get_db()
+    cursor = conn.cursor()
+    invite = cursor.execute("SELECT * FROM league_invites WHERE id = ?", (invite_id,)).fetchone()
+
+    if not invite:
+        conn.close()
+        await callback.answer("Приглашение устарело.", show_alert=True)
+        return
+
+    league_id = invite["league_id"]
+
+    # Ищем свободный слот (2-4)
+    free_slot = cursor.execute("""
+        SELECT * FROM league_members 
+        WHERE league_id = ? AND user_id IS NULL AND slot_index > 1 
+        ORDER BY slot_index ASC LIMIT 1
+    """, (league_id,)).fetchone()
+
+    if not free_slot:
+        conn.close()
+        await callback.message.edit_text("❌ В лиге больше нет свободных мест.")
+        await callback.answer()
+        return
+
+    # Берем данные игрока из vigarik.db
+    main_conn = sqlite3.connect("vigarik.db")
+    main_conn.row_factory = sqlite3.Row
+    user_row = main_conn.execute("SELECT * FROM members WHERE user_id = ?", (user_id,)).fetchone()
+    main_conn.close()
+
+    game_nick = user_row["game_nick"] if user_row and user_row["game_nick"] else "Игрок"
+    player_tag = user_row["player_tag"] if user_row and user_row["player_tag"] else "#N/A"
+    trophies = user_row["trophies"] if user_row and "trophies" in user_row.keys() else 0
+
+    # Занимаем слот в лиге
+    cursor.execute("""
+        UPDATE league_members 
+        SET user_id = ?, game_nick = ?, player_tag = ?, username = 'None', trophies_record = ?
+        WHERE id = ?
+    """, (user_id, game_nick, player_tag, trophies, free_slot["id"]))
+
+    # Удаляем все инвайты и заявки этого юзера
+    cursor.execute("DELETE FROM league_invites WHERE invitee_id = ?", (user_id,))
+    cursor.execute("DELETE FROM league_applications WHERE user_id = ?", (user_id,))
+
+    conn.commit()
+    conn.close()
+
+    await callback.message.edit_text("✅ Вы успешно приняли приглашение и вступили в лигу!")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("league:invite_reject:"))
+async def reject_invite(callback: CallbackQuery, state: FSMContext):
+    invite_id = int(callback.data.split(":")[-1])
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM league_invites WHERE id = ?", (invite_id,))
+    conn.commit()
+    conn.close()
+
+    await callback.message.edit_text("❌ Приглашение отклонено.")
+    await callback.answer()
