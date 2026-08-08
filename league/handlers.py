@@ -972,30 +972,33 @@ async def reject_invite(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text("❌ Приглашение отклонено.")
     await callback.answer()
 
+
 @router.callback_query(F.data == "league:leave")
 async def leave_league(callback: CallbackQuery, state: FSMContext):
     user_id = callback.from_user.id
-    league_data = get_user_league(user_id) # Твоя функция поиска лиги юзера
-
-    if not league_data:
-        await callback.answer("❌ Вы не состоите в лиге.", show_alert=True)
-        return
 
     conn = get_db()
     cursor = conn.cursor()
 
-    # Проверяем роль
+    # Ищем участника в базе лиг
     member = cursor.execute(
         "SELECT * FROM league_members WHERE user_id = ?", (user_id,)
     ).fetchone()
 
-    # Если игрок - лидер, удаляем лигу (или можно сделать передачу лидерства)
+    if not member:
+        conn.close()
+        await callback.answer("❌ Вы не состоите в лиге.", show_alert=True)
+        return
+
+    league_id = member["league_id"]
+
+    # Если игрок — лидер
     if member["role"] == 'лидер':
-        cursor.execute("DELETE FROM leagues WHERE id = ?", (league_data["id"],))
-        cursor.execute("DELETE FROM league_members WHERE league_id = ?", (league_data["id"],))
-        await callback.message.edit_text("✅ Вы покинули лигу. Так как вы были лидером, лига удалена.")
+        cursor.execute("DELETE FROM leagues WHERE id = ?", (league_id,))
+        cursor.execute("DELETE FROM league_members WHERE league_id = ?", (league_id,))
+        await callback.message.edit_text("✅ Вы покинули лигу. Так как вы были лидером, лига была удалена.")
     else:
-        # Просто освобождаем слот (зануляем user_id и всё остальное)
+        # Если обычный участник — просто очищаем его слот
         cursor.execute("""
             UPDATE league_members 
             SET user_id = NULL, game_nick = NULL, player_tag = NULL, username = NULL, trophies_record = 0
