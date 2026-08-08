@@ -230,55 +230,6 @@ async def show_leagues_to_apply(message: Message, state: FSMContext):
     await message.answer("📋 Выберите лигу для просмотра состава и подачи заявки:", reply_markup=builder.as_markup())
 
 
-@router.callback_query(F.data.startswith("league:info:"))
-async def view_league_info(callback: CallbackQuery, state: FSMContext):
-    league_id = int(callback.data.split(":")[-1])
-    conn = get_db()
-    cursor = conn.cursor()
-    league = cursor.execute("SELECT * FROM leagues WHERE id = ?", (league_id,)).fetchone()
-    members = cursor.execute("SELECT * FROM league_members WHERE league_id = ? ORDER BY slot_index ASC",
-                             (league_id,)).fetchall()
-    conn.close()
-
-    if not league:
-        await callback.answer("Лига не найдена!", show_alert=True)
-        return
-
-    lines = [f"Лига - {league['name']} [{league['tag']}]\n"]
-    main_conn = sqlite3.connect("vigarik.db")
-    main_conn.row_factory = sqlite3.Row
-
-    for m in members:
-        slot = m["slot_index"]
-        if m["user_id"] is None:
-            lines.append(f"{slot}. -- Свободное место --")
-        else:
-            role_label = "Лидер" if m["role"] == "лидер" else "Участник"
-            trophies = m["trophies_record"] if m["trophies_record"] else 0
-            member_db_row = main_conn.execute("SELECT ranked_elo FROM members WHERE user_id = ?",
-                                              (m["user_id"],)).fetchone()
-            current_elo = member_db_row["ranked_elo"] if member_db_row and "ranked_elo" in member_db_row.keys() else 0
-            lines.append(f"{slot}. {m['game_nick']} — {role_label} | {trophies}🏆 | {current_elo} Elo Ranked")
-
-    main_conn.close()
-    text = "\n".join(lines)
-
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Обратно к списку", callback_data="league:all_list")],
-        [InlineKeyboardButton(text="Подать заявку", callback_data=f"league:apply_send:{league_id}")]
-    ])
-    await callback.message.edit_text(text, reply_markup=keyboard)
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("league:apply_send:"))
-async def ask_apply_reason(callback: CallbackQuery, state: FSMContext):
-    league_id = int(callback.data.split(":")[-1])
-    await state.update_data(target_league_id=league_id)
-    await state.set_state(LeagueStates.waiting_apply_text)
-    await callback.message.answer("Напишите короткую заявку/причину, почему хотите вступить в эту лигу:")
-    await callback.answer()
-
 
 @router.message(LeagueStates.waiting_apply_text)
 async def process_apply_text(message: Message, state: FSMContext):
@@ -313,15 +264,6 @@ async def confirm_apply(callback: CallbackQuery, state: FSMContext):
 
     await state.clear()
     await callback.message.edit_text("✅ Заявка успешно отправлена лидеру лиги!")
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("league:apply_send:"))
-async def ask_apply_reason(callback: CallbackQuery, state: FSMContext):
-    league_id = int(callback.data.split(":")[-1])
-    await state.update_data(target_league_id=league_id)
-    await state.set_state(LeagueStates.waiting_apply_text)
-    await callback.message.answer("Напишите короткую заявку/причину, почему хотите вступить в эту лигу:")
     await callback.answer()
 
 
@@ -481,27 +423,6 @@ async def back_to_league_main_menu(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-@router.message(F.text == "➕ Пригласить игрока")
-async def invite_member_start(message: Message, state: FSMContext):
-    user_id = message.from_user.id
-    league_data = get_user_league(user_id)
-    if not league_data or league_data["slot_index"] != 1:
-        await message.answer("❌ Доступно только лидеру лиги.")
-        return
-
-    await state.set_state(LeagueStates.waiting_invite_target)
-    await message.answer("Введите тег игрока или его Telegram ID для приглашения:")
-
-
-@router.message(LeagueStates.waiting_invite_target)
-async def process_invite_target(message: Message, state: FSMContext):
-    target = message.text.strip()
-    # Здесь можно добавить логику отправки приглашения в базу или пользователю
-    await state.clear()
-    await message.answer(f"✅ Приглашение для игрока <code>{target}</code> отправлено!", parse_mode="HTML")
-    await open_league_root(message, state)
-
-
 @router.message(F.text == "👥 Состав лиги")
 async def view_team_info(message: Message, state: FSMContext):
     user_id = message.from_user.id
@@ -651,3 +572,144 @@ async def view_league_requests(message: Message, state: FSMContext):
     builder.adjust(1)
 
     await message.answer("📋 Список входящих заявок в вашу лигу:", reply_markup=builder.as_markup())
+
+
+# 1. Просмотр лиги (исправлена кнопка «Обратно к списку» и убрана кнопка подачи заявки, если зашли через "Все лиги")
+@router.callback_query(F.data.startswith("league:info:"))
+async def view_league_info(callback: CallbackQuery, state: FSMContext):
+    data_parts = callback.data.split(":")
+    league_id = int(data_parts[2])
+    # Если перешли из "Все лиги", в data может передаваться маркер, но проще проверять текущий статус игрока и контекст
+    # Сделаем умную проверку: если пользователь уже в лиге, кнопку подачи заявки точно не показываем
+    user_id = callback.from_user.id
+    user_league = get_user_league(user_id)
+
+    conn = get_db()
+    cursor = conn.cursor()
+    league = cursor.execute("SELECT * FROM leagues WHERE id = ?", (league_id,)).fetchone()
+    members = cursor.execute("SELECT * FROM league_members WHERE league_id = ? ORDER BY slot_index ASC",
+                             (league_id,)).fetchall()
+    conn.close()
+
+    if not league:
+        await callback.answer("Лига не найдена!", show_alert=True)
+        return
+
+    lines = [f"Лига - {league['name']} [{league['tag']}]\n"]
+    main_conn = sqlite3.connect("vigarik.db")
+    main_conn.row_factory = sqlite3.Row
+
+    for m in members:
+        slot = m["slot_index"]
+        if m["user_id"] is None:
+            lines.append(f"{slot}. -- Свободное место --")
+        else:
+            role_label = "Лидер" if m["role"] == "лидер" else "Участник"
+            trophies = m["trophies_record"] if m["trophies_record"] else 0
+            member_db_row = main_conn.execute("SELECT ranked_elo FROM members WHERE user_id = ?",
+                                              (m["user_id"],)).fetchone()
+            current_elo = member_db_row["ranked_elo"] if member_db_row and "ranked_elo" in member_db_row.keys() else 0
+            lines.append(f"{slot}. {m['game_nick']} — {role_label} | {trophies}🏆 | {current_elo} Elo Ranked")
+
+    main_conn.close()
+    text = "\n".join(lines)
+
+    # Кнопка возврата всегда ведет на список всех лиг
+    keyboard_buttons = [
+        [InlineKeyboardButton(text="Обратно к списку", callback_data="league:all_list")]
+    ]
+
+    # Кнопку "Подать заявку" показываем ТОЛЬКО если пользователь НЕ состоит в лиге и лига открыта
+    if not user_league and league["is_open"] == 1:
+        keyboard_buttons.append(
+            [InlineKeyboardButton(text="Подать заявку", callback_data=f"league:apply_send:{league_id}")])
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
+    await callback.message.edit_text(text, reply_markup=keyboard)
+    await callback.answer()
+
+
+# Обработчик кнопки "Обратно к списку"
+@router.callback_query(F.data == "league:all_list")
+async def back_to_all_leagues_list(callback: CallbackQuery, state: FSMContext):
+    conn = get_db()
+    cursor = conn.cursor()
+    leagues = cursor.execute("""
+        SELECT l.*, 
+        (SELECT COUNT(*) FROM league_members WHERE league_id = l.id AND user_id IS NOT NULL) as count_members
+        FROM leagues l
+        ORDER BY count_members DESC, l.id DESC
+    """).fetchall()
+    conn.close()
+
+    builder = InlineKeyboardBuilder()
+    for l in leagues:
+        count = l["count_members"]
+        status_suffix = " (Заполнена)" if count >= 4 else ""
+        builder.button(text=f"{l['name']} [{l['tag']}] ({count}/4){status_suffix}",
+                       callback_data=f"league:info:{l['id']}")
+
+    builder.button(text="◀️ Назад", callback_data="league:back_root")
+    builder.adjust(1)
+
+    await callback.message.edit_text("📋 Список всех лиг:", reply_markup=builder.as_markup())
+    await callback.answer()
+
+
+# Защита при попытке подать заявку (если уже в лиге)
+@router.callback_query(F.data.startswith("league:apply_send:"))
+async def ask_apply_reason(callback: CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    user_league = get_user_league(user_id)
+    if user_league:
+        await callback.answer("❌ Вы уже состоите в лиге! Нельзя подавать заявки.", show_alert=True)
+        return
+
+    league_id = int(callback.data.split(":")[-1])
+    await state.update_data(target_league_id=league_id)
+    await state.set_state(LeagueStates.waiting_apply_text)
+    await callback.message.answer("Напишите короткую заявку/причину, почему хотите вступить в эту лигу:")
+    await callback.answer()
+
+
+# Защита при попытке пригласить игрока (если лидер пытается пригласить того, кто уже где-то состоит)
+@router.message(F.text == "➕ Пригласить игрока")
+async def invite_member_start(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+    league_data = get_user_league(user_id)
+    if not league_data or league_data["slot_index"] != 1:
+        await message.answer("❌ Доступно только лидеру лиги.")
+        return
+
+    await state.set_state(LeagueStates.waiting_invite_target)
+    await message.answer("Введите тег игрока или его Telegram ID для приглашения:")
+
+
+@router.message(LeagueStates.waiting_invite_target)
+async def process_invite_target(message: Message, state: FSMContext):
+    target = message.text.strip()
+
+    # Пытаемся найти пользователя в базе по ID или тегу
+    main_conn = sqlite3.connect("vigarik.db")
+    main_conn.row_factory = sqlite3.Row
+    target_user = None
+    if target.isdigit():
+        target_user = main_conn.execute("SELECT * FROM members WHERE user_id = ?", (int(target),)).fetchone()
+    else:
+        target_user = main_conn.execute("SELECT * FROM members WHERE player_tag = ? OR game_nick = ?",
+                                        (target, target)).fetchone()
+    main_conn.close()
+
+    if target_user:
+        target_id = target_user["user_id"]
+        # Проверяем, состоит ли он уже в лиге
+        target_league = get_user_league(target_id)
+        if target_league:
+            await message.answer("❌ Этот игрок уже состоит в лиге! Его нельзя пригласить.")
+            await state.clear()
+            await open_league_root(message, state)
+            return
+
+    await state.clear()
+    await message.answer(f"✅ Приглашение для игрока <code>{target}</code> отправлено!", parse_mode="HTML")
+    await open_league_root(message, state)
