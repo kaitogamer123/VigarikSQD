@@ -29,6 +29,7 @@ from handlers.proposals import router as proposals_router
 from push_system import push_system_router
 from handlers.chat_events import router as chat_router
 from handlers.clan_list import router as clan_list_router
+from league.handlers import router as league_router
 
 # Модульный админ-роутер
 from handlers.admin_features import admin_main_router
@@ -153,6 +154,7 @@ async def main():
     dp.include_router(clan_list_router)
     dp.include_router(admin_main_router)
     dp.include_router(change_name_router)
+    dp.include_router(league_router)
 
     # ─── НАСТРОЙКА ПЛАНИРОВЩИКА ЗАДАЧ (APScheduler) ───────────────────────────
     scheduler = AsyncIOScheduler()
