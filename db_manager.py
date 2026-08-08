@@ -14,9 +14,8 @@ def get_connection():
 
 
 async def fetch_player_from_api(player_tag: str):
-    """Асинхронно забирает ник и кубки из официального API Brawl Stars."""
+    """Асинхронно забирает ник, кубки и клуб из официального API Brawl Stars."""
     clean_tag = player_tag.strip().upper().replace("#", "")
-    # Берем токен из config.py, если он там есть
     try:
         from config import BS_API_TOKEN
         headers = {"Authorization": f"Bearer {BS_API_TOKEN}"}
@@ -33,7 +32,8 @@ async def fetch_player_from_api(player_tag: str):
                     return {
                         "name": data.get("name"),
                         "trophies": data.get("trophies", 0),
-                        "tag": f"#{clean_tag}"
+                        "tag": f"#{clean_tag}",
+                        "club": data.get("club")
                     }
                 else:
                     print(f"⚠️ Ошибка API Brawl Stars для тега #{clean_tag}: статус {response.status}")
@@ -100,7 +100,6 @@ def add_member():
     username = input("Введите Telegram username (без @, можно пропустить): ").strip().lstrip("@")
     player_tag = input("Введите тег Brawl Stars (например, #9VJGR8VV8V): ").strip()
     role = input("Введите роль (например, member / president / helper): ").strip() or "member"
-    clan = input("Введите название клана (например, squad / academy): ").strip()
     reg_input = input("Статус регистрации (1 - активен в списках, 0 - нет) [по умолчанию 1]: ").strip()
     registered = int(reg_input) if reg_input in ("0", "1") else 1
 
@@ -111,12 +110,15 @@ def add_member():
         game_nick = api_data["name"]
         trophies = api_data["trophies"]
         clean_tag = api_data["tag"]
-        print(f"✅ Найдено в API! Ник: {game_nick} | Кубки: {trophies}")
+        club_info = api_data.get("club")
+        clan = club_info.get("name") if club_info else "No Club"
+        print(f"✅ Найдено в API! Ник: {game_nick} | Кубки: {trophies} | Клан: {clan}")
     else:
         print("⚠️ Не удалось получить данные из API (тег введен верно?). Записываем без авто-ника.")
         game_nick = "Игрок"
         trophies = 0
         clean_tag = player_tag.upper()
+        clan = "Unknown"
 
     conn = get_connection()
     if not conn: return
@@ -128,13 +130,13 @@ def add_member():
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
         """, (user_id, username if username else None, game_nick, clean_tag, trophies, role, clan, registered))
         conn.commit()
-        print(f"✅ Участник {game_nick} (ID: {user_id}) успешно сохранен в базе с актуальным ником и кубками!")
+        print(f"✅ Участник {game_nick} (ID: {user_id}) успешно сохранен в базе!")
     except Exception as e:
         print(f"❌ Ошибка при добавлении: {e}")
     conn.close()
 
 
-async def process_bulk_import(lines, role, clan, registered):
+async def process_bulk_import(lines, default_role, registered):
     conn = get_connection()
     if not conn:
         return
@@ -147,8 +149,7 @@ async def process_bulk_import(lines, role, clan, registered):
         line = line.strip()
         if not line:
             continue
-
-        # Поддерживаем разделение пробелом, табуляцией или запятой (например: 12345678 #ABC123XYZ)
+        
         parts = line.replace(",", " ").split()
         if len(parts) < 2:
             print(f"⚠️ Строка {line_num} пропущена (неверный формат): '{line}'")
@@ -165,19 +166,24 @@ async def process_bulk_import(lines, role, clan, registered):
             game_nick = api_data["name"]
             trophies = api_data["trophies"]
             clean_tag = api_data["tag"]
-            print(f"   ✅ Найдено в API: {game_nick} ({trophies} кубков)")
+            
+            club_info = api_data.get("club")
+            clan = club_info.get("name") if club_info else "No Club"
+            
+            print(f"   ✅ Найдено: {game_nick} | Кубки: {trophies} | Клан: {clan}")
         else:
             game_nick = "Игрок"
             trophies = 0
             clean_tag = player_tag.upper()
-            print(f"   ⚠️ API не ответил, сохраняем с дефолтным ником.")
+            clan = "Unknown"
+            print(f"   ⚠️ API не ответил, сохраняем с дефолтными значениями.")
 
         try:
             cursor.execute("""
                 INSERT OR REPLACE INTO members 
                 (user_id, username, game_nick, player_tag, trophies, role, clan, registered, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
-            """, (user_id, None, game_nick, clean_tag, trophies, role, clan, registered))
+            """, (user_id, None, game_nick, clean_tag, trophies, default_role, clan, registered))
             conn.commit()
             success_count += 1
         except Exception as e:
@@ -185,24 +191,21 @@ async def process_bulk_import(lines, role, clan, registered):
             fail_count += 1
 
     conn.close()
-    print(
-        f"\n🎉 Массовое добавление завершено! Успешно добавлено/обновлено: {success_count}, ошибок/пропусков: {fail_count}")
+    print(f"\n🎉 Массовое добавление завершено! Успешно: {success_count}, ошибок: {fail_count}")
 
 
 def bulk_add_members():
-    print("\n📥 МАССОВОЕ ДОБАВЛЕНИЕ УЧАСТНИКОВ")
-    print("Сначала зададим общие параметры для этого списка:")
-
-    role = input("Введите роль для всех (например, member): ").strip() or "member"
-    clan = input("Введите клан для всех (например, squad / academy): ").strip()
+    print("\n📥 МАССОВОЕ ДОБАВЛЕНИЕ УЧАСТНИКОВ (АВТО-НИК И КЛАН ИЗ API)")
+    
+    default_role = input("Введите роль для всех добавляемых (например, member): ").strip() or "member"
     reg_input = input("Статус регистрации (1 или 0) [по умолчанию 1]: ").strip()
     registered = int(reg_input) if reg_input in ("0", "1") else 1
 
-    print("\nТеперь вставь список строками. Каждая строка: Telegram_ID и Тег_Бравл_Старс")
+    print("\nВставляй список строками. Формат каждой строки: `Telegram_ID` и `Тег_Бравл_Старс`")
     print("Пример:")
     print("123456789 #9VJG88")
     print("987654321 #ABC123")
-    print("Когда закончишь вставлять, нажми Enter на пустой строке, а затем введи слово `END` и нажми Enter:\n")
+    print("Когда закончишь, нажми Enter на новой строке, напиши `END` и нажми Enter:\n")
 
     lines = []
     while True:
@@ -218,8 +221,8 @@ def bulk_add_members():
         print("❌ Список пуст.")
         return
 
-    print(f"\n🚀 Запускаю обработку {len(lines)} строк с запросами к API...")
-    asyncio.run(process_bulk_import(lines, role, clan, registered))
+    print(f"\n🚀 Запускаю обработку {len(lines)} строк...")
+    asyncio.run(process_bulk_import(lines, default_role, registered))
 
 
 def update_member_field():
@@ -259,20 +262,20 @@ def update_member_field():
     if not conn: return
     cursor = conn.cursor()
 
-    # Особенность: если меняем тег через пункт 3, автоматически обновляем и ник с кубками из API!
     if field_name == "player_tag":
         clean_tag = new_value.upper()
         print("⏳ Запрашиваем новые данные из Brawl Stars API...")
         api_data = asyncio.run(fetch_player_from_api(clean_tag))
 
         if api_data:
+            club_info = api_data.get("club")
+            clan_name = club_info.get("name") if club_info else "No Club"
             cursor.execute("""
                 UPDATE members 
-                SET player_tag = ?, game_nick = ?, trophies = ?, updated_at = datetime('now') 
+                SET player_tag = ?, game_nick = ?, trophies = ?, clan = ?, updated_at = datetime('now') 
                 WHERE user_id = ?
-            """, (api_data["tag"], api_data["name"], api_data["trophies"], user_id))
-            print(
-                f"✅ Тег обновлен, а ник автоматически сменен на '{api_data['name']}' ({api_data['trophies']} кубков)!")
+            """, (api_data["tag"], api_data["name"], api_data["trophies"], clan_name, user_id))
+            print(f"✅ Тег обновлен, ник изменен на '{api_data['name']}', клан обновлен на '{clan_name}'!")
         else:
             cursor.execute("UPDATE members SET player_tag = ?, updated_at = datetime('now') WHERE user_id = ?",
                            (clean_tag, user_id))
@@ -318,7 +321,7 @@ def main():
         print("3. ➕ Добавить нового участника по тегу (авто-ник из API)")
         print("4. ✏️ Изменить данные игрока")
         print("5. ❌ Удалить игрока из базы")
-        print("6. 📥 Массовое добавление участников (пачкой)")
+        print("6. 📥 Массовое добавление участников (пачкой с авто-кланом)")
         print("0. 🚪 Выход из панели")
 
         choice = input("\nВыберите действие (0-6): ").strip()
