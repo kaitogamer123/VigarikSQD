@@ -778,9 +778,10 @@ async def process_invite_target(message: Message, state: FSMContext):
         await open_league_root(message, state)
         return
 
-    # Жесткая проверка черезпрямой SQL-запрос к league.db: состоит ли этот user_id в какой-то лиге
     conn = get_db()
     cursor = conn.cursor()
+
+    # Проверяем, состоит ли игрок в лиге
     existing_membership = cursor.execute(
         "SELECT * FROM league_members WHERE user_id = ?", (target_user_id,)
     ).fetchone()
@@ -795,17 +796,37 @@ async def process_invite_target(message: Message, state: FSMContext):
         await open_league_root(message, state)
         return
 
-    # Создаем приглашение в таблице league_invites
-    cursor.execute("""
-        INSERT INTO league_invites (league_id, inviter_id, invitee_id) VALUES (?, ?, ?)
-    """, (league_data["id"], inviter_id, target_user_id))
-    conn.commit()
+    # Проверяем, отправлено ли уже активное приглашение
+    existing_invite = cursor.execute(
+        "SELECT * FROM league_invites WHERE league_id = ? AND invitee_id = ?",
+        (league_data["id"], target_user_id)
+    ).fetchone()
+
+    if existing_invite:
+        conn.close()
+        await message.answer("❌ Этому игроку уже отправлено приглашение в вашу лигу! Оно еще активно.")
+        await state.clear()
+        await open_league_root(message, state)
+        return
+
+    # Пытаемся записать инвайт (даже при сбое уникальности база не упадет)
+    try:
+        cursor.execute("""
+            INSERT INTO league_invites (league_id, inviter_id, invitee_id) VALUES (?, ?, ?)
+        """, (league_data["id"], inviter_id, target_user_id))
+        conn.commit()
+    except sqlite3.IntegrityError:
+        conn.close()
+        await message.answer("❌ Этому игроку уже отправлено приглашение!")
+        await state.clear()
+        await open_league_root(message, state)
+        return
+
     conn.close()
 
     await state.clear()
     await message.answer(f"✅ Приглашение для игрока <code>{target}</code> успешно отправлено!", parse_mode="HTML")
     await open_league_root(message, state)
-
 
 @router.message(F.text == "📥 Приглашения в лигу")
 async def view_league_invites(message: Message, state: FSMContext):
