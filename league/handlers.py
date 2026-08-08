@@ -1,7 +1,7 @@
 import os
 import sqlite3
 from aiogram import F, Router, Bot
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -47,31 +47,33 @@ def get_user_league(user_id: int):
     conn.close()
     return res
 
-# 1. Открытие папки "Лиги💀"
-@router.message(F.text == "Лиги💀")
+
+# 1. Открытие папки "Лиги 💀 (BetaTest)"
+@router.message(F.text == "Лиги 💀 (BetaTest)")
 async def open_league_root(message: Message, state: FSMContext):
     await state.clear()
     user_id = message.from_user.id
     league_data = get_user_league(user_id)
 
     if not league_data:
+        # Если игрок не в лиге:
         text = "Кажется тебя ещё нету ни в одной лиге. Время вступить в одну из них, или создать свою!"
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🌍 Все лиги 💀 (BetaTest)", callback_data="league:all_list")],
+            [InlineKeyboardButton(text="🌍 Все лиги", callback_data="league:all_list")],
             [InlineKeyboardButton(text="📝 Подать заявку в лигу", callback_data="league:apply_list")],
-            [InlineKeyboardButton(text="📨 Мои заявки", callback_data="league:my_applications")],
-            [InlineKeyboardButton(text="📩 Приглашения в лигу", callback_data="league:invites")],
+            [InlineKeyboardButton(text="📩 Мои заявки", callback_data="league:my_applications")],
+            [InlineKeyboardButton(text="📥 Приглашения в лигу", callback_data="league:invites")],
             [InlineKeyboardButton(text="➕ Создать лигу", callback_data="league:create")]
         ])
-        await message.answer(text, reply_markup=keyboard)
     else:
+        # Если игрок в лиге (лидер или участник):
         is_leader = (league_data["slot_index"] == 1)
-        status_set = "Открыт ✅" if league_data["is_open"] else "Закрыт ❌"
-        text = f"🏰 Ваша лига: <b>{league_data['name']} [{league_data['tag']}]</b>\nСтатус набора: {status_set}"
+        status_str = "Открыт ✅" if league_data["is_open"] == 1 else "Закрыт ❌"
+        text = f"🏰 Ваша лига: <b>{league_data['name']} [{league_data['tag']}]</b>\nСтатус набора: {status_str}"
 
         if is_leader:
             keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🌍 Все лиги 💀 (BetaTest)", callback_data="league:all_list")],
+                [InlineKeyboardButton(text="🌍 Все лиги", callback_data="league:all_list")],
                 [InlineKeyboardButton(text="👥 Состав лиги", callback_data="league:my_team_info")],
                 [InlineKeyboardButton(text="📋 Просмотреть заявки", callback_data="league:view_requests")],
                 [InlineKeyboardButton(text="➕ Пригласить игрока", callback_data="league:invite_member")],
@@ -81,11 +83,14 @@ async def open_league_root(message: Message, state: FSMContext):
             ])
         else:
             keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🌍 Все лиги", callback_data="league:all_list")],
                 [InlineKeyboardButton(text="👥 Состав лиги", callback_data="league:my_team_info")],
-                [InlineKeyboardButton(text="🌍 Все лиги 💀 (BetaTest)", callback_data="league:all_list")],
                 [InlineKeyboardButton(text="🚪 Выйти из лиги", callback_data="league:leave")]
             ])
-        await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
+
+    # Отправляем сообщение для удаления обычной клавиатуры и выводим меню с инлайн-кнопками
+    await message.answer("Меню лиг:", reply_markup=ReplyKeyboardRemove())
+    await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
 
 
 # --- СОЗДАНИЕ ЛИГИ ---
@@ -148,132 +153,135 @@ async def process_league_tag(message: Message, state: FSMContext):
 
     await message.answer(f"✅ Лига <b>{league_name} [{tag.upper()}]</b> успешно создана!", parse_mode="HTML")
 
-    # --- ОТКРЫТИЕ / ЗАКРЫТИЕ НАБОРА ---
-    @router.callback_query(F.data == "league:toggle_open")
-    async def toggle_league_open(callback: CallbackQuery):
-        user_id = callback.from_user.id
-        conn = get_db()
-        cursor = conn.cursor()
-        league = cursor.execute(
-            "SELECT l.* FROM leagues l JOIN league_members m ON l.id = m.league_id WHERE m.user_id = ? AND m.slot_index = 1",
-            (user_id,)).fetchone()
-        if league:
-            new_status = 0 if league["is_open"] == 1 else 1
-            cursor.execute("UPDATE leagues SET is_open = ? WHERE id = ?", (new_status, league["id"]))
-            conn.commit()
-            status_str = "Открыт ✅" if new_status == 1 else "Закрыт ❌"
-            await callback.answer(f"Статус набора изменен на: {status_str}", show_alert=True)
-        conn.close()
 
-        league_data = get_user_league(user_id)
-        status_set = "Открыт ✅" if league_data["is_open"] else "Закрыт ❌"
-        text = f"🏰 Ваша лига: <b>{league_data['name']} [{league_data['tag']}]</b>\nСтатус набора: {status_set}"
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="👥 Состав лиги", callback_data="league:my_team_info")],
-            [InlineKeyboardButton(text="📋 Просмотреть заявки", callback_data="league:view_requests")],
-            [InlineKeyboardButton(text="Пригласить", callback_data="league:invite_member")],
-            [InlineKeyboardButton(text="Выгнать участника", callback_data="league:kick_member")],
-            [InlineKeyboardButton(text="Передать лидерство", callback_data="league:transfer_lead")],
-            [InlineKeyboardButton(text="🔒 Закрыть набор / Открыть набор", callback_data="league:toggle_open")]
-        ])
-        try:
-            await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
-        except:
-            pass
+# --- ОТКРЫТИЕ / ЗАКРЫТИЕ НАБОРА ---
+@router.callback_query(F.data == "league:toggle_open")
+async def toggle_league_open(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    conn = get_db()
+    cursor = conn.cursor()
+    league = cursor.execute(
+        "SELECT l.* FROM leagues l JOIN league_members m ON l.id = m.league_id WHERE m.user_id = ? AND m.slot_index = 1",
+        (user_id,)).fetchone()
+    if league:
+        new_status = 0 if league["is_open"] == 1 else 1
+        cursor.execute("UPDATE leagues SET is_open = ? WHERE id = ?", (new_status, league["id"]))
+        conn.commit()
+        status_str = "Открыт ✅" if new_status == 1 else "Закрыт ❌"
+        await callback.answer(f"Статус набора изменен на: {status_str}", show_alert=True)
+    conn.close()
 
-    @router.callback_query(F.data == "league:all_list")
-    async def show_all_leagues(callback: CallbackQuery):
-        conn = get_db()
-        cursor = conn.cursor()
-        leagues = cursor.execute("""
-            SELECT l.*, 
-            (SELECT COUNT(*) FROM league_members WHERE league_id = l.id AND user_id IS NOT NULL) as count_members
-            FROM leagues l
-            ORDER BY count_members DESC, l.id DESC
-        """).fetchall()
-        conn.close()
+    league_data = get_user_league(user_id)
+    status_set = "Открыт ✅" if league_data["is_open"] else "Закрыт ❌"
+    text = f"🏰 Ваша лига: <b>{league_data['name']} [{league_data['tag']}]</b>\nСтатус набора: {status_set}"
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👥 Состав лиги", callback_data="league:my_team_info")],
+        [InlineKeyboardButton(text="📋 Просмотреть заявки", callback_data="league:view_requests")],
+        [InlineKeyboardButton(text="Пригласить", callback_data="league:invite_member")],
+        [InlineKeyboardButton(text="Выгнать участника", callback_data="league:kick_member")],
+        [InlineKeyboardButton(text="Передать лидерство", callback_data="league:transfer_lead")],
+        [InlineKeyboardButton(text="🔒 Закрыть набор / Открыть набор", callback_data="league:toggle_open")]
+    ])
+    try:
+        await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
+    except:
+        pass
 
-        builder = InlineKeyboardBuilder()
-        for l in leagues:
-            count = l["count_members"]
-            status_suffix = " (Заполнена)" if count >= 4 else ""
-            builder.button(text=f"{l['name']} [{l['tag']}] ({count}/4){status_suffix}",
-                           callback_data=f"league:info:{l['id']}")
 
-        builder.button(text="◀️ Назад", callback_data="league:back_root")
-        builder.adjust(1)
+@router.callback_query(F.data == "league:all_list")
+async def show_all_leagues(callback: CallbackQuery):
+    conn = get_db()
+    cursor = conn.cursor()
+    leagues = cursor.execute("""
+        SELECT l.*, 
+        (SELECT COUNT(*) FROM league_members WHERE league_id = l.id AND user_id IS NOT NULL) as count_members
+        FROM leagues l
+        ORDER BY count_members DESC, l.id DESC
+    """).fetchall()
+    conn.close()
 
-        text = "📋 Список всех лиг (можно открыть любую и посмотреть состав):"
-        await callback.message.edit_text(text, reply_markup=builder.as_markup())
-        await callback.answer()
+    builder = InlineKeyboardBuilder()
+    for l in leagues:
+        count = l["count_members"]
+        status_suffix = " (Заполнена)" if count >= 4 else ""
+        builder.button(text=f"{l['name']} [{l['tag']}] ({count}/4){status_suffix}",
+                       callback_data=f"league:info:{l['id']}")
 
-    @router.callback_query(F.data == "league:apply_list")
-    async def show_leagues_to_apply(callback: CallbackQuery):
-        conn = get_db()
-        cursor = conn.cursor()
-        leagues = cursor.execute("""
-            SELECT l.*, 
-            (SELECT COUNT(*) FROM league_members WHERE league_id = l.id AND user_id IS NOT NULL) as count_members
-            FROM leagues l
-            WHERE l.is_open = 1
-            GROUP BY l.id
-            HAVING count_members < 4
-            ORDER BY count_members DESC
-        """).fetchall()
-        conn.close()
+    builder.button(text="◀️ Назад", callback_data="league:back_root")
+    builder.adjust(1)
 
-        builder = InlineKeyboardBuilder()
-        for l in leagues:
-            count = l["count_members"]
-            builder.button(text=f"{l['name']} [{l['tag']}] ({count}/4)", callback_data=f"league:info:{l['id']}")
-        builder.button(text="◀️ Назад", callback_data="league:back_root")
-        builder.adjust(1)
+    text = "📋 Список всех лиг (можно открыть любую и посмотреть состав):"
+    await callback.message.edit_text(text, reply_markup=builder.as_markup())
+    await callback.answer()
 
-        text = "📋 Выберите лигу для просмотра состава и подачи заявки:"
-        await callback.message.edit_text(text, reply_markup=builder.as_markup())
-        await callback.answer()
 
-    @router.callback_query(F.data.startswith("league:info:"))
-    async def view_league_info(callback: CallbackQuery):
-        league_id = int(callback.data.split(":")[-1])
-        conn = get_db()
-        cursor = conn.cursor()
-        league = cursor.execute("SELECT * FROM leagues WHERE id = ?", (league_id,)).fetchone()
-        members = cursor.execute("SELECT * FROM league_members WHERE league_id = ? ORDER BY slot_index ASC",
-                                 (league_id,)).fetchall()
-        conn.close()
+@router.callback_query(F.data == "league:apply_list")
+async def show_leagues_to_apply(callback: CallbackQuery):
+    conn = get_db()
+    cursor = conn.cursor()
+    leagues = cursor.execute("""
+        SELECT l.*, 
+        (SELECT COUNT(*) FROM league_members WHERE league_id = l.id AND user_id IS NOT NULL) as count_members
+        FROM leagues l
+        WHERE l.is_open = 1
+        GROUP BY l.id
+        HAVING count_members < 4
+        ORDER BY count_members DESC
+    """).fetchall()
+    conn.close()
 
-        if not league:
-            await callback.answer("Лига не найдена!", show_alert=True)
-            return
+    builder = InlineKeyboardBuilder()
+    for l in leagues:
+        count = l["count_members"]
+        builder.button(text=f"{l['name']} [{l['tag']}] ({count}/4)", callback_data=f"league:info:{l['id']}")
+    builder.button(text="◀️ Назад", callback_data="league:back_root")
+    builder.adjust(1)
 
-        lines = [f"Лига - {league['name']} [{league['tag']}]\n"]
-        main_conn = sqlite3.connect("vigarik.db")
-        main_conn.row_factory = sqlite3.Row
+    text = "📋 Выберите лигу для просмотра состава и подачи заявки:"
+    await callback.message.edit_text(text, reply_markup=builder.as_markup())
+    await callback.answer()
 
-        for m in members:
-            slot = m["slot_index"]
-            if m["user_id"] is None:
-                lines.append(f"{slot}. -- Свободное место --")
-            else:
-                role_label = "Лидер" if m["role"] == "лидер" else "Участник"
-                trophies = m["trophies_record"] if m["trophies_record"] else 0
-                member_db_row = main_conn.execute("SELECT ranked_elo FROM members WHERE user_id = ?",
-                                                  (m["user_id"],)).fetchone()
-                current_elo = member_db_row[
-                    "ranked_elo"] if member_db_row and "ranked_elo" in member_db_row.keys() else 0
-                lines.append(f"{slot}. {m['game_nick']} — {role_label} | {trophies}🏆 | {current_elo} Elo Ranked")
 
-        main_conn.close()
-        text = "\n".join(lines)
+@router.callback_query(F.data.startswith("league:info:"))
+async def view_league_info(callback: CallbackQuery):
+    league_id = int(callback.data.split(":")[-1])
+    conn = get_db()
+    cursor = conn.cursor()
+    league = cursor.execute("SELECT * FROM leagues WHERE id = ?", (league_id,)).fetchone()
+    members = cursor.execute("SELECT * FROM league_members WHERE league_id = ? ORDER BY slot_index ASC",
+                             (league_id,)).fetchall()
+    conn.close()
 
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Обратно к выбору лиги", callback_data="league:apply_list")],
-            [InlineKeyboardButton(text="Подать заявку", callback_data=f"league:apply_send:{league_id}")]
-        ])
-        await callback.message.edit_text(text, reply_markup=keyboard)
-        await callback.answer()
+    if not league:
+        await callback.answer("Лига не найдена!", show_alert=True)
+        return
 
+    lines = [f"Лига - {league['name']} [{league['tag']}]\n"]
+    main_conn = sqlite3.connect("vigarik.db")
+    main_conn.row_factory = sqlite3.Row
+
+    for m in members:
+        slot = m["slot_index"]
+        if m["user_id"] is None:
+            lines.append(f"{slot}. -- Свободное место --")
+        else:
+            role_label = "Лидер" if m["role"] == "лидер" else "Участник"
+            trophies = m["trophies_record"] if m["trophies_record"] else 0
+            member_db_row = main_conn.execute("SELECT ranked_elo FROM members WHERE user_id = ?",
+                                              (m["user_id"],)).fetchone()
+            current_elo = member_db_row[
+                "ranked_elo"] if member_db_row and "ranked_elo" in member_db_row.keys() else 0
+            lines.append(f"{slot}. {m['game_nick']} — {role_label} | {trophies}🏆 | {current_elo} Elo Ranked")
+
+    main_conn.close()
+    text = "\n".join(lines)
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Обратно к выбору лиги", callback_data="league:apply_list")],
+        [InlineKeyboardButton(text="Подать заявку", callback_data=f"league:apply_send:{league_id}")]
+    ])
+    await callback.message.edit_text(text, reply_markup=keyboard)
+    await callback.answer()
 
 @router.callback_query(F.data.startswith("league:apply_send:"))
 async def ask_apply_reason(callback: CallbackQuery, state: FSMContext):
