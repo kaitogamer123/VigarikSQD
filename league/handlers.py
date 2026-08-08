@@ -47,7 +47,10 @@ def get_user_league(user_id: int):
     conn.close()
     return res
 
-
+@router.callback_query()
+async def debug_callback(callback: CallbackQuery):
+    print(f"НАЖАТА КНОПКА С DATA: {repr(callback.data)}")
+    await callback.answer(f"Data: {callback.data}")
 # 1. Открытие главного меню лиг (с нижней клавиатурой)
 @router.message(F.text == "Лиги 💀 (BetaTest)")
 async def open_league_root(message: Message, state: FSMContext):
