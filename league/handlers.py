@@ -622,3 +622,32 @@ async def reject_application(callback: CallbackQuery, state: FSMContext):
 
     await callback.message.edit_text("❌ Заявка отклонена.")
     await callback.answer()
+@router.message(F.text == "📋 Просмотреть заявки")
+async def view_league_requests(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+    league = get_user_league(user_id)
+    if not league or league["slot_index"] != 1:
+        await message.answer("❌ Доступно только лидеру лиги.")
+        return
+
+    conn = get_db()
+    cursor = conn.cursor()
+    requests = cursor.execute("""
+        SELECT a.*, m.game_nick 
+        FROM league_applications a
+        LEFT JOIN members m ON a.user_id = m.user_id
+        WHERE a.league_id = ?
+    """, (league["id"],)).fetchall()
+    conn.close()
+
+    if not requests:
+        await message.answer("📭 На данный момент нет входящих заявок в лигу.")
+        return
+
+    builder = InlineKeyboardBuilder()
+    for req in requests:
+        nick = req["game_nick"] if req["game_nick"] else f"ID: {req['user_id']}"
+        builder.button(text=f"📩 Заявка от {nick}", callback_data=f"league:app_detail:{req['id']}")
+    builder.adjust(1)
+
+    await message.answer("📋 Список входящих заявок в вашу лигу:", reply_markup=builder.as_markup())
