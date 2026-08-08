@@ -769,28 +769,57 @@ async def invite_member_start(message: Message, state: FSMContext):
 @router.message(LeagueStates.waiting_invite_target)
 async def process_invite_target(message: Message, state: FSMContext):
     target = message.text.strip()
+    inviter_id = message.from_user.id
+    league_data = get_user_league(inviter_id)
 
-    # Пытаемся найти пользователя в базе по ID или тегу
-    main_conn = sqlite3.connect("vigarik.db")
-    main_conn.row_factory = sqlite3.Row
-    target_user = None
+    # Определяем ID или тег целевого игрока
+    target_user_id = None
     if target.isdigit():
-        target_user = main_conn.execute("SELECT * FROM members WHERE user_id = ?", (int(target),)).fetchone()
+        target_user_id = int(target)
     else:
-        target_user = main_conn.execute("SELECT * FROM members WHERE player_tag = ? OR game_nick = ?",
-                                        (target, target)).fetchone()
-    main_conn.close()
+        main_conn = sqlite3.connect("vigarik.db")
+        main_conn.row_factory = sqlite3.Row
+        target_user = main_conn.execute("SELECT user_id FROM members WHERE player_tag = ? OR game_nick = ?", (target, target)).fetchone()
+        main_conn.close()
+        if target_user:
+            target_user_id = target_user["user_id"]
 
-    if target_user:
-        target_id = target_user["user_id"]
-        # Проверяем, состоит ли он уже в лиге
-        target_league = get_user_league(target_id)
-        if target_league:
-            await message.answer("❌ Этот игрок уже состоит в лиге! Его нельзя пригласить.")
-            await state.clear()
-            await open_league_root(message, state)
-            return
+    if not target_user_id:
+        await message.answer("❌ Игрок не найден в базе данных бота!")
+        await state.clear()
+        await open_league_root(message, state)
+        return
+
+    if target_user_id == inviter_id:
+        await message.answer("❌ Нельзя пригласить самого себя!")
+        await state.clear()
+        await open_league_root(message, state)
+        return
+
+    # Жесткая проверка черезпрямой SQL-запрос к league.db: состоит ли этот user_id в какой-то лиге
+    conn = get_db()
+    cursor = conn.cursor()
+    existing_membership = cursor.execute(
+        "SELECT * FROM league_members WHERE user_id = ?", (target_user_id,)
+    ).fetchone()
+
+    if existing_membership:
+        conn.close()
+        if existing_membership["league_id"] == league_data["id"]:
+            await message.answer("❌ Этот игрок уже находится в вашей лиге!")
+        else:
+            await message.answer("❌ Этот игрок уже состоит в другой лиге!")
+        await state.clear()
+        await open_league_root(message, state)
+        return
+
+    # Создаем приглашение в таблице league_invites
+    cursor.execute("""
+        INSERT INTO league_invites (league_id, inviter_id, invitee_id) VALUES (?, ?, ?)
+    """, (league_data["id"], inviter_id, target_user_id))
+    conn.commit()
+    conn.close()
 
     await state.clear()
-    await message.answer(f"✅ Приглашение для игрока <code>{target}</code> отправлено!", parse_mode="HTML")
+    await message.answer(f"✅ Приглашение для игрока <code>{target}</code> успешно отправлено!", parse_mode="HTML")
     await open_league_root(message, state)
