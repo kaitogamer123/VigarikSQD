@@ -358,14 +358,34 @@ async def confirm_kick(message: Message, state: FSMContext):
 @router.message(F.text == "👑 Передать лидерство")
 async def transfer_lead_start(message: Message, state: FSMContext):
     user_id = message.from_user.id
-    league_data = get_user_league(user_id)
-    if not league_data or league_data["slot_index"] != 1:
-        await message.answer("❌ Доступно только текущему лидеру.")
+    league = get_user_league(user_id)
+
+    if not league or league["slot_index"] != 1:
+        await message.answer("❌ Доступно только лидеру лиги.")
         return
 
-    await state.set_state(LeagueStates.waiting_transfer_slot)
-    await message.answer("Введите номер слота игрока (2-4), которому хотите передать лидерство:")
+    # Получаем состав лиги
+    conn = get_db()
+    cursor = conn.cursor()
+    members = cursor.execute(
+        "SELECT * FROM league_members WHERE league_id = ? ORDER BY slot_index ASC",
+        (league["id"],)
+    ).fetchall()
+    conn.close()
 
+    # Формируем красивый список для выбора
+    lines = ["Выберите номер слота (2-4), которому хотите передать лидерство:\n"]
+    for m in members:
+        # Лидера (себя) не предлагаем
+        if m["slot_index"] == 1:
+            lines.append(f"{m['slot_index']}. {m['game_nick']} — 👑 Лидер")
+        elif m["user_id"] is None:
+            lines.append(f"{m['slot_index']}. -- Свободное место -- — 👤 Участник")
+        else:
+            lines.append(f"{m['slot_index']}. {m['game_nick']} — 👤 Участник")
+
+    await state.set_state(LeagueStates.waiting_transfer_slot)
+    await message.answer("\n".join(lines))
 
 @router.message(LeagueStates.waiting_transfer_slot)
 async def process_transfer_slot_number(message: Message, state: FSMContext):
@@ -586,6 +606,8 @@ async def reject_application(callback: CallbackQuery, state: FSMContext):
 
     await callback.message.edit_text("❌ Заявка отклонена.")
     await callback.answer()
+
+
 @router.message(F.text == "📋 Просмотреть заявки")
 async def view_league_requests(message: Message, state: FSMContext):
     user_id = message.from_user.id
@@ -596,11 +618,10 @@ async def view_league_requests(message: Message, state: FSMContext):
 
     conn = get_db()
     cursor = conn.cursor()
+    # Вытаскиваем заявки именно из league.db (таблица league_applications, колонка text_reason)
     requests = cursor.execute("""
-        SELECT a.*, m.game_nick 
-        FROM league_applications a
-        LEFT JOIN members m ON a.user_id = m.user_id
-        WHERE a.league_id = ?
+        SELECT * FROM league_applications
+        WHERE league_id = ?
     """, (league["id"],)).fetchall()
     conn.close()
 
@@ -608,14 +629,20 @@ async def view_league_requests(message: Message, state: FSMContext):
         await message.answer("📭 На данный момент нет входящих заявок в лигу.")
         return
 
+    # Подтягиваем ники из vigarik.db для красоты
+    main_conn = sqlite3.connect("vigarik.db")
+    main_conn.row_factory = sqlite3.Row
+
     builder = InlineKeyboardBuilder()
     for req in requests:
-        nick = req["game_nick"] if req["game_nick"] else f"ID: {req['user_id']}"
+        user_row = main_conn.execute("SELECT game_nick FROM members WHERE user_id = ?", (req["user_id"],)).fetchone()
+        nick = user_row["game_nick"] if user_row and user_row["game_nick"] else f"ID: {req['user_id']}"
         builder.button(text=f"📩 Заявка от {nick}", callback_data=f"league:app_detail:{req['id']}")
+
+    main_conn.close()
     builder.adjust(1)
 
     await message.answer("📋 Список входящих заявок в вашу лигу:", reply_markup=builder.as_markup())
-
 
 # 1. Просмотр лиги (исправлена кнопка «Обратно к списку» и убрана кнопка подачи заявки, если зашли через "Все лиги")
 @router.callback_query(F.data.startswith("league:info:"))
