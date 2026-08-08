@@ -557,6 +557,16 @@ async def accept_application(callback: CallbackQuery, state: FSMContext):
     league_id = app["league_id"]
     user_id = app["user_id"]
 
+    # Проверка: если игрок уже состоит в какой-либо лиге, автоматически сносим его заявку и не пускаем
+    existing_league = get_user_league(user_id)
+    if existing_league:
+        cursor.execute("DELETE FROM league_applications WHERE id = ?", (app_id,))
+        conn.commit()
+        conn.close()
+        await callback.message.edit_text("❌ Игрок уже состоит в лиге! Эта заявка была автоматически удалена.")
+        await callback.answer()
+        return
+
     # Ищем свободный слот в лиге (от 2 до 4)
     free_slot = cursor.execute("""
         SELECT * FROM league_members 
@@ -570,7 +580,7 @@ async def accept_application(callback: CallbackQuery, state: FSMContext):
         await callback.answer()
         return
 
-    # Получаем игровые данные игрока из основной базы
+    # Получаем игровые данные игрока из основной базы vigarik.db
     main_conn = sqlite3.connect("vigarik.db")
     main_conn.row_factory = sqlite3.Row
     user_row = main_conn.execute("SELECT * FROM members WHERE user_id = ?", (user_id,)).fetchone()
@@ -578,7 +588,7 @@ async def accept_application(callback: CallbackQuery, state: FSMContext):
 
     game_nick = user_row["game_nick"] if user_row and user_row["game_nick"] else "Игрок"
     player_tag = user_row["player_tag"] if user_row and user_row["player_tag"] else "#N/A"
-    username = app.get("username", "None")
+    username = "None" # Убираем .get() со sqlite3.Row чтобы не было краша
     trophies = user_row["trophies"] if user_row and "trophies" in user_row.keys() else 0
 
     # Занимаем слот
@@ -595,7 +605,6 @@ async def accept_application(callback: CallbackQuery, state: FSMContext):
 
     await callback.message.edit_text("✅ Заявка принята, игрок добавлен в лигу!")
     await callback.answer()
-
 
 @router.callback_query(F.data.startswith("league:reject:"))
 async def reject_application(callback: CallbackQuery, state: FSMContext):
