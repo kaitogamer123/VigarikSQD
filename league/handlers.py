@@ -409,15 +409,22 @@ async def confirm_transfer(message: Message, state: FSMContext):
                        (league_data["id"], user_id))
         cursor.execute("UPDATE league_members SET role = 'лидер' WHERE league_id = ? AND slot_index = ?",
                        (league_data["id"], target_slot))
-        # Меняем слоты (текущий лидер на слот 2, новый лидер на 1)
-        cursor.execute("UPDATE league_members SET slot_index = ? WHERE slot_index = 1", (target_slot,))
-        cursor.execute("UPDATE league_members SET slot_index = 1 WHERE slot_index = ?", (target_slot,))
+
+        # Меняем слоты местами через временный индекс (99), чтобы база не запуталась
+        cursor.execute("UPDATE league_members SET slot_index = 99 WHERE league_id = ? AND slot_index = 1",
+                       (league_data["id"],))
+        cursor.execute("UPDATE league_members SET slot_index = 1 WHERE league_id = ? AND slot_index = ?",
+                       (league_data["id"], target_slot))
+        cursor.execute("UPDATE league_members SET slot_index = ? WHERE league_id = ? AND slot_index = 99",
+                       (target_slot, league_data["id"]))
+
         conn.commit()
         await message.answer("👑 Лидерство успешно передано!")
 
     conn.close()
     await state.clear()
     await open_league_root(message, state)
+
 @router.callback_query(F.data == "league:back_root")
 async def back_to_league_main_menu(callback: CallbackQuery, state: FSMContext):
     await state.clear()
