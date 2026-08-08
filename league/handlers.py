@@ -253,19 +253,24 @@ async def confirm_apply(callback: CallbackQuery, state: FSMContext):
 
     conn = get_db()
     cursor = conn.cursor()
-    try:
-        cursor.execute("""
-            INSERT INTO league_applications (league_id, user_id, text) VALUES (?, ?, ?)
-        """, (league_id, user_id, apply_text))
-        conn.commit()
-    except Exception:
-        pass
+
+    # 1. Исправлено имя колонки на text_reason
+    # 2. Добавлена проверка на случай, если данные в state слетели
+    if not league_id or not apply_text:
+        await callback.answer("Ошибка: данные заявки утеряны. Попробуйте еще раз.")
+        await state.clear()
+        return
+
+    cursor.execute("""
+        INSERT INTO league_applications (league_id, user_id, text_reason) VALUES (?, ?, ?)
+    """, (league_id, user_id, apply_text))
+
+    conn.commit()
     conn.close()
 
     await state.clear()
     await callback.message.edit_text("✅ Заявка успешно отправлена лидеру лиги!")
     await callback.answer()
-
 
 @router.message(LeagueStates.waiting_apply_text)
 async def process_apply_text(message: Message, state: FSMContext):
@@ -278,29 +283,6 @@ async def process_apply_text(message: Message, state: FSMContext):
     await message.answer(f"Текст вашей заявки:\n\n<i>{message.text.strip()}</i>\n\nПодтверждаете отправку?",
                          reply_markup=keyboard, parse_mode="HTML")
     await state.set_state(LeagueStates.waiting_apply_confirm)
-
-
-@router.callback_query(F.data == "league:apply_confirm")
-async def confirm_apply(callback: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    league_id = data.get("target_league_id")
-    apply_text = data.get("apply_text")
-    user_id = callback.from_user.id
-
-    conn = get_db()
-    cursor = conn.cursor()
-    try:
-        cursor.execute("""
-            INSERT INTO league_applications (league_id, user_id, text) VALUES (?, ?, ?)
-        """, (league_id, user_id, apply_text))
-        conn.commit()
-    except Exception:
-        pass
-    conn.close()
-
-    await state.clear()
-    await callback.message.edit_text("✅ Заявка успешно отправлена лидеру лиги!")
-    await callback.answer()
 
 
 @router.message(F.text == "🚪 Выгнать участника")
@@ -823,3 +805,33 @@ async def process_invite_target(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(f"✅ Приглашение для игрока <code>{target}</code> успешно отправлено!", parse_mode="HTML")
     await open_league_root(message, state)
+
+
+@router.message(F.text == "📥 Приглашения в лигу")
+async def view_league_invites(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+
+    conn = get_db()
+    cursor = conn.cursor()
+    # Вытаскиваем приглашения для этого пользователя
+    invites = cursor.execute("""
+        SELECT i.*, l.name as league_name, l.tag as league_tag 
+        FROM league_invites i
+        JOIN leagues l ON i.league_id = l.id
+        WHERE i.invitee_id = ?
+    """, (user_id,)).fetchall()
+    conn.close()
+
+    if not invites:
+        await message.answer("📭 У вас нет активных приглашений в лиги.")
+        return
+
+    builder = InlineKeyboardBuilder()
+    for inv in invites:
+        builder.button(
+            text=f"🏰 {inv['league_name']} [{inv['league_tag']}]",
+            callback_data=f"league:invite_view:{inv['id']}"
+        )
+    builder.adjust(1)
+
+    await message.answer("📥 Список полученных приглашений в лиги:", reply_markup=builder.as_markup())
