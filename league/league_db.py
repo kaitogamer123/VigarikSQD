@@ -44,7 +44,7 @@ def init_league_db():
         )
     """)
 
-    # Таблица заявок в лиги
+    # Таблица заявок в лиги (с исправленной колонкой text_reason)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS league_applications (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -65,6 +65,12 @@ def init_league_db():
             invitee_id INTEGER,
             FOREIGN KEY (league_id) REFERENCES leagues(id) ON DELETE CASCADE
         )
+    """)
+
+    # Уникальный индекс, чтобы исключить дублирование приглашений в ту же лигу одному юзеру
+    cursor.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_invite 
+        ON league_invites (league_id, invitee_id)
     """)
 
     conn.commit()
