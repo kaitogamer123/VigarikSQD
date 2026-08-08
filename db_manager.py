@@ -36,9 +36,9 @@ async def fetch_player_from_api(player_tag: str):
                         "tag": f"#{clean_tag}"
                     }
                 else:
-                    print(f"⚠️ Ошибка API Brawl Stars: статус {response.status}")
+                    print(f"⚠️ Ошибка API Brawl Stars для тега #{clean_tag}: статус {response.status}")
         except Exception as e:
-            print(f"⚠️ Не удалось подключиться к API: {e}")
+            print(f"⚠️ Не удалось подключиться к API для тега #{clean_tag}: {e}")
     return None
 
 
@@ -132,6 +132,94 @@ def add_member():
     except Exception as e:
         print(f"❌ Ошибка при добавлении: {e}")
     conn.close()
+
+
+async def process_bulk_import(lines, role, clan, registered):
+    conn = get_connection()
+    if not conn:
+        return
+    cursor = conn.cursor()
+
+    success_count = 0
+    fail_count = 0
+
+    for line_num, line in enumerate(lines, 1):
+        line = line.strip()
+        if not line:
+            continue
+
+        # Поддерживаем разделение пробелом, табуляцией или запятой (например: 12345678 #ABC123XYZ)
+        parts = line.replace(",", " ").split()
+        if len(parts) < 2:
+            print(f"⚠️ Строка {line_num} пропущена (неверный формат): '{line}'")
+            fail_count += 1
+            continue
+
+        user_id = parts[0].strip()
+        player_tag = parts[1].strip()
+
+        print(f"\n⏳ [{line_num}] Обработка ID: {user_id} | Тег: {player_tag}...")
+        api_data = await fetch_player_from_api(player_tag)
+
+        if api_data:
+            game_nick = api_data["name"]
+            trophies = api_data["trophies"]
+            clean_tag = api_data["tag"]
+            print(f"   ✅ Найдено в API: {game_nick} ({trophies} кубков)")
+        else:
+            game_nick = "Игрок"
+            trophies = 0
+            clean_tag = player_tag.upper()
+            print(f"   ⚠️ API не ответил, сохраняем с дефолтным ником.")
+
+        try:
+            cursor.execute("""
+                INSERT OR REPLACE INTO members 
+                (user_id, username, game_nick, player_tag, trophies, role, clan, registered, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            """, (user_id, None, game_nick, clean_tag, trophies, role, clan, registered))
+            conn.commit()
+            success_count += 1
+        except Exception as e:
+            print(f"   ❌ Ошибка записи в БД: {e}")
+            fail_count += 1
+
+    conn.close()
+    print(
+        f"\n🎉 Массовое добавление завершено! Успешно добавлено/обновлено: {success_count}, ошибок/пропусков: {fail_count}")
+
+
+def bulk_add_members():
+    print("\n📥 МАССОВОЕ ДОБАВЛЕНИЕ УЧАСТНИКОВ")
+    print("Сначала зададим общие параметры для этого списка:")
+
+    role = input("Введите роль для всех (например, member): ").strip() or "member"
+    clan = input("Введите клан для всех (например, squad / academy): ").strip()
+    reg_input = input("Статус регистрации (1 или 0) [по умолчанию 1]: ").strip()
+    registered = int(reg_input) if reg_input in ("0", "1") else 1
+
+    print("\nТеперь вставь список строками. Каждая строка: Telegram_ID и Тег_Бравл_Старс")
+    print("Пример:")
+    print("123456789 #9VJG88")
+    print("987654321 #ABC123")
+    print("Когда закончишь вставлять, нажми Enter на пустой строке, а затем введи слово `END` и нажми Enter:\n")
+
+    lines = []
+    while True:
+        try:
+            line = input()
+        except EOFError:
+            break
+        if line.strip().upper() == "END":
+            break
+        lines.append(line)
+
+    if not lines:
+        print("❌ Список пуст.")
+        return
+
+    print(f"\n🚀 Запускаю обработку {len(lines)} строк с запросами к API...")
+    asyncio.run(process_bulk_import(lines, role, clan, registered))
 
 
 def update_member_field():
@@ -230,9 +318,10 @@ def main():
         print("3. ➕ Добавить нового участника по тегу (авто-ник из API)")
         print("4. ✏️ Изменить данные игрока")
         print("5. ❌ Удалить игрока из базы")
+        print("6. 📥 Массовое добавление участников (пачкой)")
         print("0. 🚪 Выход из панели")
 
-        choice = input("\nВыберите действие (0-5): ").strip()
+        choice = input("\nВыберите действие (0-6): ").strip()
         if choice == "1":
             show_all_members()
         elif choice == "2":
@@ -243,6 +332,8 @@ def main():
             update_member_field()
         elif choice == "5":
             delete_member()
+        elif choice == "6":
+            bulk_add_members()
         elif choice == "0":
             print("Выход.")
             break
