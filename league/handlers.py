@@ -971,11 +971,10 @@ async def reject_invite(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text("❌ Приглашение отклонено.")
     await callback.answer()
 
-
-@router.callback_query(F.data.contains("🚪 Выйти из лиги"))
-async def leave_league(callback: CallbackQuery, state: FSMContext):
-    # Весь остальной код функции остается прежним
-    user_id = callback.from_user.id
+@router.message(F.text.contains("Выйти из лиги"))
+async def text_leave_league(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+    
     conn = get_db()
     cursor = conn.cursor()
 
@@ -985,7 +984,7 @@ async def leave_league(callback: CallbackQuery, state: FSMContext):
 
     if not member:
         conn.close()
-        await callback.answer("❌ Вы не состоите в лиге.", show_alert=True)
+        await message.answer("❌ Вы не состоите в лиге.")
         return
 
     league_id = member["league_id"]
@@ -993,19 +992,14 @@ async def leave_league(callback: CallbackQuery, state: FSMContext):
     if member["role"] == 'лидер':
         cursor.execute("DELETE FROM leagues WHERE id = ?", (league_id,))
         cursor.execute("DELETE FROM league_members WHERE league_id = ?", (league_id,))
-        await callback.message.edit_text("✅ Вы покинули лигу. Так как вы были лидером, лига была удалена.")
+        await message.answer("✅ Вы покинули лигу. Так как вы были лидером, лига была удалена.")
     else:
         cursor.execute("""
             UPDATE league_members 
             SET user_id = NULL, game_nick = NULL, player_tag = NULL, username = NULL, trophies_record = 0
             WHERE user_id = ?
         """, (user_id,))
-        await callback.message.edit_text("✅ Вы успешно вышли из лиги.")
+        await message.answer("✅ Вы успешно вышли из лиги.")
 
     conn.commit()
     conn.close()
-    await callback.answer()
-@router.callback_query()
-async def debug_callback(callback: CallbackQuery):
-    print(f"\n\n👉 НАЖАТА КНОПКА, DATA = {repr(callback.data)}\n\n")
-    await callback.answer(f"Data: {callback.data}")
