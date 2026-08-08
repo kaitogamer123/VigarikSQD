@@ -785,3 +785,108 @@ async def withdraw_application(callback: CallbackQuery):
 
     await callback.message.edit_text("❌ Ваша заявка была отозвана.")
     await callback.answer()
+
+
+# --- ДЕТАЛИ И РЕШЕНИЕ ПО ЗАЯВКЕ ЛИДЕРОМ ---
+@router.callback_query(F.data.startswith("league:app_detail:"))
+async def view_app_detail(callback: CallbackQuery):
+    app_id = int(callback.data.split(":")[-1])
+    conn = get_db()
+    cursor = conn.cursor()
+    app = cursor.execute("SELECT * FROM league_applications WHERE id = ?", (app_id,)).fetchone()
+
+    if not app:
+        conn.close()
+        await callback.answer("Заявка не найдена или уже обработана.", show_alert=True)
+        return
+
+    main_conn = sqlite3.connect("vigarik.db")
+    main_conn.row_factory = sqlite3.Row
+    u_row = main_conn.execute("SELECT * FROM members WHERE user_id = ?", (app["user_id"],)).fetchone()
+    main_conn.close()
+
+    nick = u_row["game_nick"] if u_row and "game_nick" in u_row.keys() else f"ID: {app['user_id']}"
+    trophies = u_row["trophies"] if u_row and "trophies" in u_row.keys() else 0
+    conn.close()
+
+    text = (
+        f"📩 Заявка от игрока: <b>{nick}</b>\n"
+        f"🏆 Трофеи: {trophies}\n\n"
+        f"💬 Текст заявки:\n<i>\"{app['text_reason']}\"</i>"
+    )
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Принять", callback_data=f"league:app_accept:{app_id}"),
+            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"league:app_reject:{app_id}")
+        ],
+        [InlineKeyboardButton(text="◀️ К списку заявок", callback_data="league:view_requests")]
+    ])
+
+    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("league:app_accept:"))
+async def accept_application(callback: CallbackQuery):
+    app_id = int(callback.data.split(":")[-1])
+    conn = get_db()
+    cursor = conn.cursor()
+
+    app = cursor.execute("SELECT * FROM league_applications WHERE id = ?", (app_id,)).fetchone()
+    if not app:
+        conn.close()
+        await callback.answer("Заявка не найдена.", show_alert=True)
+        return
+
+    league_id = app["league_id"]
+    target_user_id = app["user_id"]
+
+    free_slot = cursor.execute(
+        "SELECT * FROM league_members WHERE league_id = ? AND slot_index IN (2, 3, 4) AND user_id IS NULL ORDER BY slot_index ASC LIMIT 1",
+        (league_id,)
+    ).fetchone()
+
+    if not free_slot:
+        conn.close()
+        await callback.answer("❌ В лиге больше нет свободных мест (все слоты заняты)!", show_alert=True)
+        return
+
+    main_conn = sqlite3.connect("vigarik.db")
+    main_conn.row_factory = sqlite3.Row
+    u_row = main_conn.execute("SELECT * FROM members WHERE user_id = ?", (target_user_id,)).fetchone()
+    main_conn.close()
+
+    game_nick = u_row["game_nick"] if u_row and u_row["game_nick"] else "Игрок"
+    player_tag = u_row["player_tag"] if u_row and u_row["player_tag"] else "#N/A"
+    trophies = u_row["trophies"] if u_row and "trophies" in u_row.keys() else 0
+    username = u_row["username"] if u_row and "username" in u_row.keys() else ""
+
+    cursor.execute("""
+        UPDATE league_members 
+        SET user_id = ?, game_nick = ?, player_tag = ?, username = ?, role = 'участник', trophies_record = ?
+        WHERE league_id = ? AND slot_index = ?
+    """, (target_user_id, game_nick, player_tag, username, trophies, league_id, free_slot["slot_index"]))
+
+    cursor.execute("DELETE FROM league_applications WHERE user_id = ?", (target_user_id,))
+    cursor.execute("DELETE FROM league_invites WHERE target_user_id = ?", (target_user_id,))
+
+    conn.commit()
+    conn.close()
+
+    await callback.message.edit_text(
+        f"✅ Игрок <b>{game_nick}</b> успешно принят в лигу на слот №{free_slot['slot_index']}!", parse_mode="HTML")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("league:app_reject:"))
+async def reject_application(callback: CallbackQuery):
+    app_id = int(callback.data.split(":")[-1])
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM league_applications WHERE id = ?", (app_id,))
+    conn.commit()
+    conn.close()
+
+    await callback.message.edit_text("❌ Заявка была отклонена.")
+    await callback.answer()
