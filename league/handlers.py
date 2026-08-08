@@ -532,13 +532,15 @@ async def view_app_detail(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Заявка не найдена")
         return
 
-    text = f"📩 Заявка от игрока (ID: {app['user_id']}):\n\n<i>{app['text']}</i>"
+    # Исправлено с app['text'] на app['text_reason']
+    text = f"📩 Заявка от игрока (ID: {app['user_id']}):\n\n<i>{app['text_reason']}</i>"
+
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Принять", callback_data=f"league:accept:{app_id}"),
          InlineKeyboardButton(text="❌ Отклонить", callback_data=f"league:reject:{app_id}")]
     ])
     await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
-
+    await callback.answer()
 
 @router.callback_query(F.data.startswith("league:accept:"))
 async def accept_application(callback: CallbackQuery, state: FSMContext):
