@@ -97,7 +97,7 @@ async def open_league_root(message: Message, state: FSMContext):
 @router.callback_query(F.data == "league:create")
 async def start_create_league(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text(
-        "Напиши полное название лиги (например, ViGarikSQuaD):\nПРИНИМАТЬ ЛЮБЫЕ СИМВОЛЫ В НАЗВАНИИ!!!")
+        "Напиши полное название лиги (например, ViGarikSQuaD):\n")
     await state.set_state(LeagueStates.waiting_for_league_name)
     await callback.answer()
 
@@ -198,12 +198,13 @@ async def toggle_league_open(callback: CallbackQuery):
 async def show_leagues_to_apply(callback: CallbackQuery):
     conn = get_db()
     cursor = conn.cursor()
-    # Получаем все лиги и считаем количество занятых участников (где user_id IS NOT NULL)
+    # Добавили GROUP BY l.id, чтобы корректно работал фильтр HAVING
     leagues = cursor.execute("""
         SELECT l.*, 
         (SELECT COUNT(*) FROM league_members WHERE league_id = l.id AND user_id IS NOT NULL) as count_members
         FROM leagues l
         WHERE l.is_open = 1
+        GROUP BY l.id
         HAVING count_members < 4
         ORDER BY count_members DESC
     """).fetchall()
@@ -220,7 +221,6 @@ async def show_leagues_to_apply(callback: CallbackQuery):
     await callback.message.edit_text(text, reply_markup=builder.as_markup())
     await callback.answer()
 
-
 # Просмотр информации о конкретной лиге
 @router.callback_query(F.data.startswith("league:info:"))
 async def view_league_info(callback: CallbackQuery):
@@ -236,15 +236,17 @@ async def view_league_info(callback: CallbackQuery):
         await callback.answer("Лига не найдена!", show_alert=True)
         return
 
+    league_elo = league["record_league"] if league["record_league"] else 0
     lines = [f"Лига - {league['name']} [{league['tag']}]\n"]
+
     for m in members:
         slot = m["slot_index"]
         if m["user_id"] is None:
             lines.append(f"{slot}. -- Свободное место --")
         else:
-            role_label = "ЛИДЕР" if m["role"] == "лидер" else "УЧАСТНИК"
-            lines.append(
-                f"{slot}. {m['game_nick']} - {role_label} - Рекорд трофеев: {m['trophies_record']} - Рекорд лиги: {league['record_league']}")
+            role_label = "Лидер" if m["role"] == "лидер" else "Участник"
+            trophies = m["trophies_record"] if m["trophies_record"] else 0
+            lines.append(f"{slot}. {m['game_nick']} — {role_label} | {trophies}🏆 | {league_elo} Elo Ranked")
 
     text = "\n".join(lines)
 
@@ -255,20 +257,28 @@ async def view_league_info(callback: CallbackQuery):
     await callback.message.edit_text(text, reply_markup=keyboard)
     await callback.answer()
 
-
 # Возврат в корень папки Лиги
+# --- УМНЫЙ ВОЗВРАТ НАЗАД ---
 @router.callback_query(F.data == "league:back_root")
-async def back_to_league_root(callback: CallbackQuery):
+async def back_to_league_root(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
     user_id = callback.from_user.id
     league_data = get_user_league(user_id)
-    text = "Кажется тебя ещё нету ни в одной лиге. Время вступить в одну из них, или создать свою!"
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Подать заявку в лигу", callback_data="league:apply_list")],
-        [InlineKeyboardButton(text="Мои заявки", callback_data="league:my_applications")],
-        [InlineKeyboardButton(text="Приглашения в лигу", callback_data="league:invites")],
-        [InlineKeyboardButton(text="Создать лигу", callback_data="league:create")]
-    ])
-    await callback.message.edit_text(text, reply_markup=keyboard)
+
+    if not league_data:
+        # Если реально не в лиге — показываем меню для безлижных
+        text = "Кажется тебя ещё нету ни в одной лиге. Время вступить в одну из них, или создать свою!"
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📋 Все лиги", callback_data="league:all_list")],
+            [InlineKeyboardButton(text="Подать заявку в лигу", callback_data="league:apply_list")],
+            [InlineKeyboardButton(text="Мои заявки", callback_data="league:my_applications")],
+            [InlineKeyboardButton(text="Приглашения в лигу", callback_data="league:invites")],
+            [InlineKeyboardButton(text="Создать лигу", callback_data="league:create")]
+        ])
+        await callback.message.edit_text(text, reply_markup=keyboard)
+    else:
+        # Если состоит в лиге — вызываем отрисовку главного меню лиги (лидера или мембера)
+        await open_league_root(callback.message, state)
     await callback.answer()
 
 
@@ -820,14 +830,17 @@ async def view_my_team_info(callback: CallbackQuery):
                              (league_id,)).fetchall()
     conn.close()
 
+    league_elo = league_data["record_league"] if league_data["record_league"] else 0
     lines = [f"🏰 Ваша лига - <b>{league_data['name']} [{league_data['tag']}]</b>\n"]
+
     for m in members:
         slot = m["slot_index"]
         if m["user_id"] is None:
             lines.append(f"{slot}. -- Свободное место --")
         else:
-            role_label = "ЛИДЕР" if m["role"] == "лидер" else "УЧАСТНИК"
-            lines.append(f"{slot}. {m['game_nick']} — {role_label} | Рекорд трофеев: {m['trophies_record']}")
+            role_label = "Лидер" if m["role"] == "лидер" else "Участник"
+            trophies = m["trophies_record"] if m["trophies_record"] else 0
+            lines.append(f"{slot}. {m['game_nick']} — {role_label} | {trophies}🏆 | {league_elo} Elo Ranked")
 
     text = "\n".join(lines)
 
