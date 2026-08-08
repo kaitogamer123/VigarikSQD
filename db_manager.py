@@ -3,6 +3,8 @@ import os
 import asyncio
 import aiohttp
 
+from config import BS_API_TOKEN, CLAN_TAGS
+
 DB_PATH = "vigarik.db"
 
 
@@ -16,12 +18,7 @@ def get_connection():
 async def fetch_player_from_api(player_tag: str):
     """Асинхронно забирает ник, кубки и клуб из официального API Brawl Stars."""
     clean_tag = player_tag.strip().upper().replace("#", "")
-    try:
-        from config import BRAWL_API_TOKEN
-        headers = {"Authorization": f"Bearer {BRAWL_API_TOKEN}"}
-    except ImportError:
-        headers = {}
-
+    headers = {"Authorization": f"Bearer {BS_API_TOKEN}"} if BS_API_TOKEN else {}
     url = f"https://api.brawlstars.com/v1/players/%23{clean_tag}"
 
     async with aiohttp.ClientSession() as session:
@@ -40,6 +37,19 @@ async def fetch_player_from_api(player_tag: str):
         except Exception as e:
             print(f"⚠️ Не удалось подключиться к API для тега #{clean_tag}: {e}")
     return None
+
+
+def resolve_clan_key(club_info):
+    """Определяет короткий ключ клана по тегу из API с помощью CLAN_TAGS."""
+    if not club_info:
+        return "No Club"
+    
+    api_club_tag = club_info.get("tag", "").upper().strip().replace("#", "")
+    for key, tag in CLAN_TAGS.items():
+        if tag.upper().strip().replace("#", "") == api_club_tag:
+            return key
+            
+    return club_info.get("name", "Other Club")
 
 
 def show_all_members():
@@ -121,15 +131,14 @@ def add_member():
         game_nick = api_data["name"]
         trophies = api_data["trophies"]
         clean_tag = api_data["tag"]
-        club_info = api_data.get("club")
-        clan = club_info.get("name") if club_info else "No Club"
-        print(f"✅ Найдено в API! Ник: {game_nick} | Кубки: {trophies} | Клан: {clan}")
+        clan = resolve_clan_key(api_data.get("club"))
+        print(f"✅ Найдено в API! Ник: {game_nick} | Кубки: {trophies} | Клан (ключ): {clan}")
     else:
         print("⚠️ Не удалось получить данные из API (тег введен верно?). Записываем без авто-ника.")
         game_nick = "Игрок"
         trophies = 0
         clean_tag = player_tag.upper()
-        clan = "Unknown"
+        clan = "unknown"
 
     try:
         cursor.execute("""
@@ -191,16 +200,14 @@ async def process_bulk_import(lines, default_role, registered):
             game_nick = api_data["name"]
             trophies = api_data["trophies"]
             clean_tag = api_data["tag"]
+            clan = resolve_clan_key(api_data.get("club"))
 
-            club_info = api_data.get("club")
-            clan = club_info.get("name") if club_info else "No Club"
-
-            print(f"   ✅ Найдено: {game_nick} | Кубки: {trophies} | Клан: {clan}")
+            print(f"   ✅ Найдено: {game_nick} | Кубки: {trophies} | Клан (ключ): {clan}")
         else:
             game_nick = "Игрок"
             trophies = 0
             clean_tag = player_tag.upper()
-            clan = "Unknown"
+            clan = "unknown"
             print(f"   ⚠️ API не ответил, сохраняем с дефолтными значениями.")
 
         try:
@@ -299,14 +306,13 @@ def update_member_field():
         api_data = asyncio.run(fetch_player_from_api(clean_tag))
 
         if api_data:
-            club_info = api_data.get("club")
-            clan_name = club_info.get("name") if club_info else "No Club"
+            clan_key = resolve_clan_key(api_data.get("club"))
             cursor.execute("""
                 UPDATE members 
                 SET player_tag = ?, game_nick = ?, trophies = ?, clan = ?, updated_at = datetime('now') 
                 WHERE user_id = ?
-            """, (api_data["tag"], api_data["name"], api_data["trophies"], clan_name, user_id))
-            print(f"✅ Тег обновлен, ник изменен на '{api_data['name']}', клан обновлен на '{clan_name}'!")
+            """, (api_data["tag"], api_data["name"], api_data["trophies"], clan_key, user_id))
+            print(f"✅ Тег обновлен, ник изменен на '{api_data['name']}', клан обновлен на '{clan_key}'!")
         else:
             cursor.execute("UPDATE members SET player_tag = ?, updated_at = datetime('now') WHERE user_id = ?",
                            (clean_tag, user_id))
