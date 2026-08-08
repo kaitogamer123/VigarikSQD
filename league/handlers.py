@@ -236,8 +236,11 @@ async def view_league_info(callback: CallbackQuery):
         await callback.answer("Лига не найдена!", show_alert=True)
         return
 
-    league_elo = league["record_league"] if league["record_league"] else 0
     lines = [f"Лига - {league['name']} [{league['tag']}]\n"]
+
+    # Подключаемся к основной базе vigarik.db для получения актуального Elo
+    main_conn = sqlite3.connect("vigarik.db")
+    main_conn.row_factory = sqlite3.Row
 
     for m in members:
         slot = m["slot_index"]
@@ -246,8 +249,15 @@ async def view_league_info(callback: CallbackQuery):
         else:
             role_label = "Лидер" if m["role"] == "лидер" else "Участник"
             trophies = m["trophies_record"] if m["trophies_record"] else 0
-            lines.append(f"{slot}. {m['game_nick']} — {role_label} | {trophies}🏆 | {league_elo} Elo Ranked")
 
+            # Достаем актуальное ranked_elo участника
+            member_db_row = main_conn.execute("SELECT ranked_elo FROM members WHERE user_id = ?",
+                                              (m["user_id"],)).fetchone()
+            current_elo = member_db_row["ranked_elo"] if member_db_row and "ranked_elo" in member_db_row.keys() else 0
+
+            lines.append(f"{slot}. {m['game_nick']} — {role_label} | {trophies}🏆 | {current_elo} Elo Ranked")
+
+    main_conn.close()
     text = "\n".join(lines)
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -256,7 +266,6 @@ async def view_league_info(callback: CallbackQuery):
     ])
     await callback.message.edit_text(text, reply_markup=keyboard)
     await callback.answer()
-
 # Возврат в корень папки Лиги
 # --- УМНЫЙ ВОЗВРАТ НАЗАД ---
 @router.callback_query(F.data == "league:back_root")
@@ -380,7 +389,7 @@ async def view_league_requests(callback: CallbackQuery):
         conn.close()
         await callback.message.edit_text("📭 На данный момент нет активных заявок в вашу лигу.",
                                          reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                                             [InlineKeyboardButton(text="◀️ Назад", callback_data="league:back_main")]
+                                             [InlineKeyboardButton(text="◀️ Назад", callback_data="league:back_root")]
                                          ]))
         return
 
@@ -396,7 +405,7 @@ async def view_league_requests(callback: CallbackQuery):
 
         builder.button(text=f"{nick} | {date_str}", callback_data=f"league:app_detail:{app['id']}")
 
-    builder.button(text="◀️ Назад", callback_data="league:back_main")
+    builder.button(text="◀️ Назад", callback_data="league:back_root")
     builder.adjust(1)
     conn.close()
 
@@ -688,7 +697,7 @@ async def confirm_transfer(callback: CallbackQuery, state: FSMContext):
 
 
 # --- КНОПКА ВОЗВРАТА В ГЛАВНОЕ МЕНЮ ЛИГИ ---
-@router.callback_query(F.data == "league:back_main")
+@router.callback_query(F.data == "league:back_root")
 async def back_to_league_main_menu(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     # Вызываем отрисовку главного меню лиги повторно
@@ -830,8 +839,11 @@ async def view_my_team_info(callback: CallbackQuery):
                              (league_id,)).fetchall()
     conn.close()
 
-    league_elo = league_data["record_league"] if league_data["record_league"] else 0
     lines = [f"🏰 Ваша лига - <b>{league_data['name']} [{league_data['tag']}]</b>\n"]
+
+    # Подключаемся к основной базе vigarik.db, чтобы достать актуальное Elo участников
+    main_conn = sqlite3.connect("vigarik.db")
+    main_conn.row_factory = sqlite3.Row
 
     for m in members:
         slot = m["slot_index"]
@@ -840,12 +852,19 @@ async def view_my_team_info(callback: CallbackQuery):
         else:
             role_label = "Лидер" if m["role"] == "лидер" else "Участник"
             trophies = m["trophies_record"] if m["trophies_record"] else 0
-            lines.append(f"{slot}. {m['game_nick']} — {role_label} | {trophies}🏆 | {league_elo} Elo Ranked")
 
+            # Достаем актуальное ranked_elo из таблицы members
+            member_db_row = main_conn.execute("SELECT ranked_elo FROM members WHERE user_id = ?",
+                                              (m["user_id"],)).fetchone()
+            current_elo = member_db_row["ranked_elo"] if member_db_row and "ranked_elo" in member_db_row.keys() else 0
+
+            lines.append(f"{slot}. {m['game_nick']} — {role_label} | {trophies}🏆 | {current_elo} Elo Ranked")
+
+    main_conn.close()
     text = "\n".join(lines)
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="league:back_main")]
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="league:back_root")]
     ])
 
     await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
