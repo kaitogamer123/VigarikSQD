@@ -52,8 +52,7 @@ async def process_player_tag_registration(message: Message, state: FSMContext, b
     # Авто-определение клана
     detected_clan = None
     for clan_key, configured_tag in config.CLAN_TAGS.items():
-        if api_clan_tag and api_clan_tag.strip().upper().replace("#", "") == configured_tag.strip().upper().replace("#",
-                                                                                                                    ""):
+        if api_clan_tag and api_clan_tag.strip().upper().replace("#", "") == configured_tag.strip().upper().replace("#", ""):
             detected_clan = clan_key
             break
 
@@ -66,14 +65,22 @@ async def process_player_tag_registration(message: Message, state: FSMContext, b
         return
 
     # Сохраняем временные данные в FSM (нужно для обычных игроков)
-    await state.update_data(raw_tag=raw_tag, game_nick=game_nick, trophies=trophies, detected_clan=detected_clan)
+    # Сохраняем также реальный username и имя юзера из Telegram, чтобы не затирать их потом заглушками!
+    await state.update_data(
+        raw_tag=raw_tag,
+        game_nick=game_nick,
+        trophies=trophies,
+        detected_clan=detected_clan,
+        tg_username=username,
+        tg_firstname=message.from_user.first_name or "Игрок",
+        tg_lastname=message.from_user.last_name or ""
+    )
 
     # Проверяем, есть ли текущий игрок в файле admins.txt на лету
     file_rights = get_admin_rights_from_file(user_id)
 
     # ЛОГИКА АВТО-ОДОБРЕНИЯ АДМИНИСТРАЦИИ И ВЛАДЕЛЬЦА
     if user_id == 7899153362 or file_rights is not None:
-        # ИСПРАВЛЕНО: Для админов FSM чистим мгновенно, чтобы кнопки меню не багались!
         await state.clear()
 
         assigned_role = "president"
@@ -240,10 +247,24 @@ async def process_admin_verification_v3(call: CallbackQuery, bot: Bot):
 
     # 2. ОБРАБОТКА ОТМЕНЫ (НАЖАЛИ "НЕТ") — Возвращаем базовые кнопки
     if stage == "no":
-        await call.message.edit_text(text=restored_text, reply_markup=kb_init)
+        await call.answer("Отменено")
+        try:
+            player_data = await get_player_profile(player_tag)
+            game_nick = player_data["name"] if player_data else "Игрок"
+            action_word = "принять" if action == "ap" else "отклонить"
+
+            kb_init = InlineKeyboardMarkup(inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="✅ Принять", callback_data=f"v3:ap:{target_id}:{player_tag}:init"),
+                    InlineKeyboardButton(text="❌ Отклонить", callback_data=f"v3:dc:{target_id}:{player_tag}:init")
+                ]
+            ])
+            await call.message.edit_text(text=f"Заявка игрока {hd.quote(game_nick)}:", parse_mode="HTML", reply_markup=kb_init)
+        except Exception:
+            pass
         return
 
-        # 3. ОБРАБОТКА ПОДТВЕРЖДЕНИЯ (НАЖАЛИ "ДА")
+    # 3. ОБРАБОТКА ПОДТВЕРЖДЕНИЯ (НАЖАЛИ "ДА")
     if stage == "yes":
         admin_name = f"@{call.from_user.username}" if call.from_user.username else call.from_user.first_name
 
@@ -261,10 +282,10 @@ async def process_admin_verification_v3(call: CallbackQuery, bot: Bot):
         if action == "ap":
             detected_clan = "squad"
             for clan_key, configured_tag in config.CLAN_TAGS.items():
-                if clan_tag and clan_tag.strip().upper().replace("#", "") == configured_tag.strip().upper().replace("#",
-                                                                                                                    ""):
+                if clan_tag and clan_tag.strip().upper().replace("#", "") == configured_tag.strip().upper().replace("#", ""):
                     detected_clan = clan_key
                     break
+
             # По умолчанию роль обычного участника
             assigned_role = "member"
 
@@ -276,11 +297,25 @@ async def process_admin_verification_v3(call: CallbackQuery, bot: Bot):
                     detected_clan = file_rights["clan"]
 
             try:
-                # Фиксируем игрока в базе данных
+                # ИСПРАВЛЕНО: Достаем реальные данные юзера из базы (если он там уже есть) или берем безопасные дефолты вместо затирания "unknown" и "Игрок"
+                old_member = await db.get_member(target_id) or {}
+
+                real_username = old_member.get("username") or f"user_{target_id}"
+                real_firstname = old_member.get("first_name") or game_nick
+                real_lastname = old_member.get("last_name") or ""
+
+                # Фиксируем игрока в базе данных с нормальными данными и тегом
                 await db.upsert_member(
-                    user_id=target_id, username="unknown", first_name="Игрок", last_name="",
-                    game_nick=game_nick, player_tag=player_tag, trophies=trophies,
-                    clan=detected_clan, role=assigned_role, registered=1
+                    user_id=target_id,
+                    username=real_username,
+                    first_name=real_firstname,
+                    last_name=real_lastname,
+                    game_nick=game_nick,
+                    player_tag=player_tag,
+                    trophies=trophies,
+                    clan=detected_clan,
+                    role=assigned_role,
+                    registered=1
                 )
             except Exception as e:
                 logger.error(f"Ошибка сохранения игрока: {e}")
