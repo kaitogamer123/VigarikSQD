@@ -3,7 +3,7 @@ import os
 import asyncio
 import aiohttp
 
-from config import BS_API_TOKEN, CLAN_TAGS
+from config import BRAWL_API_TOKEN as BS_API_TOKEN, CLAN_TAGS
 
 DB_PATH = "vigarik.db"
 
