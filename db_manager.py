@@ -103,6 +103,18 @@ def add_member():
     reg_input = input("Статус регистрации (1 - активен в списках, 0 - нет) [по умолчанию 1]: ").strip()
     registered = int(reg_input) if reg_input in ("0", "1") else 1
 
+    conn = get_connection()
+    if not conn: return
+    cursor = conn.cursor()
+
+    # Проверка: если игрок уже есть и у него уже зафиксирован тег — прерываем добавление
+    cursor.execute("SELECT player_tag FROM members WHERE user_id = ?", (user_id,))
+    row = cursor.fetchone()
+    if row and row[0] and row[0].strip() != "N/A":
+        print(f"⚠️ Игрок с Telegram ID {user_id} уже прошел проверку и имеет тег ({row[0]}). Пропускаем.")
+        conn.close()
+        return
+
     print("⏳ Запрашиваем данные игрока из Brawl Stars API...")
     api_data = asyncio.run(fetch_player_from_api(player_tag))
 
@@ -120,14 +132,20 @@ def add_member():
         clean_tag = player_tag.upper()
         clan = "Unknown"
 
-    conn = get_connection()
-    if not conn: return
-    cursor = conn.cursor()
     try:
         cursor.execute("""
-            INSERT OR REPLACE INTO members 
+            INSERT INTO members 
             (user_id, username, game_nick, player_tag, trophies, role, clan, registered, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            ON CONFLICT(user_id) DO UPDATE SET
+                username = COALESCE(excluded.username, members.username),
+                game_nick = excluded.game_nick,
+                player_tag = excluded.player_tag,
+                trophies = excluded.trophies,
+                role = excluded.role,
+                clan = excluded.clan,
+                registered = excluded.registered,
+                updated_at = datetime('now')
         """, (user_id, username if username else None, game_nick, clean_tag, trophies, role, clan, registered))
         conn.commit()
         print(f"✅ Участник {game_nick} (ID: {user_id}) успешно сохранен в базе!")
@@ -143,13 +161,14 @@ async def process_bulk_import(lines, default_role, registered):
     cursor = conn.cursor()
 
     success_count = 0
+    skip_count = 0
     fail_count = 0
 
     for line_num, line in enumerate(lines, 1):
         line = line.strip()
         if not line:
             continue
-        
+
         parts = line.replace(",", " ").split()
         if len(parts) < 2:
             print(f"⚠️ Строка {line_num} пропущена (неверный формат): '{line}'")
@@ -159,6 +178,14 @@ async def process_bulk_import(lines, default_role, registered):
         user_id = parts[0].strip()
         player_tag = parts[1].strip()
 
+        # Проверка перед запросом к API: есть ли уже юзер и заполнен ли у него тег
+        cursor.execute("SELECT player_tag FROM members WHERE user_id = ?", (user_id,))
+        row = cursor.fetchone()
+        if row and row[0] and row[0].strip() != "N/A":
+            print(f"⏭️ [{line_num}] Игрок с ID {user_id} уже прошел проверку (тег: {row[0]}). Пропускаем.")
+            skip_count += 1
+            continue
+
         print(f"\n⏳ [{line_num}] Обработка ID: {user_id} | Тег: {player_tag}...")
         api_data = await fetch_player_from_api(player_tag)
 
@@ -166,10 +193,10 @@ async def process_bulk_import(lines, default_role, registered):
             game_nick = api_data["name"]
             trophies = api_data["trophies"]
             clean_tag = api_data["tag"]
-            
+
             club_info = api_data.get("club")
             clan = club_info.get("name") if club_info else "No Club"
-            
+
             print(f"   ✅ Найдено: {game_nick} | Кубки: {trophies} | Клан: {clan}")
         else:
             game_nick = "Игрок"
@@ -180,9 +207,15 @@ async def process_bulk_import(lines, default_role, registered):
 
         try:
             cursor.execute("""
-                INSERT OR REPLACE INTO members 
+                INSERT INTO members 
                 (user_id, username, game_nick, player_tag, trophies, role, clan, registered, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                ON CONFLICT(user_id) DO UPDATE SET
+                    game_nick = excluded.game_nick,
+                    player_tag = excluded.player_tag,
+                    trophies = excluded.trophies,
+                    clan = excluded.clan,
+                    updated_at = datetime('now')
             """, (user_id, None, game_nick, clean_tag, trophies, default_role, clan, registered))
             conn.commit()
             success_count += 1
@@ -191,12 +224,12 @@ async def process_bulk_import(lines, default_role, registered):
             fail_count += 1
 
     conn.close()
-    print(f"\n🎉 Массовое добавление завершено! Успешно: {success_count}, ошибок: {fail_count}")
+    print(f"\n🎉 Массовое добавление завершено! Успешно: {success_count}, пропущено (уже были): {skip_count}, ошибок: {fail_count}")
 
 
 def bulk_add_members():
     print("\n📥 МАССОВОЕ ДОБАВЛЕНИЕ УЧАСТНИКОВ (АВТО-НИК И КЛАН ИЗ API)")
-    
+
     default_role = input("Введите роль для всех добавляемых (например, member): ").strip() or "member"
     reg_input = input("Статус регистрации (1 или 0) [по умолчанию 1]: ").strip()
     registered = int(reg_input) if reg_input in ("0", "1") else 1
