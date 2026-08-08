@@ -973,7 +973,7 @@ async def reject_invite(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-@router.callback_query(F.data == "league:leave")
+@router.callback_query(F.data.in_({"league:leave", "leave_league", "leave"}))
 async def leave_league(callback: CallbackQuery, state: FSMContext):
     user_id = callback.from_user.id
 
