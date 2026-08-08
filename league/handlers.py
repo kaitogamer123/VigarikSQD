@@ -5,6 +5,10 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from league.league_db import get_connection as get_db, init_league_db
+
+# Инициализация базы данных при старте модуля
+init_league_db()
 
 router = Router()
 DB_PATH = os.path.join("league", "league.db")
