@@ -418,11 +418,54 @@ async def confirm_transfer(message: Message, state: FSMContext):
     await open_league_root(message, state)
 @router.callback_query(F.data == "league:back_root")
 async def back_to_league_main_menu(callback: CallbackQuery, state: FSMContext):
-    await callback.message.delete()
-    await open_league_root(callback.message, state)
+    await state.clear()
+    user_id = callback.from_user.id
+    league_data = get_user_league(user_id)
+
+    if not league_data:
+        text = "Кажется тебя ещё нету ни в одной лиге. Время вступить в одну из них, или создать свою!"
+        keyboard = ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text="🌍 Все лиги")],
+                [KeyboardButton(text="📝 Подать заявку в лигу")],
+                [KeyboardButton(text="📩 Мои заявки"), KeyboardButton(text="📥 Приглашения в лигу")],
+                [KeyboardButton(text="➕ Создать лигу")]
+            ],
+            resize_keyboard=True
+        )
+    else:
+        is_leader = (league_data["slot_index"] == 1)
+        status_str = "Открыт ✅" if league_data["is_open"] == 1 else "Закрыт ❌"
+        text = f"🏰 Ваша лига: <b>{league_data['name']} [{league_data['tag']}]</b>\nСтатус набора: {status_str}"
+
+        if is_leader:
+            keyboard = ReplyKeyboardMarkup(
+                keyboard=[
+                    [KeyboardButton(text="🌍 Все лиги"), KeyboardButton(text="👥 Состав лиги")],
+                    [KeyboardButton(text="📋 Просмотреть заявки")],
+                    [KeyboardButton(text="➕ Пригласить игрока"), KeyboardButton(text="🚪 Выгнать участника")],
+                    [KeyboardButton(text="👑 Передать лидерство")],
+                    [KeyboardButton(text="🔒 Закрыть набор / Открыть набор")]
+                ],
+                resize_keyboard=True
+            )
+        else:
+            keyboard = ReplyKeyboardMarkup(
+                keyboard=[
+                    [KeyboardButton(text="🌍 Все лиги"), KeyboardButton(text="👥 Состав лиги")],
+                    [KeyboardButton(text="🚪 Выйти из лиги")]
+                ],
+                resize_keyboard=True
+            )
+
+    # Удаляем инлайн-сообщение со списком/кланом и отправляем актуальное сообщение с нижней клавиатурой
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+
+    await callback.message.answer(text, reply_markup=keyboard, parse_mode="HTML")
     await callback.answer()
-
-
 @router.message(F.text == "👥 Состав лиги")
 async def view_team_info(message: Message, state: FSMContext):
     user_id = message.from_user.id
