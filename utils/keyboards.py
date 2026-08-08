@@ -22,7 +22,7 @@ def main_menu(member: dict) -> ReplyKeyboardMarkup:
     builder = ReplyKeyboardBuilder()
 
     # САМОЕ НАЧАЛО ДЕРЕВА ПАПОК: Кнопка Лиги
-    builder.button(text="Лиги💀")
+    builder.button(text="Лиги 💀 (BetaTest)")
 
     # Остальные кнопки
     builder.button(text="💡 Отправить предложение")
