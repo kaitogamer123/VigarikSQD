@@ -1,7 +1,7 @@
 import os
 import sqlite3
 from aiogram import F, Router, Bot
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
+from aiogram.types import Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -48,7 +48,7 @@ def get_user_league(user_id: int):
     return res
 
 
-# 1. Открытие папки "Лиги 💀 (BetaTest)"
+# 1. Открытие папки "Лиги 💀 (BetaTest)" с обычной клавиатурой внизу
 @router.message(F.text == "Лиги 💀 (BetaTest)")
 async def open_league_root(message: Message, state: FSMContext):
     await state.clear()
@@ -58,13 +58,15 @@ async def open_league_root(message: Message, state: FSMContext):
     if not league_data:
         # Если игрок не в лиге:
         text = "Кажется тебя ещё нету ни в одной лиге. Время вступить в одну из них, или создать свою!"
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🌍 Все лиги", callback_data="league:all_list")],
-            [InlineKeyboardButton(text="📝 Подать заявку в лигу", callback_data="league:apply_list")],
-            [InlineKeyboardButton(text="📩 Мои заявки", callback_data="league:my_applications")],
-            [InlineKeyboardButton(text="📥 Приглашения в лигу", callback_data="league:invites")],
-            [InlineKeyboardButton(text="➕ Создать лигу", callback_data="league:create")]
-        ])
+        keyboard = ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text="🌍 Все лиги")],
+                [KeyboardButton(text="📝 Подать заявку в лигу")],
+                [KeyboardButton(text="📩 Мои заявки"), KeyboardButton(text="📥 Приглашения в лигу")],
+                [KeyboardButton(text="➕ Создать лигу")]
+            ],
+            resize_keyboard=True
+        )
     else:
         # Если игрок в лиге (лидер или участник):
         is_leader = (league_data["slot_index"] == 1)
@@ -72,27 +74,26 @@ async def open_league_root(message: Message, state: FSMContext):
         text = f"🏰 Ваша лига: <b>{league_data['name']} [{league_data['tag']}]</b>\nСтатус набора: {status_str}"
 
         if is_leader:
-            keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🌍 Все лиги", callback_data="league:all_list")],
-                [InlineKeyboardButton(text="👥 Состав лиги", callback_data="league:my_team_info")],
-                [InlineKeyboardButton(text="📋 Просмотреть заявки", callback_data="league:view_requests")],
-                [InlineKeyboardButton(text="➕ Пригласить игрока", callback_data="league:invite_member")],
-                [InlineKeyboardButton(text="🚪 Выгнать участника", callback_data="league:kick_member")],
-                [InlineKeyboardButton(text="👑 Передать лидерство", callback_data="league:transfer_lead")],
-                [InlineKeyboardButton(text="🔒 Закрыть набор / Открыть набор", callback_data="league:toggle_open")]
-            ])
+            keyboard = ReplyKeyboardMarkup(
+                keyboard=[
+                    [KeyboardButton(text="🌍 Все лиги"), KeyboardButton(text="👥 Состав лиги")],
+                    [KeyboardButton(text="📋 Просмотреть заявки")],
+                    [KeyboardButton(text="➕ Пригласить игрока"), KeyboardButton(text="🚪 Выгнать участника")],
+                    [KeyboardButton(text="👑 Передать лидерство")],
+                    [KeyboardButton(text="🔒 Закрыть набор / Открыть набор")]
+                ],
+                resize_keyboard=True
+            )
         else:
-            keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🌍 Все лиги", callback_data="league:all_list")],
-                [InlineKeyboardButton(text="👥 Состав лиги", callback_data="league:my_team_info")],
-                [InlineKeyboardButton(text="🚪 Выйти из лиги", callback_data="league:leave")]
-            ])
+            keyboard = ReplyKeyboardMarkup(
+                keyboard=[
+                    [KeyboardButton(text="🌍 Все лиги"), KeyboardButton(text="👥 Состав лиги")],
+                    [KeyboardButton(text="🚪 Выйти из лиги")]
+                ],
+                resize_keyboard=True
+            )
 
-    # Отправляем сообщение для удаления обычной клавиатуры и выводим меню с инлайн-кнопками
-    await message.answer("Меню лиг:", reply_markup=ReplyKeyboardRemove())
     await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
-
-
 # --- СОЗДАНИЕ ЛИГИ ---
 @router.callback_query(F.data == "league:create")
 async def start_create_league(callback: CallbackQuery, state: FSMContext):
