@@ -18,21 +18,18 @@ from config import CLAN_DISPLAY, ROLE_LABELS, ROLES
 
 def main_menu(member: dict) -> ReplyKeyboardMarkup:
     """Генерирует нижнее Reply-меню кнопок, видимое всем игрокам."""
-    # Получаем роль игрока. Если её нет — по умолчанию он обычный member
     role = member.get("role", "member") if member else "member"
     builder = ReplyKeyboardBuilder()
 
-    # Кнопки для всех зарегистрированных участников
-#    builder.button(text="✏️ Изменить текущий ник")
+    # САМОЕ НАЧАЛО ДЕРЕВА ПАПОК: Кнопка Лиги
+    builder.button(text="Лиги💀")
+
+    # Остальные кнопки
     builder.button(text="💡 Отправить предложение")
 
-    # Если игрок из основы (squad), выводим ему кнопку пуша
     if member and member.get("clan") == "squad":
         builder.button(text="🎯 Выбрать цель пуша")
 
-    # ИСПРАВЛЕНО: Жесткая и безопасная проверка на админку.
-    # Кнопка "Для админов" покажется ТОЛЬКО если роль игрока НЕ является обычной ('member')
-    # и НЕ является пустой/отсутствующей.
     if role and role != "member":
         builder.button(text="👔 Для админов")
 
