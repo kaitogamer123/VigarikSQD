@@ -17,8 +17,8 @@ async def fetch_player_from_api(player_tag: str):
     """Асинхронно забирает ник, кубки и клуб из официального API Brawl Stars."""
     clean_tag = player_tag.strip().upper().replace("#", "")
     try:
-        from config import BS_API_TOKEN
-        headers = {"Authorization": f"Bearer {BS_API_TOKEN}"}
+        from config import BRAWL_API_TOKEN
+        headers = {"Authorization": f"Bearer {BRAWL_API_TOKEN}"}
     except ImportError:
         headers = {}
 
@@ -107,7 +107,6 @@ def add_member():
     if not conn: return
     cursor = conn.cursor()
 
-    # Проверка: если игрок уже есть и у него уже зафиксирован тег — прерываем добавление
     cursor.execute("SELECT player_tag FROM members WHERE user_id = ?", (user_id,))
     row = cursor.fetchone()
     if row and row[0] and row[0].strip() != "N/A":
@@ -178,7 +177,6 @@ async def process_bulk_import(lines, default_role, registered):
         user_id = parts[0].strip()
         player_tag = parts[1].strip()
 
-        # Проверка перед запросом к API: есть ли уже юзер и заполнен ли у него тег
         cursor.execute("SELECT player_tag FROM members WHERE user_id = ?", (user_id,))
         row = cursor.fetchone()
         if row and row[0] and row[0].strip() != "N/A":
