@@ -1005,3 +1005,7 @@ async def leave_league(callback: CallbackQuery, state: FSMContext):
     conn.commit()
     conn.close()
     await callback.answer()
+@router.callback_query()
+async def debug_callback(callback: CallbackQuery):
+    print(f"\n\n👉 НАЖАТА КНОПКА, DATA = {repr(callback.data)}\n\n")
+    await callback.answer(f"Data: {callback.data}")
