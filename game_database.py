@@ -1,3 +1,9 @@
+import aiosqlite
+import logging
+
+GAME_DB_PATH = "game_clans.db"
+logger = logging.getLogger(__name__)
+
 async def init_game_db() -> None:
     async with aiosqlite.connect(GAME_DB_PATH) as db:
         await db.execute("PRAGMA journal_mode=WAL;")
