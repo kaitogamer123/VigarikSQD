@@ -60,6 +60,7 @@ async def cmd_start(message: types.Message, state: FSMContext, bot: Bot):
     logger.info('   🔎 Проверяю кланы...')
     clans = await get_user_clans(bot, user_id)
     logger.info(f'   📊 Найденные кланы: {clans if clans else "НИЧЕГО НЕ НАЙДЕНО"}')
+    has_access = bool(clans)
     
     # Логируем проверку каждого клана для отладки
     for clan_key, clan_info in CLAN_CHATS.items():
@@ -110,8 +111,11 @@ async def cmd_start(message: types.Message, state: FSMContext, bot: Bot):
     logger.info('\n   ' + '═'*51)
     logger.info(f'   📍 ИТОГОВЫЙ РЕЗУЛЬТАТ: {"✅ ДОСТУП РАЗРЕШЕН" if has_access else "❌ ДОСТУП ЗАПРЕЩЕН"}')
     logger.info('   ' + '═'*51 + '\n')
+
+    # Проверяем, есть ли он уже в БД
+    member = await db.get_member(user_id)
     logger.info(f"   💾 В БД: {'ДА' if member else 'НЕТ'}")
-    
+
     if member:
         logger.info(f"   📝 Регистрация: {'ЗАВЕРШЕНА' if member.get('registered') == 1 else 'НЕ ЗАВЕРШЕНА'}")
         logger.info(f"   🏆 Клан: {member.get('clan', 'не указан')}")
