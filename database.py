@@ -28,6 +28,7 @@ async def init_db() -> None:
                 game_nick TEXT, 
                 player_tag TEXT, 
                 trophies INTEGER DEFAULT 0, 
+                ranked_elo INTEGER DEFAULT 0,
                 clan TEXT, 
                 role TEXT DEFAULT 'member', 
                 registered INTEGER DEFAULT 0, 
@@ -90,6 +91,7 @@ async def upsert_member(
         game_nick: str = None,
         player_tag: str = None,
         trophies: int = None,
+        ranked_elo: int = None, # <-- Добавили аргумент
         clan: str = None,
         role: str = None,
         registered: int = None,
@@ -109,8 +111,8 @@ async def upsert_member(
         # Атомарный апсерт по УНИКАЛЬНОМУ user_id
         await db.execute(
             """ 
-            INSERT INTO members (user_id, username, first_name, last_name, game_nick, player_tag, trophies, clan, role, registered) 
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) 
+            INSERT INTO members (user_id, username, first_name, last_name, game_nick, player_tag, trophies, ranked_elo, clan, role, registered) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) 
             ON CONFLICT(user_id) DO UPDATE SET 
                 username = CASE WHEN ? IS NOT NULL THEN ? ELSE username END, 
                 first_name = CASE WHEN ? IS NOT NULL THEN ? ELSE first_name END, 
@@ -118,13 +120,14 @@ async def upsert_member(
                 game_nick = CASE WHEN ? IS NOT NULL THEN ? ELSE game_nick END, 
                 player_tag = CASE WHEN ? IS NOT NULL THEN ? ELSE player_tag END, 
                 trophies = CASE WHEN ? IS NOT NULL THEN ? ELSE trophies END, 
+                ranked_elo = CASE WHEN ? IS NOT NULL THEN ? ELSE ranked_elo END, 
                 clan = CASE WHEN ? IS NOT NULL THEN ? ELSE clan END, 
                 role = CASE WHEN ? IS NOT NULL THEN ? ELSE role END, 
                 registered = CASE WHEN ? IS NOT NULL THEN ? ELSE registered END, 
                 updated_at = datetime('now') 
             """,
             (
-                user_id, username, first_name, last_name, game_nick, player_tag, trophies or 0, clan, role or "member",
+                user_id, username, first_name, last_name, game_nick, player_tag, trophies or 0, ranked_elo or 0, clan, role or "member",
                 registered if registered is not None else 0,
                 # Параметры для CASE WHEN:
                 username, username,
@@ -133,6 +136,7 @@ async def upsert_member(
                 game_nick, game_nick,
                 player_tag, player_tag,
                 trophies, trophies,
+                ranked_elo, ranked_elo,
                 clan, clan,
                 role, role,
                 registered, registered
