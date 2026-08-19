@@ -64,33 +64,36 @@ async def cmd_start(message: types.Message, state: FSMContext, bot: Bot):
 
     if not clans:
         logger.warning(f"❌ ДОСТУП ЗАПРЕЩЕН - {user_id} (@{username}) ни в одном чате клана")
-
-        # Если пользователь — админ (в файле admins.txt или админ чата), отправим детальный отчёт в админ-чат
+        
+        # ВСЕГДА отправляем диагностический отчёт в админ-чат (даже если это обычный юзер)
         try:
-            if user_id in INITIAL_ADMINS or is_admin:
-                from utils.admin_logger import log_bot_event
+            from utils.admin_logger import log_bot_event
 
-                diag_lines = [
-                    f"Отладка /start для пользователя: {user_id} @{username}",
-                    f"В admins.txt: {'ДА' if user_id in INITIAL_ADMINS else 'НЕТ'}",
-                    f"В админ-чате (ADMIN_CHAT_ID): {'ДА' if is_admin else 'НЕТ'}",
-                    "Проверка статусов по кланам:"
-                ]
+            diag_lines = [
+                f"❌ ДОСТУП ЗАПРЕЩЕН для пользователя: {user_id} @{username}",
+                f"В admins.txt: {'ДА' if user_id in INITIAL_ADMINS else 'НЕТ'}",
+                f"В админ-чате: {'ДА' if is_admin else 'НЕТ'}",
+                "",
+                "📊 Детальная проверка по кланам:"
+            ]
 
-                for clan_key, chat_info in CLAN_CHATS.items():
-                    try:
-                        member = await bot.get_chat_member(chat_id=chat_info['chat_id'], user_id=user_id)
-                        status = getattr(member, 'status', str(member))
-                        diag_lines.append(f" - {clan_key} (id={chat_info['chat_id']}): status={status}")
-                    except Exception as e:
-                        diag_lines.append(f" - {clan_key} (id={chat_info['chat_id']}): error={e}")
+            for clan_key, chat_info in CLAN_CHATS.items():
+                try:
+                    member = await bot.get_chat_member(chat_id=chat_info['chat_id'], user_id=user_id)
+                    status = getattr(member, 'status', str(member))
+                    diag_lines.append(f"  • {clan_key} (id={chat_info['chat_id']}): {status}")
+                    logger.info(f"      Статус в {clan_key}: {status}")
+                except Exception as e:
+                    error_str = str(e)[:100]
+                    diag_lines.append(f"  • {clan_key} (id={chat_info['chat_id']}): ❌ {error_str}")
+                    logger.error(f"      Ошибка в {clan_key}: {e}")
 
-                diag_text = "\n".join(diag_lines)
+            diag_text = "\n".join(diag_lines)
 
-                # Отправляем как WARNING чтобы он дошёл в админ-топик
-                await log_bot_event(bot=bot, event_type="warning", description=diag_text, user_id=user_id, username=username)
+            # Отправляем как WARNING чтобы увидеть в админ-топике
+            await log_bot_event(bot=bot, event_type="warning", description=diag_text, user_id=user_id, username=username)
         except Exception as e:
-            logger.error(f"Не удалось отправить отладочный отчёт в админ-чат: {e}")
+            logger.error(f"Не удалось отправить отладочный отчёт: {e}")
 
         await message.answer(
             "❌ Доступ заблокирован. Вас нет ни в одном чате наших кланов.\n\n"
