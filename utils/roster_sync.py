@@ -179,6 +179,7 @@ async def auto_update_trophies_task(bot: Bot) -> None:
                             game_nick=profile["name"],
                             player_tag=tag,
                             trophies=profile["trophies"],
+                            ranked_elo=profile.get("ranked_elo", 0),
                             clan=clan_key,
                             role=member.get("role", "member"),
                             registered=member.get("registered", 1),

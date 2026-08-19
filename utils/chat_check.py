@@ -33,7 +33,10 @@ async def get_user_clans(bot: Bot, user_id: int) -> list[str]:
             if member.status in ["left", "kicked"]:
                 continue
 
-            if member.status in ["owner", "administrator", "member", "restricted"]:
+            # DEBUG: Логируем статус пользователя для отладки
+            logger.debug(f"Пользователь {user_id} в чате {clan_key} имеет статус: {member.status}")
+
+            if member.status in ["creator", "owner", "administrator", "member", "restricted"]:
                 user_clans.append(clan_key)
 
         except TelegramBadRequest as e:

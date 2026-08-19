@@ -39,11 +39,20 @@ async def get_player_profile(player_tag: str) -> Optional[Dict[str, Any]]:
                     data = await response.json()
                     club_info = data.get("club", {})
 
+                    # Достаем очки Ranked (если поле приходит в ответе API, иначе 0)
+                    ranked_data = data.get("rankedSeasonRank") or data.get("highestRankedMode") or {}
+                    # Если ранкед приходит как объект с трофеями/эло или просто числом
+                    ranked_elo = 0
+                    if isinstance(ranked_data, dict):
+                        ranked_elo = ranked_data.get("trophies", 0)
+                    elif isinstance(ranked_data, (int, float)):
+                        ranked_elo = int(ranked_data)
+
                     return {
                         "name": data.get("name"),            # Игровой ник
                         "clan_tag": club_info.get("tag"),    # Тег текущего клуба
                         "trophies": data.get("trophies"),    # Его кубки
-                        "ranked_rank": data.get("rankedSeasonRank", 1) # Текущий ранг Лиги (1-19)
+                        "ranked_elo": ranked_elo             # Рассчитанное эло / ранг
                     }
                 elif response.status == 404:
                     logger.warning(f"Игрок с тегом {player_tag} не найден в API Brawl Stars (404).")
