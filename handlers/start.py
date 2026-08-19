@@ -21,43 +21,6 @@ logger = bot_events_logger
 router = Router()
 
 
-@router.message(F.chat.type == "private")
-async def _debug_private_messages(message: types.Message):
-    """Temporary debug handler: log any private message to admin_actions.log to verify routing."""
-    try:
-        from utils.admin_logger import log_admin_action
-        await log_admin_action(
-            bot=message.bot,
-            admin_id=message.from_user.id,
-            admin_name=message.from_user.username or str(message.from_user.id),
-            action_text=f"DEBUG_PRIVATE: received message: {message.text[:200]}",
-            clan_key="main_admin"
-        )
-    except Exception:
-        logger = logging.getLogger("admin_actions")
-        logger.exception("Failed to log debug private message")
-
-
-@router.message(lambda message: message.text and message.text.strip().startswith('/start'), F.chat.type == "private")
-async def _fallback_start_handler(message: types.Message, bot: Bot):
-    """Fallback: catch /start text messages if CommandStart filter misses them."""
-    try:
-        # Log to bot events file and to admin actions so we see it in both places
-        logger.info(f"FALLBACK /start received from {message.from_user.id} @{message.from_user.username}")
-        from utils.admin_logger import log_admin_action
-        await log_admin_action(
-            bot=bot,
-            admin_id=message.from_user.id,
-            admin_name=message.from_user.username or str(message.from_user.id),
-            action_text=f"FALLBACK_START: {message.text}",
-            clan_key="main_admin"
-        )
-        # Respond so user sees bot is alive
-        await message.answer("🔧 Debug: fallback /start received. Проверяю доступ...")
-    except Exception as e:
-        logger.exception(f"Fallback start handler error: {e}")
-
-
 class RegistrationState(StatesGroup):
     # ИСПРАВЛЕНО: Состояние choosing_clan удалено, так как API определяет клан автоматически
     entering_nick = State()
