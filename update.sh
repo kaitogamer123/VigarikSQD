@@ -15,7 +15,8 @@ echo "=============================================="
 
 # 1. Скачиваем свежий код с GitHub
 echo "[1/3] Загрузка изменений с Git..."
-git pull
+git fetch origin
+git reset --hard origin/master
 
 # 2. Проверяем и обновляем библиотеки (если добавлял новые)
 if [ -f "requirements.txt" ]; then
