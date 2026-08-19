@@ -1,5 +1,6 @@
 """
-Система расширенного логирования действий администрации и трансляции ЛС в супергруппу.
+Система расширенного логирования действий администрации, ошибок и значимых событий бота.
+Пишет логи в файл И в чат администрации (только важные события).
 """
 
 import logging
@@ -20,6 +21,16 @@ if not logger.handlers:
     formatter = logging.Formatter("[%(asctime)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
+
+# Отдельный логгер для системных событий бота
+bot_events_logger = logging.getLogger("bot_events")
+bot_events_logger.setLevel(logging.INFO)
+
+if not bot_events_logger.handlers:
+    bot_handler = logging.FileHandler("bot_events.log", encoding="utf-8")
+    bot_formatter = logging.Formatter("[%(asctime)s] %(levelname)s - %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    bot_handler.setFormatter(bot_formatter)
+    bot_events_logger.addHandler(bot_handler)
 
 
 async def get_or_create_admin_topic(bot: Bot, chat_id: int, admin_id: int, admin_name: str) -> int:
@@ -209,3 +220,78 @@ async def log_user_chat(bot: Bot, user_id: int, username: str, first_name: str, 
         logger.error(f"Ошибка трансляции ЛС в топик: {e.message}")
     except Exception as e:
         logger.error(f"Ошибка логгера чата: {e}")
+
+
+async def log_bot_event(bot: Bot, event_type: str, description: str, user_id: int = None, username: str = None):
+    """
+    НОВОЕ: Логирует значимые события бота (ошибки, успешные операции) в чат администрации.
+    
+    event_type: "error", "success", "info", "warning"
+    description: описание того, что произошло
+    user_id/username: если событие связано с юзером
+    """
+    time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    # Логируем в файл
+    event_emoji = {"error": "❌", "success": "✅", "info": "ℹ️", "warning": "⚠️"}.get(event_type, "📝")
+    file_log = f"[{event_emoji} {event_type.upper()}] {description}"
+    if user_id or username:
+        file_log += f" (User: {username or user_id})"
+    bot_events_logger.log(
+        logging.ERROR if event_type == "error" else logging.INFO,
+        file_log
+    )
+    
+    # Логируем в чат администрации (только если это ошибка, успех или важное предупреждение)
+    if event_type not in ["error", "success", "warning"]:
+        return
+    
+    chat_id = config.LOGS_CHAT_ID or config.ADMIN_CHAT_ID
+    if not chat_id:
+        return
+    
+    # Получаем или создаем топик для системных событий
+    setting_key = "topic_id_bot_events"
+    thread_id_str = await get_setting(setting_key)
+    
+    if not thread_id_str:
+        try:
+            topic = await bot.create_forum_topic(
+                chat_id=chat_id,
+                name="⚙️ Системные события и ошибки",
+                icon_color=0xFF6B6B  # Красный цвет
+            )
+            await set_setting(setting_key, str(topic.message_thread_id))
+            thread_id_str = str(topic.message_thread_id)
+        except Exception as e:
+            bot_events_logger.error(f"Не удалось создать топик системных событий: {e}")
+            return
+    
+    # Формируем красивое сообщение
+    emoji_map = {"error": "❌", "success": "✅", "info": "ℹ️", "warning": "⚠️"}
+    emoji = emoji_map.get(event_type, "📝")
+    
+    safe_desc = hd.quote(str(description))
+    
+    html_text = f"{emoji} <b>{event_type.upper()}</b>\n"
+    html_text += f"📅 <code>{time_str}</code>\n"
+    html_text += f"📝 {safe_desc}"
+    
+    if user_id or username:
+        safe_username = hd.quote(str(username)) if username else None
+        display_name = f"@{safe_username}" if safe_username else f"ID: {user_id}"
+        html_text += f"\n👤 <b>Пользователь:</b> {display_name}"
+    
+    try:
+        await bot.send_message(
+            chat_id=chat_id,
+            message_thread_id=int(thread_id_str),
+            text=html_text,
+            parse_mode="HTML"
+        )
+    except TelegramBadRequest as e:
+        if "thread not found" in e.message.lower():
+            await set_setting(setting_key, "")
+        bot_events_logger.error(f"Ошибка отправки системного лога: {e.message}")
+    except Exception as e:
+        bot_events_logger.error(f"Ошибка логирования события: {e}")

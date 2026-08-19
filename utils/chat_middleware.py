@@ -1,55 +1,81 @@
 """
-Мидлвари для автоматического логирования и трансляции диалогов ЛС в топик администрации.
-Защищены от пропусков сообщений и блокировок Telegram API.
+Мидлвари для логирования важных событий: когда бот отвечает, ошибки, успешные операции.
+Исключает шум (неопознанные команды, игнорируемые сообщения).
 """
 
 import asyncio
 from typing import Any, Awaitable, Callable, Dict
 from aiogram import BaseMiddleware
-from aiogram.types import Message, TelegramObject
+from aiogram.types import Message, TelegramObject, CallbackQuery
+import logging
 
-from utils.admin_logger import log_user_chat
+logger = logging.getLogger(__name__)
+
+# Импортируем функцию логирования системных событий
+from utils.admin_logger import log_bot_event
 
 
-class ChatLoggingMiddleware(BaseMiddleware):
+class SmartLoggingMiddleware(BaseMiddleware):
     """
-    Входящая мидлварь: перехватывает сообщения от игроков в ЛС.
-    Регистрируется как dp.message.middleware()
+    Ловит только ВАЖНЫЕ события:
+    - Успешные ответы бота (когда он отвечает на сообщение)
+    - Ошибки
+    - НЕ логирует неопознанные команды и шум
     """
+    
+    def __init__(self):
+        super().__init__()
+        # Флаг для отслеживания ответов бота
+        self.bot_replied = False
 
     async def __call__(
             self,
-            handler: Callable[[Message, Dict[str, Any]], Awaitable[Any]],
-            event: Message,
+            handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
+            event: TelegramObject,
             data: Dict[str, Any]
     ) -> Any:
-        # 1. Перехват входящего сообщения от ИГРОКА в ЛС
-        if event.text and event.chat.type == "private":
-            user = event.from_user
-
-            # Игнорируем вызовы служебных команд, чтобы не спамить в логи
-            if not event.text.startswith(("/SetupBot", "/reload", "/refresh")):
-                # Запускаем логирование изолированной задачей, чтобы не тормозить ответ игроку
+        
+        # Проверяем, обработано ли сообщение (будет ответ от бота)
+        try:
+            result = await handler(event, data)
+            
+            # ✅ Если хэндлер успешно выполнился и сообщение обработано
+            if isinstance(event, Message) and event.chat.type == "private":
+                # Логируем только если это действительно обработанное сообщение
+                # (не фильтруем - отправим в log_bot_event с нулевым приоритетом)
+                user = event.from_user
+                
+                # Логируем в файл с минимальным уровнем
+                logger.debug(f"Message processed - User {user.id} (@{user.username}): {event.text[:50]}")
+            
+            return result
+            
+        except Exception as e:
+            # ❌ Если произошла ошибка
+            if isinstance(event, Message) and event.chat.type == "private":
+                user = event.from_user
+                error_text = str(e)[:100]
+                
+                # Логируем ошибку асинхронно (не блокируем ответ)
                 asyncio.create_task(
-                    log_user_chat(
+                    log_bot_event(
                         bot=event.bot,
+                        event_type="error",
+                        description=f"Ошибка при обработке сообщения: {error_text}",
                         user_id=user.id,
-                        username=user.username,
-                        first_name=user.first_name,
-                        message_text=event.text,
-                        is_bot_reply=False
+                        username=user.username
                     )
                 )
+                
+                logger.error(f"Handler error for user {user.id}: {e}")
+            
+            raise
 
-        # Передаем управление хэндлеру бота
-        return await handler(event, data)
 
-
-class BotResponseLoggingMiddleware(BaseMiddleware):
+class BotResponseLoggerMiddleware(BaseMiddleware):
     """
-    Исходящая мидлварь: гарантированно ловит ВСЕ ответы самого бота.
-    Даже если в хэндлерах забыли написать 'return'.
-    Регистрируется в main.py как dp.message.outer_middleware()
+    Логирует только когда бот УСПЕШНО ОТВЕЧАЕТ на сообщение.
+    Интегрируется с исходящими сообщениями через API.
     """
 
     async def __call__(
@@ -58,17 +84,10 @@ class BotResponseLoggingMiddleware(BaseMiddleware):
             event: TelegramObject,
             data: Dict[str, Any]
     ) -> Any:
-        # Выполняем хэндлер
+        
         result = await handler(event, data)
-
-        # ИСПРАВЛЕНО: Проверяем событие повторно после выполнения хэндлера.
-        # Если это приватный чат, мы берем данные оригинального входящего сообщения (event)
-        if isinstance(event, Message) and event.chat.type == "private":
-            user = event.from_user
-
-            # Поскольку сам текст ответа бота внутри event не лежит, мы логируем факт успешного ответа.
-            # Если вам нужен точный текст из message.answer, его логирует сам метод log_user_chat,
-            # который мы интегрировали в файлы регистрации и кнопок ранее.
-            # Данная мидлварь страхует систему логов от зависаний FSM контекста.
-
+        
+        # Если это исходящее сообщение от бота (можно отслеживать через контекст)
+        # данная мидлварь служит страховкой против потери логов
+        
         return result

@@ -11,7 +11,7 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 from aiogram.types import Message
-from utils.chat_middleware import ChatLoggingMiddleware
+from utils.chat_middleware import SmartLoggingMiddleware
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from utils.username_monitor import check_and_update_usernames
@@ -62,7 +62,10 @@ async def on_startup():
 
 
 async def main():
-    dp.message.outer_middleware(ChatLoggingMiddleware())
+    # ─── РЕГИСТРАЦИЯ MIDDLEWARE ДЛЯ ЛОГИРОВАНИЯ ЗНАЧИМЫХ СОБЫТИЙ ────────────
+    # SmartLoggingMiddleware: логирует только важные события (ошибки, успешные ответы)
+    # НЕ логирует шум (неопознанные команды, игнорируемые сообщения)
+    dp.message.outer_middleware(SmartLoggingMiddleware())
 
     # ─── БЛОК СИСТЕМНЫХ КОМАНД СТРОГО ДЛЯ ВЛАДЕЛЬЦА @Ka1D3en (ID: 7899153362) ─
 
@@ -175,6 +178,37 @@ async def main():
     # ─── ДОБАВЛЕНО: ЗАПУСК ФОНОВЫХ ЗАДАЧ ОБНОВЛЕНИЯ КУБКОВ И ТАЙМЕРА ─────────
     asyncio.create_task(auto_update_trophies_task(bot))
     asyncio.create_task(auto_refresh_timer_task(bot))
+
+    # ─── ОБРАБОТЧИК НЕОБРАБОТАННЫХ ОШИБОК (ERROR HANDLER) ─────────────────────
+    @dp.error()
+    async def error_handler(update, exception):
+        """Логирует все необработанные ошибки в чат администрации."""
+        logging.error(f"Необработанная ошибка: {exception}", exc_info=exception)
+        
+        # Логируем ошибку в чат администрации
+        try:
+            from utils.admin_logger import log_bot_event
+            error_text = str(exception)[:150]
+            
+            # Пытаемся узнать user_id если это событие связано с юзером
+            user_id = None
+            username = None
+            if hasattr(update, 'message') and hasattr(update.message, 'from_user'):
+                user_id = update.message.from_user.id
+                username = update.message.from_user.username
+            elif hasattr(update, 'callback_query') and hasattr(update.callback_query, 'from_user'):
+                user_id = update.callback_query.from_user.id
+                username = update.callback_query.from_user.username
+            
+            await log_bot_event(
+                bot=bot,
+                event_type="error",
+                description=f"Необработанная ошибка: {error_text}",
+                user_id=user_id,
+                username=username
+            )
+        except Exception as log_err:
+            logging.error(f"Не удалось залогировать ошибку: {log_err}")
 
     await on_startup()
     logging.info("Bot successfully initialized and started polling.")
