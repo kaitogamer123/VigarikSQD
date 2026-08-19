@@ -2,6 +2,7 @@
 Обработчик команды /start и первичная авторизация по кланам через API.
 """
 
+import logging
 from aiogram import Router, types, F, Bot
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
@@ -10,8 +11,10 @@ from aiogram.types import ReplyKeyboardRemove
 
 import database as db
 from utils.chat_check import get_user_clans, is_chat_admin
-from config import CLAN_DISPLAY, INITIAL_ADMINS
+from config import CLAN_DISPLAY, INITIAL_ADMINS, CLAN_CHATS
 from utils.keyboards import main_menu
+
+logger = logging.getLogger(__name__)
 
 router = Router()
 
@@ -26,21 +29,41 @@ async def cmd_start(message: types.Message, state: FSMContext, bot: Bot):
     await state.clear()
     user_id = message.from_user.id
     username = message.from_user.username
+    
+    # ───── НОВОЕ: ПОЛНОЕ ЛОГИРОВАНИЕ ДЛЯ ОТЛАДКИ ──────────────────────────────
+    logger.info(f"🔍 /START КОМАНДА - Проверка доступа")
+    logger.info(f"   👤 User ID: {user_id}")
+    logger.info(f"   📱 Username: @{username or 'нет'}")
+    logger.info(f"   💾 В admins.txt: {'ДА' if user_id in INITIAL_ADMINS else 'НЕТ'}")
+    
+    if user_id in INITIAL_ADMINS:
+        logger.info(f"   ⭐ Роль админа: {INITIAL_ADMINS[user_id]}")
 
     # 1. Проверяем, админ ли он чата администрации
+    logger.info(f"   🔎 Проверяю статус в админ-чате...")
     is_admin = await is_chat_admin(bot, user_id)
+    logger.info(f"   📋 Админ чата: {is_admin}")
 
     # Определяем базовую роль
     current_role = "member"
     if user_id in INITIAL_ADMINS:
         current_role = INITIAL_ADMINS[user_id]["role"]
+        logger.info(f"   ✅ Роль из admins.txt: {current_role}")
     elif is_admin:
         current_role = "vice"  # Дефолтная роль для админ-чата
+        logger.info(f"   ✅ Роль как админ-чата: {current_role}")
 
     # 2. Проверяем, в каких чатах кланов состоит человек
+    logger.info(f"   🔎 Проверяю члланы кланов...")
     clans = await get_user_clans(bot, user_id)
+    logger.info(f"   📊 Найденные кланы: {clans if clans else 'НИЧЕГО НЕ НАЙДЕНО'}")
+    
+    # Логируем проверку каждого клана для отладки
+    for clan_key, clan_info in CLAN_CHATS.items():
+        logger.debug(f"      └─ Клан '{clan_key}' (ID: {clan_info['chat_id']}): {'✅ найден' if clan_key in clans else '❌ не найден'}")
 
     if not clans:
+        logger.warning(f"❌ ДОСТУП ЗАПРЕЩЕН - {user_id} (@{username}) ни в одном чате клана")
         await message.answer(
             "❌ Доступ заблокирован. Вас нет ни в одном чате наших кланов.\n\n"
             "Вступайте в наши кланы ViGarik Squad или Academy, чтобы пользоваться ботом!",
@@ -48,10 +71,18 @@ async def cmd_start(message: types.Message, state: FSMContext, bot: Bot):
         )
         return
 
+    logger.info(f"✅ ДОСТУП РАЗРЕШЕН - {user_id} (@{username}) в кланах: {clans}")
+
     # Проверяем, есть ли он уже в БД
     member = await db.get_member(user_id)
+    logger.info(f"   💾 В БД: {'ДА' if member else 'НЕТ'}")
+    
+    if member:
+        logger.info(f"   📝 Регистрация: {'ЗАВЕРШЕНА' if member.get('registered') == 1 else 'НЕ ЗАВЕРШЕНА'}")
+        logger.info(f"   🏆 Клан: {member.get('clan', 'не указан')}")
 
     if member and member.get("registered") == 1:
+        logger.info(f"✅ Юзер уже зарегистрирован - показываю главное меню")
         await message.answer(
             f"Привет, {message.from_user.first_name}! Это главное меню бота ViGarik Squad. 🎮\n"
             f"Вы зарегистрированы в клане: <b>{CLAN_DISPLAY.get(member['clan'], member['clan']).upper()}</b>",
@@ -62,6 +93,7 @@ async def cmd_start(message: types.Message, state: FSMContext, bot: Bot):
 
     # 3. ИСПРАВЛЕНО: Больше не заставляем выбирать клан кнопками, если их несколько.
     # Мы сразу запрашиваем тег аккаунта, а API само определит его реальный клуб!
+    logger.info(f"🎮 Запускаю регистрацию - прошу тег Brawl Stars")
     await message.answer(
         f"Привет, @{username or message.from_user.first_name}! Это приветственное сообщение бота ViGarik Squad. 👋\n\n"
         f"Для верификации вашего аккаунта введите ваш <b>точный игровой тег</b> Brawl Stars "
