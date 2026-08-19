@@ -31,50 +31,38 @@ async def cmd_start(message: types.Message, state: FSMContext, bot: Bot):
     username = message.from_user.username
     
     # ───── НОВОЕ: ПОЛНОЕ ЛОГИРОВАНИЕ ДЛЯ ОТЛАДКИ ──────────────────────────────
-    print(f"\n{'='*80}")
-    print(f"🔍 /START КОМАНДА - Проверка доступа")
-    print(f"   👤 User ID: {user_id}")
-    print(f"   📱 Username: @{username or 'нет'}")
-    print(f"   💾 В admins.txt: {'ДА' if user_id in INITIAL_ADMINS else 'НЕТ'}")
-    
-    logger.info(f"🔍 /START КОМАНДА - Проверка доступа")
-    logger.info(f"   👤 User ID: {user_id}")
-    logger.info(f"   📱 Username: @{username or 'нет'}")
-    logger.info(f"   💾 В admins.txt: {'ДА' if user_id in INITIAL_ADMINS else 'НЕТ'}")
-    
+    logger.info('\n' + '='*80)
+    logger.info('🔍 /START КОМАНДА - Проверка доступа')
+    logger.info(f'   👤 User ID: {user_id}')
+    logger.info(f'   📱 Username: @{username or "нет"}')
+    logger.info(f'   💾 В admins.txt: {"ДА" if user_id in INITIAL_ADMINS else "НЕТ"}')
+
     if user_id in INITIAL_ADMINS:
-        print(f"   ⭐ Роль админа: {INITIAL_ADMINS[user_id]}")
-        logger.info(f"   ⭐ Роль админа: {INITIAL_ADMINS[user_id]}")
+        logger.info(f'   ⭐ Роль админа: {INITIAL_ADMINS[user_id]}')
 
     # 1. Проверяем, админ ли он чата администрации
-    print(f"   🔎 Проверяю статус в админ-чате...")
-    logger.info(f"   🔎 Проверяю статус в админ-чате...")
+    logger.info('   🔎 Проверяю статус в админ-чате...')
     is_admin = await is_chat_admin(bot, user_id)
-    print(f"   📋 Админ чата: {is_admin}")
-    logger.info(f"   📋 Админ чата: {is_admin}")
+    logger.info(f'   📋 Админ чата: {is_admin}')
 
     # Определяем базовую роль
     current_role = "member"
     if user_id in INITIAL_ADMINS:
         current_role = INITIAL_ADMINS[user_id]["role"]
-        print(f"   ✅ Роль из admins.txt: {current_role}")
-        logger.info(f"   ✅ Роль из admins.txt: {current_role}")
+        logger.info(f'   ✅ Роль из admins.txt: {current_role}')
     elif is_admin:
         current_role = "vice"  # Дефолтная роль для админ-чата
-        print(f"   ✅ Роль как админ-чата: {current_role}")
-        logger.info(f"   ✅ Роль как админ-чата: {current_role}")
+        logger.info(f'   ✅ Роль как админ-чата: {current_role}')
 
     # 2. Проверяем, в каких чатах кланов состоит человек
-    print(f"   🔎 Проверяю кланы...")
-    logger.info(f"   🔎 Проверяю кланы...")
+    logger.info('   🔎 Проверяю кланы...')
     clans = await get_user_clans(bot, user_id)
-    print(f"   📊 Найденные кланы: {clans if clans else 'НИЧЕГО НЕ НАЙДЕНО'}")
-    logger.info(f"   📊 Найденные кланы: {clans if clans else 'НИЧЕГО НЕ НАЙДЕНО'}")
+    logger.info(f'   📊 Найденные кланы: {clans if clans else "НИЧЕГО НЕ НАЙДЕНО"}')
     
     # Логируем проверку каждого клана для отладки
     for clan_key, clan_info in CLAN_CHATS.items():
         result = '✅ найден' if clan_key in clans else '❌ не найден'
-        print(f"      └─ Клан '{clan_key}': {result}")
+        logger.info(f"      └─ Клан '{clan_key}': {result}")
         logger.debug(f"      └─ Клан '{clan_key}' (ID: {clan_info['chat_id']}): {result}")
 
     if not clans:
@@ -117,13 +105,9 @@ async def cmd_start(message: types.Message, state: FSMContext, bot: Bot):
         )
         return
 
-    print(f"   ════════════════════════════════════════════════════")
-    print(f"   ✅ ДОСТУП РАЗРЕШЕН - в кланах: {clans}")
-    print(f"   ════════════════════════════════════════════════════\n")
-    logger.info(f"✅ ДОСТУП РАЗРЕШЕН - {user_id} (@{username}) в кланах: {clans}")
-
-    # Проверяем, есть ли он уже в БД
-    member = await db.get_member(user_id)
+    logger.info('\n   ' + '═'*51)
+    logger.info(f'   📍 ИТОГОВЫЙ РЕЗУЛЬТАТ: {"✅ ДОСТУП РАЗРЕШЕН" if has_access else "❌ ДОСТУП ЗАПРЕЩЕН"}')
+    logger.info('   ' + '═'*51 + '\n')
     logger.info(f"   💾 В БД: {'ДА' if member else 'НЕТ'}")
     
     if member:
