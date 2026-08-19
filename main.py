@@ -88,6 +88,47 @@ async def main():
         except Exception as e:
             await message.answer(f"❌ Ошибка при перезагрузке файла конфигурации: {e}")
 
+    @dp.message(F.text.startswith("/check_access"))
+    async def cmd_check_access(message: Message, bot: Bot):
+        """Показывает владельцу фактический статус пользователя в чатах."""
+        if message.from_user.id not in (7899153362, 5281584435):
+            return
+
+        parts = message.text.split(maxsplit=1)
+        if len(parts) != 2 or not parts[1].strip().lstrip("-").isdigit():
+            await message.answer("Использование: <code>/check_access USER_ID</code>", parse_mode="HTML")
+            return
+
+        target_id = int(parts[1].strip())
+        from config import ADMIN_CHAT_ID, CLAN_CHATS, INITIAL_ADMINS
+
+        report = [
+            f"🔎 <b>Проверка пользователя</b> <code>{target_id}</code>",
+            f"В admins.txt: {'ДА' if target_id in INITIAL_ADMINS else 'НЕТ'}",
+            "",
+            "📊 Статусы в чатах:"
+        ]
+
+        try:
+            member = await bot.get_chat_member(ADMIN_CHAT_ID, target_id)
+            report.append(f"• Админ-чат: <code>{member.status}</code>")
+        except Exception as e:
+            report.append(f"• Админ-чат: ❌ <code>{str(e)[:120]}</code>")
+
+        found_clans = []
+        for clan_key, chat_info in CLAN_CHATS.items():
+            try:
+                member = await bot.get_chat_member(chat_info["chat_id"], target_id)
+                report.append(f"• {clan_key}: <code>{member.status}</code>")
+                if member.status in ("creator", "owner", "administrator", "member", "restricted"):
+                    found_clans.append(clan_key)
+            except Exception as e:
+                report.append(f"• {clan_key}: ❌ <code>{str(e)[:120]}</code>")
+
+        report.append("")
+        report.append(f"Итог: {'✅ доступ есть' if found_clans else '❌ доступ не найден'}")
+        await message.answer("\n".join(report), parse_mode="HTML")
+
     @dp.message(F.text.in_({"/SetupBotVigarikThreads", "SetupBotVigarikThreads", "/SetupBotVigarikThreads@Vigarik_Sqd_bot"}))
     async def cmd_setup_threads_direct(message: Message, bot: Bot):
         if message.from_user.id != 7899153362:
