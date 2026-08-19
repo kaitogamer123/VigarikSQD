@@ -5,7 +5,7 @@ title Авто-деплой VigarikSQD
 echo ==============================================
 echo [1/2] Отправка изменений в GitHub...
 echo ==============================================
-git push origin master
+git push VigarikSQD master
 
 echo.
 echo ==============================================
