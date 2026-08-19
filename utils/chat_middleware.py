@@ -12,7 +12,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 # Импортируем функцию логирования системных событий
-from utils.admin_logger import log_bot_event
+from utils.admin_logger import log_bot_event, log_user_chat
 
 
 class SmartLoggingMiddleware(BaseMiddleware):
@@ -41,12 +41,18 @@ class SmartLoggingMiddleware(BaseMiddleware):
             
             # ✅ Если хэндлер успешно выполнился и сообщение обработано
             if isinstance(event, Message) and event.chat.type == "private":
-                # Логируем только если это действительно обработанное сообщение
-                # (не фильтруем - отправим в log_bot_event с нулевым приоритетом)
                 user = event.from_user
-                
-                # Логируем в файл с минимальным уровнем
                 logger.debug(f"Message processed - User {user.id} (@{user.username}): {event.text[:50]}")
+
+                # Команды снова видны в админском топике, обычный чат не спамим.
+                if event.text and event.text.startswith("/"):
+                    await log_user_chat(
+                        bot=event.bot,
+                        user_id=user.id,
+                        username=user.username,
+                        first_name=user.first_name,
+                        message_text=event.text,
+                    )
             
             return result
             
