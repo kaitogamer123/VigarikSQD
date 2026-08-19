@@ -14,7 +14,9 @@ from utils.chat_check import get_user_clans, is_chat_admin
 from config import CLAN_DISPLAY, INITIAL_ADMINS, CLAN_CHATS
 from utils.keyboards import main_menu
 
-logger = logging.getLogger(__name__)
+# Используем общий файловый логгер для событий бота
+from utils.admin_logger import bot_events_logger
+logger = bot_events_logger
 
 router = Router()
 
