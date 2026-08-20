@@ -1,5 +1,5 @@
 from aiogram import Router
-from aiogram.types import Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from aiogram import F
 from config import CLAN_CHATS
 import aiosqlite
@@ -33,6 +33,52 @@ async def get_inactive_list(clan_type: str) -> list[dict]:
             return [dict(row) for row in rows]
 
 
+def inactive_keyboard(expanded: bool) -> InlineKeyboardMarkup:
+    if expanded:
+        button = InlineKeyboardButton(text="🔼 Свернуть список", callback_data="inactive:collapse")
+    else:
+        button = InlineKeyboardButton(text="📋 Показать список", callback_data="inactive:expand")
+    return InlineKeyboardMarkup(inline_keyboard=[[button]])
+
+
+def format_inactive_header(clan_type: str, player_count: int) -> str:
+    return (
+        f"📊 <b>Активность клана ({CLAN_CHATS[clan_type]['title']})</b>\n"
+        f"<i>По времени последнего обновления данных бота</i>\n"
+        f"Игроков: <b>{player_count}</b>"
+    )
+
+
+def format_inactive_lines(players: list[dict]) -> str:
+    now = datetime.now()
+    lines = []
+
+    for player in players:
+        nick = player["game_nick"] or "Игрок"
+        last_str = player["updated_at"]
+
+        try:
+            last_time = datetime.strptime(last_str, "%Y-%m-%d %H:%M:%S")
+            diff = now - last_time
+            days = diff.days
+            hours = diff.seconds // 3600
+        except (TypeError, ValueError):
+            days = 0
+            hours = 0
+
+        if days >= 3:
+            emoji = "🔴"
+        elif days >= 2:
+            emoji = "🟡"
+        else:
+            emoji = "🟢"
+
+        time_text = f"{days} дн. {hours} ч. назад" if days > 0 else f"{hours} ч. назад"
+        lines.append(f"{emoji} <b>{nick}</b> — Последняя проверка: {time_text}")
+
+    return "\n".join(lines)
+
+
 @router.message(F.text.regexp(r"^/inactive(?:@\w+)?(?:\s|$)", flags=re.IGNORECASE))
 async def inactive_handler(message: Message):
     clan_type = get_clan_type_by_chat(message.chat.id)
@@ -59,40 +105,45 @@ async def inactive_handler(message: Message):
         )
         return
 
-    now = datetime.now()
-    lines = []
+    text = format_inactive_header(clan_type, len(players))
+    await message.answer(text, parse_mode="HTML", reply_markup=inactive_keyboard(expanded=False))
 
-    for p in players:
-        nick = p["game_nick"] or "Игрок"
-        last_str = p["updated_at"]
 
-        # Считаем разницу во времени с последней игрой
-        try:
-            last_time = datetime.strptime(last_str, "%Y-%m-%d %H:%M:%S")
-            diff = now - last_time
-            days = diff.days
-            hours = diff.seconds // 3600
-        except Exception:
-            days = 0
-            hours = 0
+@router.callback_query(F.data.in_({"inactive:expand", "inactive:collapse"}))
+async def inactive_toggle_handler(callback: CallbackQuery):
+    if not callback.message:
+        await callback.answer()
+        return
 
-        # 3+ дня без обновления данных — красный, 1-3 дня — жёлтый.
-        if days >= 3:
-            emoji = "🔴"
-        elif days >= 2:
-            emoji = "🟡"
-        else:
-            emoji = "🟢"
+    clan_type = get_clan_type_by_chat(callback.message.chat.id)
+    if not clan_type:
+        await callback.answer("Команда доступна только в клановых чатах.", show_alert=True)
+        return
 
-        time_text = f"{days} дн. {hours} ч. назад" if days > 0 else f"{hours} ч. назад"
-        lines.append(f"{emoji} <b>{nick}</b> — Последняя проверка: {time_text}")
+    try:
+        players = await get_inactive_list(clan_type)
+    except Exception:
+        logger.exception("Ошибка при обновлении списка активности: clan=%s", clan_type)
+        await callback.answer("Не удалось загрузить список.", show_alert=True)
+        return
 
-    # Упаковываем весь список внутрь тега спойлера <tg-spoiler>
-    joined_list = "\n".join(lines)
-    text = (
-        f"📊 <b>Активность клана ({CLAN_CHATS[clan_type]['title']}):</b>\n"
-        f"<i>По времени последнего обновления данных бота</i>\n\n"
-        f"<tg-spoiler>{joined_list}</tg-spoiler>"
+    if not players:
+        text = (
+            f"📊 <b>Активность клана ({CLAN_CHATS[clan_type]['title']})</b>\n\n"
+            "❌ Данные об активности пока отсутствуют."
+        )
+        await callback.message.edit_text(text, parse_mode="HTML")
+        await callback.answer()
+        return
+
+    expanded = callback.data == "inactive:expand"
+    text = format_inactive_header(clan_type, len(players))
+    if expanded:
+        text += f"\n\n{format_inactive_lines(players)}"
+
+    await callback.message.edit_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=inactive_keyboard(expanded=expanded),
     )
-
-    await message.answer(text, parse_mode="HTML")
+    await callback.answer()
