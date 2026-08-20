@@ -5,8 +5,10 @@ from config import CLAN_CHATS
 import aiosqlite
 from datetime import datetime
 from database import DB_PATH
+import logging
 
 router = Router()
+logger = logging.getLogger(__name__)
 
 
 def get_clan_type_by_chat(chat_id: int) -> str | None:
@@ -30,13 +32,23 @@ async def get_inactive_list(clan_type: str) -> list[dict]:
             return [dict(row) for row in rows]
 
 
-@router.message(Command(commands=["InActive", "inactive"]))
+@router.message(Command(commands=["inactive"], ignore_case=True))
 async def inactive_handler(message: Message):
     clan_type = get_clan_type_by_chat(message.chat.id)
     if not clan_type:
+        logger.warning(
+            "Команда /inactive получена вне кланового чата: chat_id=%s thread_id=%s",
+            message.chat.id,
+            message.message_thread_id,
+        )
         return
 
-    players = await get_inactive_list(clan_type)
+    try:
+        players = await get_inactive_list(clan_type)
+    except Exception:
+        logger.exception("Ошибка при загрузке списка активности: clan=%s", clan_type)
+        await message.answer("❌ Не удалось загрузить список активности. Ошибка записана в лог.")
+        return
 
     if not players:
         await message.answer(
