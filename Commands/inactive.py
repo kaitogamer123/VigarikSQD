@@ -3,6 +3,7 @@ from aiogram.types import Message
 from aiogram import F
 from config import CLAN_CHATS
 import aiosqlite
+import re
 from datetime import datetime
 from database import DB_PATH
 import logging
@@ -32,7 +33,7 @@ async def get_inactive_list(clan_type: str) -> list[dict]:
             return [dict(row) for row in rows]
 
 
-@router.message(F.text.regexp(r"^/inactive(?:@\w+)?(?:\s|$)"))
+@router.message(F.text.regexp(r"^/inactive(?:@\w+)?(?:\s|$)", flags=re.IGNORECASE))
 async def inactive_handler(message: Message):
     clan_type = get_clan_type_by_chat(message.chat.id)
     if not clan_type:
