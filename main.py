@@ -198,13 +198,13 @@ async def main():
     dp.include_router(reg_router)
     dp.include_router(proposals_router)
     dp.include_router(push_system_router)
+    dp.include_router(inactive_router)
     dp.include_router(chat_router)
     dp.include_router(clan_list_router)
     dp.include_router(admin_main_router)
     dp.include_router(change_name_router)
     dp.include_router(league_router)
     dp.include_router(trophies_router)
-    dp.include_router(inactive_router)
 
     # ─── НАСТРОЙКА ПЛАНИРОВЩИКА ЗАДАЧ (APScheduler) ───────────────────────────
     scheduler = AsyncIOScheduler()
