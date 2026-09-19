@@ -190,7 +190,7 @@ async def _send_report(target: Message, clan_type: str) -> None:
         await target.answer("❌ Не удалось вывести список активности. Попробуй позже.")
 
 
-@router.message(Command(commands=["inactive", "InActive", "in_active"]))
+@router.message(Command(commands=["inactive", "in_active"], ignore_case=True, ignore_mention=True))
 async def inactive_handler(message: Message):
     clan_type = get_clan_type_by_chat(message.chat.id)
 

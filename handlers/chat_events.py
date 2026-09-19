@@ -157,7 +157,7 @@ async def on_chat_member_update(event: ChatMemberUpdated, bot: Bot):
 
 
 # ─── ПЕРЕХВАТ СООБЩЕНИЙ ДЛЯ СБОРА УЧАСТНИКОВ ───────────────────────────────────
-@router.message(F.chat.type.in_({"group", "supergroup"}))
+@router.message(F.chat.type.in_({"group", "supergroup"}), ~F.text.startswith("/"))
 async def on_group_message_collect_user(message: Message):
     chat_id = message.chat.id
     clan = detect_clan_by_chat(chat_id)
