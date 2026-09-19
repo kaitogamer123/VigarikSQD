@@ -6,6 +6,7 @@
 Данные — из накопительной базы player_stats.db.
 """
 import logging
+import re
 
 from aiogram import Router, F
 from aiogram.filters import Command
@@ -76,6 +77,15 @@ def _fmt_signed(value: int) -> str:
     return f"+{value}" if value > 0 else str(value)
 
 
+# Ловит /clantoppush и /clantoppush@ИмяБота в любом чате, независимо от
+# регистра и упоминания. Надёжнее фильтра Command в групповых чатах.
+_TOP_PUSH_RE = re.compile(r"^/clantoppush(?:@[A-Za-z0-9_]+)?(?:\s|$)", re.IGNORECASE)
+
+
+def _is_top_push_command(message: Message) -> bool:
+    return bool(message.text and _TOP_PUSH_RE.match(message.text.strip()))
+
+
 async def build_top_push(clan_key: str, hours: int) -> str:
     members = await get_clan_members(clan_key)
     tags = [m.get("player_tag") for m in members if m.get("player_tag")]
@@ -133,7 +143,7 @@ async def build_top_push(clan_key: str, hours: int) -> str:
     return "\n".join(lines)
 
 
-@router.message(Command(commands=["ClanTopPush", "clantoppush", "clan_top_push"]))
+@router.message(_is_top_push_command)
 async def cmd_clan_top_push(message: Message):
     await message.answer(
         "🏆 <b>Топ пуша клана</b>\n\nВыбери клан, по которому хочешь посмотреть прирост трофеев:",

@@ -35,6 +35,7 @@ from player_stats_db import init_player_stats_db
 from utils.stats_collector import auto_collect_stats_task
 from Commands.trophies_game import router as trophies_router
 from Commands.inactive import router as inactive_router
+from Commands.clan_stats import router as clan_stats_router
 
 # Модульный админ-роутер
 from handlers.admin_features import admin_main_router
@@ -150,6 +151,9 @@ async def main():
         )
 
     # ─── РЕГИСТРАЦИЯ ВСЕХ РОУТЕРОВ В ДИСПЕТЧЕРЕ ────────────────────────────────
+    # Узкие команды-статистики подключаем первыми, чтобы групповой catch-all
+    # и FSM-хэндлеры не перехватывали их до обработки.
+    dp.include_router(clan_stats_router)
     dp.include_router(start_router)
     dp.include_router(reg_router)
     dp.include_router(proposals_router)
