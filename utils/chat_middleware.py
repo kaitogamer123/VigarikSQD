@@ -1,99 +1,138 @@
 """
-Мидлвари для логирования важных событий: когда бот отвечает, ошибки, успешные операции.
-Исключает шум (неопознанные команды, игнорируемые сообщения).
+Мидлвари для автоматического логирования и трансляции диалогов ЛС в топик администрации.
+Защищены от пропусков сообщений и блокировок Telegram API.
+
+ВОССТАНОВЛЕНО: полноценная "слежка" за ВСЕМИ сообщениями пользователей боту в ЛС
+(текст, команды, фото/видео/стикеры/голосовые и т.д.), а также нажатия инлайн-кнопок.
 """
 
-import asyncio
-from typing import Any, Awaitable, Callable, Dict
-from aiogram import BaseMiddleware
-from aiogram.types import Message, TelegramObject, CallbackQuery
 import logging
+from typing import Any, Awaitable, Callable, Dict
+
+from aiogram import BaseMiddleware
+from aiogram.types import Message, CallbackQuery, TelegramObject
+
+from utils.admin_logger import log_user_chat
 
 logger = logging.getLogger(__name__)
 
-# Импортируем функцию логирования системных событий
-from utils.admin_logger import log_bot_event, log_user_chat
+
+def _describe_non_text(message: Message) -> str:
+    """Возвращает человекочитаемое описание не-текстового сообщения для лога."""
+    if message.photo:
+        base = "🖼 [Фото]"
+    elif message.video:
+        base = "🎬 [Видео]"
+    elif message.video_note:
+        base = "⭕ [Видео-кружок]"
+    elif message.voice:
+        base = "🎤 [Голосовое сообщение]"
+    elif message.audio:
+        base = "🎵 [Аудио]"
+    elif message.document:
+        base = "📎 [Документ]"
+    elif message.sticker:
+        base = f"🩹 [Стикер {message.sticker.emoji or ''}]"
+    elif message.animation:
+        base = "🎞 [GIF]"
+    elif message.contact:
+        base = "📞 [Контакт]"
+    elif message.location:
+        base = "📍 [Геолокация]"
+    elif message.poll:
+        base = "📊 [Опрос]"
+    else:
+        base = "📦 [Вложение]"
+
+    caption = message.caption
+    if caption:
+        return f"{base} {caption.strip()}"
+    return base
 
 
-class SmartLoggingMiddleware(BaseMiddleware):
+class ChatLoggingMiddleware(BaseMiddleware):
     """
-    Ловит только ВАЖНЫЕ события:
-    - Успешные ответы бота (когда он отвечает на сообщение)
-    - Ошибки
-    - НЕ логирует неопознанные команды и шум
+    Входящая мидлварь: перехватывает ВСЕ сообщения и колбэки от игроков в ЛС.
+    Регистрируется как dp.message.outer_middleware() и dp.callback_query.outer_middleware()
     """
-    
-    def __init__(self):
-        super().__init__()
-        # Флаг для отслеживания ответов бота
-        self.bot_replied = False
 
     async def __call__(
             self,
             handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
             event: TelegramObject,
-            data: Dict[str, Any]
+            data: Dict[str, Any],
     ) -> Any:
-        
-        # Проверяем, обработано ли сообщение (будет ответ от бота)
+        # Логирование обёрнуто в собственный try/except, чтобы сбой логгера
+        # НИКОГДА не ломал обработку самого сообщения пользователем.
         try:
-            result = await handler(event, data)
-            
-            # ✅ Если хэндлер успешно выполнился и сообщение обработано
-            if isinstance(event, Message) and event.chat.type == "private":
-                user = event.from_user
-                logger.debug(f"Message processed - User {user.id} (@{user.username}): {event.text[:50]}")
-
-                # Команды снова видны в админском топике, обычный чат не спамим.
-                if event.text and event.text.startswith("/"):
-                    await log_user_chat(
-                        bot=event.bot,
-                        user_id=user.id,
-                        username=user.username,
-                        first_name=user.first_name,
-                        message_text=event.text,
-                    )
-            
-            return result
-            
+            await self._safe_log(event)
         except Exception as e:
-            # ❌ Если произошла ошибка
-            if isinstance(event, Message) and event.chat.type == "private":
-                user = event.from_user
-                error_text = str(e)[:100]
-                
-                # Логируем ошибку асинхронно (не блокируем ответ)
-                asyncio.create_task(
-                    log_bot_event(
-                        bot=event.bot,
-                        event_type="error",
-                        description=f"Ошибка при обработке сообщения: {error_text}",
-                        user_id=user.id,
-                        username=user.username
-                    )
-                )
-                
-                logger.error(f"Handler error for user {user.id}: {e}")
-            
-            raise
+            logger.error(f"[ChatLoggingMiddleware] Сбой логирования события: {e}")
+
+        # Передаём управление хэндлеру бота в любом случае
+        return await handler(event, data)
+
+    async def _safe_log(self, event: TelegramObject) -> None:
+        # ─── ОБЫЧНЫЕ СООБЩЕНИЯ В ЛС ─────────────────────────────
+        if isinstance(event, Message):
+            user = event.from_user
+            # Защита от служебных сообщений без автора (каналы, миграции и т.п.)
+            if user is None:
+                return
+            # Логируем только личные сообщения игроков боту
+            if event.chat.type != "private":
+                return
+
+            # Текст, подпись к медиа или описание вложения — логируем ВСЁ
+            if event.text:
+                message_text = event.text
+            elif event.caption:
+                message_text = _describe_non_text(event)
+            else:
+                message_text = _describe_non_text(event)
+
+            await log_user_chat(
+                bot=event.bot,
+                user_id=user.id,
+                username=user.username,
+                first_name=user.first_name,
+                message_text=message_text,
+                is_bot_reply=False,
+            )
+            return
+
+        # ─── НАЖАТИЯ ИНЛАЙН-КНОПОК В ЛС ─────────────────────────
+        if isinstance(event, CallbackQuery):
+            user = event.from_user
+            if user is None:
+                return
+            msg = event.message
+            # Логируем только если кнопка нажата в личке
+            if msg is None or getattr(msg.chat, "type", None) != "private":
+                return
+
+            await log_user_chat(
+                bot=event.bot,
+                user_id=user.id,
+                username=user.username,
+                first_name=user.first_name,
+                message_text=f"🔘 [Нажал кнопку] {event.data}",
+                is_bot_reply=False,
+            )
+            return
 
 
-class BotResponseLoggerMiddleware(BaseMiddleware):
+class BotResponseLoggingMiddleware(BaseMiddleware):
     """
-    Логирует только когда бот УСПЕШНО ОТВЕЧАЕТ на сообщение.
-    Интегрируется с исходящими сообщениями через API.
+    Исходящая мидлварь-заглушка. Оставлена для совместимости.
+    Логирование ответов бота выполняется точечно через log_user_chat(is_bot_reply=True)
+    в местах, где боту важно зафиксировать ответ.
     """
 
     async def __call__(
             self,
             handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
             event: TelegramObject,
-            data: Dict[str, Any]
+            data: Dict[str, Any],
     ) -> Any:
-        
-        result = await handler(event, data)
-        
-        # Если это исходящее сообщение от бота (можно отслеживать через контекст)
-        # данная мидлварь служит страховкой против потери логов
-        
-        return result
+        return await handler(event, data)

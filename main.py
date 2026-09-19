@@ -1,8 +1,8 @@
 """
 Главный файл запуска Telegram-бота ViGarik Squad.
 Полная исправленная версия с ежечасным обновлением трофеев и таймером.
+ИСПРАВЛЕНО: восстановлена слежка за всеми сообщениями + глобальный error-handler.
 """
-
 import asyncio
 import logging
 import os
@@ -11,9 +11,8 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 from aiogram.types import Message
-from utils.chat_middleware import SmartLoggingMiddleware
-
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
 from utils.username_monitor import check_and_update_usernames
 from config import TOKEN
 from database import init_db
@@ -37,13 +36,15 @@ from Commands.inactive import router as inactive_router
 # Модульный админ-роутер
 from handlers.admin_features import admin_main_router
 
+# ИСПРАВЛЕНО: единая точка подключения слежки + error-handler
+from utils.error_handler import setup_logging_and_errors
+
 logging.basicConfig(level=logging.INFO)
 
 bot = Bot(
     token=TOKEN,
     default=DefaultBotProperties(parse_mode=ParseMode.HTML)
 )
-
 dp = Dispatcher()
 
 
@@ -53,7 +54,6 @@ async def on_startup():
     await init_db()
     await init_game_db()
     logging.info("Database initialized successfully.")
-
     try:
         await sync_all_rosters(bot)
         logging.info("Initial roster sync done")
@@ -62,13 +62,10 @@ async def on_startup():
 
 
 async def main():
-    # ─── РЕГИСТРАЦИЯ MIDDLEWARE ДЛЯ ЛОГИРОВАНИЯ ЗНАЧИМЫХ СОБЫТИЙ ────────────
-    # SmartLoggingMiddleware: логирует только важные события (ошибки, успешные ответы)
-    # НЕ логирует шум (неопознанные команды, игнорируемые сообщения)
-    dp.message.outer_middleware(SmartLoggingMiddleware())
+    # ─── СЛЕЖКА ЗА ВСЕМИ СООБЩЕНИЯМИ + ГЛОБАЛЬНЫЙ ПЕРЕХВАТ ОШИБОК ───
+    setup_logging_and_errors(dp)
 
     # ─── БЛОК СИСТЕМНЫХ КОМАНД СТРОГО ДЛЯ ВЛАДЕЛЬЦА @Ka1D3en (ID: 7899153362) ─
-
     @dp.message(F.text.in_({"/reload_config", "reload_config", "/reload_config@Vigarik_Sqd_bot"}))
     async def cmd_reload_config_direct(message: Message):
         if message.from_user.id != 7899153362:
@@ -77,59 +74,19 @@ async def main():
             from utils.admin_logger import reload_bot_config, log_admin_action
             reload_bot_config()
             await message.answer(
-                "🔄 <b>Конфигурация бота успешно обновлена!</b>\nНовые роли и настройки топиков вступили в силу.",
+                "🔄 Конфигурация бота успешно обновлена! \nНовые роли и настройки топиков вступили в силу.",
                 parse_mode="HTML")
             await log_admin_action(
                 bot=message.bot,
                 admin_id=message.from_user.id,
                 admin_name=message.from_user.username or "Ka1D3en",
-                action_text="⚙️ Выполнил принудительную <b>перезагрузку файла конфигурации</b> (config.py) на лету."
+                action_text="⚙️ Выполнил принудительную перезагрузку файла конфигурации (config.py) на лету."
             )
         except Exception as e:
             await message.answer(f"❌ Ошибка при перезагрузке файла конфигурации: {e}")
 
-    @dp.message(F.text.startswith("/check_access"))
-    async def cmd_check_access(message: Message, bot: Bot):
-        """Показывает владельцу фактический статус пользователя в чатах."""
-        if message.from_user.id not in (7899153362, 5281584435):
-            return
-
-        parts = message.text.split(maxsplit=1)
-        if len(parts) != 2 or not parts[1].strip().lstrip("-").isdigit():
-            await message.answer("Использование: <code>/check_access USER_ID</code>", parse_mode="HTML")
-            return
-
-        target_id = int(parts[1].strip())
-        from config import ADMIN_CHAT_ID, CLAN_CHATS, INITIAL_ADMINS
-
-        report = [
-            f"🔎 <b>Проверка пользователя</b> <code>{target_id}</code>",
-            f"В admins.txt: {'ДА' if target_id in INITIAL_ADMINS else 'НЕТ'}",
-            "",
-            "📊 Статусы в чатах:"
-        ]
-
-        try:
-            member = await bot.get_chat_member(ADMIN_CHAT_ID, target_id)
-            report.append(f"• Админ-чат: <code>{member.status}</code>")
-        except Exception as e:
-            report.append(f"• Админ-чат: ❌ <code>{str(e)[:120]}</code>")
-
-        found_clans = []
-        for clan_key, chat_info in CLAN_CHATS.items():
-            try:
-                member = await bot.get_chat_member(chat_info["chat_id"], target_id)
-                report.append(f"• {clan_key}: <code>{member.status}</code>")
-                if member.status in ("creator", "owner", "administrator", "member", "restricted"):
-                    found_clans.append(clan_key)
-            except Exception as e:
-                report.append(f"• {clan_key}: ❌ <code>{str(e)[:120]}</code>")
-
-        report.append("")
-        report.append(f"Итог: {'✅ доступ есть' if found_clans else '❌ доступ не найден'}")
-        await message.answer("\n".join(report), parse_mode="HTML")
-
-    @dp.message(F.text.in_({"/SetupBotVigarikThreads", "SetupBotVigarikThreads", "/SetupBotVigarikThreads@Vigarik_Sqd_bot"}))
+    @dp.message(F.text.in_({"/SetupBotVigarikThreads", "SetupBotVigarikThreads",
+                            "/SetupBotVigarikThreads@Vigarik_Sqd_bot"}))
     async def cmd_setup_threads_direct(message: Message, bot: Bot):
         if message.from_user.id != 7899153362:
             return
@@ -137,11 +94,9 @@ async def main():
         from database import set_setting
         chat_id = config.LOGS_CHAT_ID or config.ADMIN_CHAT_ID
         if not chat_id:
-            await message.answer("❌ Сначала пропиши ID чата in <code>LOGS_CHAT_ID</code> внутри <b>config.py</b>!",
-                                 parse_mode="HTML")
+            await message.answer("❌ Сначала пропиши ID чата in LOGS_CHAT_ID внутри config.py !", parse_mode="HTML")
             return
-
-        await message.answer("⏳ <b>Запуск развертывания системы...</b>\nСоздаю топики логов в административном чате...",
+        await message.answer("⏳ Запуск развертывания системы... \nСоздаю топики логов в административном чате...",
                              parse_mode="HTML")
         topics_config = {
             "main_admin": ("👔 Общие логи админки", 0x6FB9F0),
@@ -157,54 +112,51 @@ async def main():
                 await bot.send_message(
                     chat_id=chat_id,
                     message_thread_id=topic.message_thread_id,
-                    text=f"📌 Топик успешно инициализирован. Сюда будут поступать логи категории: <b>{name}</b>.",
+                    text=f"📌 Топик успешно инициализирован. Сюда будут поступать логи категории: {name} .",
                     parse_mode="HTML"
                 )
-                results.append(f"✅ {name} — ID темы: <code>{topic.message_thread_id}</code>")
+                results.append(f"✅ {name} — ID темы: {topic.message_thread_id} ")
             except Exception as e:
                 await message.answer(
-                    f"❌ Ошибка при создании топика <b>{name}</b>: {e}\nУбедись, что бот админ в группе с правом управления темами!",
+                    f"❌ Ошибка при создании топика {name} : {e}\nУбедись, что бот админ в группе с правом управления темами!",
                     parse_mode="HTML")
                 return
-
         from utils.admin_logger import log_admin_action
         await log_admin_action(
             bot=bot,
             admin_id=message.from_user.id,
             admin_name=message.from_user.username or "Ka1D3en",
-            action_text="🚀 Успешно выполнил <b>автоматическое развертывание топиков логов</b> системы.",
+            action_text="🚀 Успешно выполнил автоматическое развертывание топиков логов системы.",
             clan_key="main_admin"
         )
-
-        report = "🚀 <b>Система логирования успешно настроена!</b>\n\nВсе топики созданы и привязаны к базе данных:\n" + "\n".join(
+        report = "🚀 Система логирования успешно настроена! \n\nВсе топики созданы и привязаны к базе данных:\n" + "\n".join(
             results)
         await message.answer(report, parse_mode="HTML")
 
     @dp.message(F.text.contains("get_id"))
     async def cmd_get_chat_id_direct(message: Message):
         thread_id = message.message_thread_id
-        thread_info = f"<code>{thread_id}</code>" if thread_id else "<i>(Общий чат / General)</i>"
+        thread_info = f" {thread_id} " if thread_id else " (Общий чат / General) "
         await message.answer(
-            f"🆔 <b>ДАННЫЕ ЭТОГО ЧАТА:</b>\n\n"
-            f"1️⃣ <b>ID группы (LOGS_CHAT_ID):</b> <code>{message.chat.id}</code>\n"
-            f"2️⃣ <b>ID текущего топика:</b> {thread_info}\n\n"
+            f"🆔 ДАННЫЕ ЭТОГО ЧАТА: \n\n"
+            f"1️⃣ ID группы (LOGS_CHAT_ID): {message.chat.id} \n"
+            f"2️⃣ ID текущего топика: {thread_info}\n\n"
             f"👉 Скопируй ID группы с минусом и вставь в config.py в поле LOGS_CHAT_ID",
             parse_mode="HTML"
         )
 
     # ─── РЕГИСТРАЦИЯ ВСЕХ РОУТЕРОВ В ДИСПЕТЧЕРЕ ────────────────────────────────
-
     dp.include_router(start_router)
     dp.include_router(reg_router)
     dp.include_router(proposals_router)
     dp.include_router(push_system_router)
-    dp.include_router(inactive_router)
     dp.include_router(chat_router)
     dp.include_router(clan_list_router)
     dp.include_router(admin_main_router)
     dp.include_router(change_name_router)
     dp.include_router(league_router)
     dp.include_router(trophies_router)
+    dp.include_router(inactive_router)
 
     # ─── НАСТРОЙКА ПЛАНИРОВЩИКА ЗАДАЧ (APScheduler) ───────────────────────────
     scheduler = AsyncIOScheduler()
@@ -219,37 +171,6 @@ async def main():
     # ─── ДОБАВЛЕНО: ЗАПУСК ФОНОВЫХ ЗАДАЧ ОБНОВЛЕНИЯ КУБКОВ И ТАЙМЕРА ─────────
     asyncio.create_task(auto_update_trophies_task(bot))
     asyncio.create_task(auto_refresh_timer_task(bot))
-
-    # ─── ОБРАБОТЧИК НЕОБРАБОТАННЫХ ОШИБОК (ERROR HANDLER) ─────────────────────
-    @dp.error()
-    async def error_handler(update, exception):
-        """Логирует все необработанные ошибки в чат администрации."""
-        logging.error(f"Необработанная ошибка: {exception}", exc_info=exception)
-        
-        # Логируем ошибку в чат администрации
-        try:
-            from utils.admin_logger import log_bot_event
-            error_text = str(exception)[:150]
-            
-            # Пытаемся узнать user_id если это событие связано с юзером
-            user_id = None
-            username = None
-            if hasattr(update, 'message') and hasattr(update.message, 'from_user'):
-                user_id = update.message.from_user.id
-                username = update.message.from_user.username
-            elif hasattr(update, 'callback_query') and hasattr(update.callback_query, 'from_user'):
-                user_id = update.callback_query.from_user.id
-                username = update.callback_query.from_user.username
-            
-            await log_bot_event(
-                bot=bot,
-                event_type="error",
-                description=f"Необработанная ошибка: {error_text}",
-                user_id=user_id,
-                username=username
-            )
-        except Exception as log_err:
-            logging.error(f"Не удалось залогировать ошибку: {log_err}")
 
     await on_startup()
     logging.info("Bot successfully initialized and started polling.")

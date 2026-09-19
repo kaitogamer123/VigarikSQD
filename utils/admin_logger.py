@@ -1,13 +1,13 @@
 """
-Система расширенного логирования действий администрации, ошибок и значимых событий бота.
-Пишет логи в файл И в чат администрации (только важные события).
+Система расширенного логирования действий администрации и трансляции ЛС в супергруппу.
+УКРЕПЛЕНО: безопасные преобразования int(), защита от None и пустых настроек топиков.
 """
-
 import logging
 from datetime import datetime
+
 from aiogram import Bot
-from aiogram.exceptions import TelegramBadRequest  # ДОБАВЛЕНО: Для отлова удаления топиков
-from aiogram.utils.markdown import html_decoration as hd  # ИСПРАВЛЕНО: Экранирование текста
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.utils.markdown import html_decoration as hd
 
 import config
 from database import get_setting, set_setting
@@ -15,22 +15,43 @@ from database import get_setting, set_setting
 # Настраиваем локальный файловый логгер
 logger = logging.getLogger("admin_actions")
 logger.setLevel(logging.INFO)
-
 if not logger.handlers:
     file_handler = logging.FileHandler("admin_actions.log", encoding="utf-8")
     formatter = logging.Formatter("[%(asctime)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
 
-# Отдельный логгер для системных событий бота
-bot_events_logger = logging.getLogger("bot_events")
-bot_events_logger.setLevel(logging.INFO)
 
-if not bot_events_logger.handlers:
-    bot_handler = logging.FileHandler("bot_events.log", encoding="utf-8")
-    bot_formatter = logging.Formatter("[%(asctime)s] %(levelname)s - %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
-    bot_handler.setFormatter(bot_formatter)
-    bot_events_logger.addHandler(bot_handler)
+def _safe_int(value, default=0) -> int:
+    """Безопасно превращает значение в int. Никогда не падает на None/пустой строке/мусоре."""
+    if value is None:
+        return default
+    try:
+        return int(str(value).strip())
+    except (ValueError, TypeError):
+        return default
+
+
+def reload_bot_config() -> None:
+    """
+    Принудительная перезагрузка config.py на лету.
+    Используется командой /reload_config.
+    """
+    try:
+        # Предпочитаем reload_config из config.py, если он есть
+        if hasattr(config, "reload_config"):
+            config.reload_config()
+            return
+    except Exception as e:
+        logger.error(f"config.reload_config() failed: {e}")
+
+    # Фоллбек: importlib.reload
+    try:
+        import importlib
+        importlib.reload(config)
+    except Exception as e:
+        logger.error(f"importlib.reload(config) failed: {e}")
+        raise
 
 
 async def get_or_create_admin_topic(bot: Bot, chat_id: int, admin_id: int, admin_name: str) -> int:
@@ -41,37 +62,28 @@ async def get_or_create_admin_topic(bot: Bot, chat_id: int, admin_id: int, admin
     setting_key = f"admin_topic_{admin_id}"
     thread_id_str = await get_setting(setting_key)
 
-    # Безопасное имя для топика
     safe_name = hd.quote(str(admin_name)) if admin_name else ""
     topic_title = f"📁 Логи @{admin_name}" if admin_name else f"📁 Логи ID {admin_id}"
 
-    if thread_id_str:
-        # ИСПРАВЛЕНО: Проверяем, жив ли топик (админы могли удалить его вручную в Telegram)
-        try:
-            # Делаем пустой проверочный пинг в топик (например, меняем имя или просто проверяем статус)
-            # Чтобы не спамить текстом, мы просто вернем сохраненный ID, но завернем отправку лога ниже в try-except
-            return int(thread_id_str)
-        except ValueError:
-            pass
+    existing_id = _safe_int(thread_id_str, 0)
+    if existing_id:
+        return existing_id
 
     try:
         topic = await bot.create_forum_topic(
             chat_id=chat_id,
             name=topic_title,
-            icon_color=0x9B59B6  # Фиолетовый цвет
+            icon_color=0x9B59B6
         )
-
         await set_setting(setting_key, str(topic.message_thread_id))
-
         await bot.send_message(
             chat_id=chat_id,
             message_thread_id=topic.message_thread_id,
-            text=f"📌 Топик инициализирован. Сюда дублируются действия администратора: <b>@{safe_name}</b> (ID: <code>{admin_id}</code>).",
+            text=f"📌 Топик инициализирован. Сюда дублируются действия администратора: @{safe_name} (ID: {admin_id} ).",
             parse_mode="HTML"
         )
         return topic.message_thread_id
     except Exception as e:
-        # ИСПРАВЛЕНО: Пишем в правильный логгер logger вместо глобального logging
         logger.error(f"Не удалось создать персональный топик для админа {admin_id}: {e}")
         return 0
 
@@ -82,41 +94,37 @@ async def log_admin_action(bot: Bot, admin_id: int, admin_name: str, action_text
     """
     time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     log_msg = f"[{clan_key.upper()}] Админ ID {admin_id} (@{admin_name}): {action_text}"
-
     logger.info(log_msg)
 
     chat_id = config.LOGS_CHAT_ID or config.ADMIN_CHAT_ID
     if not chat_id:
         return
 
-    # ИСПРАВЛЕНО: Экранируем имя админа и его действие, чтобы спецсимволы не ломали разметку лога
     safe_name = hd.quote(str(admin_name)) if admin_name else "unknown"
-
     html_text = (
-        f"⚡ <b>ДЕЙСТВИЕ АДМИНИСТРАЦИИ</b>\n"
-        f"📅 <b>Время:</b> <code>{time_str}</code>\n"
-        f"👤 <b>Админ:</b> @{safe_name} (ID: <code>{admin_id}</code>)\n"
-        f"📝 <b>Что сделано:</b> {action_text}"
+        f"⚡ ДЕЙСТВИЕ АДМИНИСТРАЦИИ \n"
+        f"📅 Время: {time_str} \n"
+        f"👤 Админ: @{safe_name} (ID: {admin_id} )\n"
+        f"📝 Что сделано: {action_text}"
     )
 
     # ────── ОТПРАВКА В ТОПИК КАТЕГОРИИ (КЛАНА) ──────
     setting_key = f"topic_id_{clan_key}"
     thread_id_str = await get_setting(setting_key)
-
     if not thread_id_str and clan_key != "main_admin":
         thread_id_str = await get_setting("topic_id_main_admin")
 
-    if thread_id_str:
+    category_thread_id = _safe_int(thread_id_str, 0)
+    if category_thread_id:
         try:
             await bot.send_message(
                 chat_id=chat_id,
-                message_thread_id=int(thread_id_str),
+                message_thread_id=category_thread_id,
                 text=html_text,
                 parse_mode="HTML"
             )
         except TelegramBadRequest as e:
-            # ИСПРАВЛЕНО: Если топик удален, сбрасываем его в БД, чтобы бот пересоздал его при следующем действии
-            if "thread not found" in e.message.lower():
+            if e.message and "thread not found" in e.message.lower():
                 await set_setting(setting_key, "")
             logger.error(f"Не удалось отправить лог в топик категории {clan_key}: {e}")
         except Exception as e:
@@ -124,8 +132,7 @@ async def log_admin_action(bot: Bot, admin_id: int, admin_name: str, action_text
 
     # ────── ОТПРАВКА В ПЕРСОНАЛЬНЫЙ ТОПИК АДМИНА ──────
     admin_thread_id = await get_or_create_admin_topic(bot, chat_id, admin_id, admin_name)
-
-    if admin_thread_id and admin_thread_id != int(thread_id_str or 0):
+    if admin_thread_id and admin_thread_id != category_thread_id:
         try:
             await bot.send_message(
                 chat_id=chat_id,
@@ -134,8 +141,7 @@ async def log_admin_action(bot: Bot, admin_id: int, admin_name: str, action_text
                 parse_mode="HTML"
             )
         except TelegramBadRequest as e:
-            if "thread not found" in e.message.lower():
-                # Если админ удалил свой личный топик, очищаем ключ, чтобы бот создал новый топик в следующий раз
+            if e.message and "thread not found" in e.message.lower():
                 await set_setting(f"admin_topic_{admin_id}", "")
         except Exception as e:
             logger.error(f"Не удалось отправить лог в персональный топик админа {admin_id}: {e}")
@@ -148,8 +154,9 @@ async def get_or_create_chat_log_topic(bot: Bot, chat_id: int) -> int:
     setting_key = "topic_id_users_chat"
     thread_id_str = await get_setting(setting_key)
 
-    if thread_id_str:
-        return int(thread_id_str)
+    existing_id = _safe_int(thread_id_str, 0)
+    if existing_id:
+        return existing_id
 
     try:
         topic = await bot.create_forum_topic(
@@ -158,7 +165,6 @@ async def get_or_create_chat_log_topic(bot: Bot, chat_id: int) -> int:
             icon_color=0x2ECC71
         )
         await set_setting(setting_key, str(topic.message_thread_id))
-
         await bot.send_message(
             chat_id=chat_id,
             message_thread_id=topic.message_thread_id,
@@ -189,22 +195,21 @@ async def log_user_chat(bot: Bot, user_id: int, username: str, first_name: str, 
     if not thread_id:
         return
 
-    # ИСПРАВЛЕНО: Жесткое экранирование входящих юзернеймов, имен и текста ЛС от краша разметки Telegram
     safe_username = hd.quote(str(username)) if username else None
     safe_firstname = hd.quote(str(first_name)) if first_name else "Игрок"
-    safe_message = hd.quote(str(message_text))
+    safe_message = hd.quote(str(message_text)) if message_text is not None else "[пустое сообщение]"
 
     display_name = f"@{safe_username}" if safe_username else f"{safe_firstname} (ID: {user_id})"
 
     if is_bot_reply:
         html_text = (
-            f"🤖 <b>Ответ бота для</b> {display_name}:\n"
-            f" └ <i>{safe_message}</i>"
+            f"🤖 Ответ бота для {display_name}:\n"
+            f" └ {safe_message} "
         )
     else:
         html_text = (
-            f"👤 <b>Игрок</b> {display_name} <b>написал боту:</b>\n"
-            f" └ <code>{safe_message}</code>"
+            f"👤 Игрок {display_name} написал боту: \n"
+            f" └ {safe_message} "
         )
 
     try:
@@ -215,83 +220,8 @@ async def log_user_chat(bot: Bot, user_id: int, username: str, first_name: str, 
             parse_mode="HTML"
         )
     except TelegramBadRequest as e:
-        if "thread not found" in e.message.lower():
+        if e.message and "thread not found" in e.message.lower():
             await set_setting("topic_id_users_chat", "")
-        logger.error(f"Ошибка трансляции ЛС в топик: {e.message}")
+        logger.error(f"Ошибка трансляции ЛС в топик: {getattr(e, 'message', e)}")
     except Exception as e:
         logger.error(f"Ошибка логгера чата: {e}")
-
-
-async def log_bot_event(bot: Bot, event_type: str, description: str, user_id: int = None, username: str = None):
-    """
-    НОВОЕ: Логирует значимые события бота (ошибки, успешные операции) в чат администрации.
-    
-    event_type: "error", "success", "info", "warning"
-    description: описание того, что произошло
-    user_id/username: если событие связано с юзером
-    """
-    time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    
-    # Логируем в файл
-    event_emoji = {"error": "❌", "success": "✅", "info": "ℹ️", "warning": "⚠️"}.get(event_type, "📝")
-    file_log = f"[{event_emoji} {event_type.upper()}] {description}"
-    if user_id or username:
-        file_log += f" (User: {username or user_id})"
-    bot_events_logger.log(
-        logging.ERROR if event_type == "error" else logging.INFO,
-        file_log
-    )
-    
-    # Логируем в чат администрации (только если это ошибка, успех или важное предупреждение)
-    if event_type not in ["error", "success", "warning"]:
-        return
-    
-    chat_id = config.LOGS_CHAT_ID or config.ADMIN_CHAT_ID
-    if not chat_id:
-        return
-    
-    # Получаем или создаем топик для системных событий
-    setting_key = "topic_id_bot_events"
-    thread_id_str = await get_setting(setting_key)
-    
-    if not thread_id_str:
-        try:
-            topic = await bot.create_forum_topic(
-                chat_id=chat_id,
-                name="⚙️ Системные события и ошибки",
-                icon_color=0xFF6B6B  # Красный цвет
-            )
-            await set_setting(setting_key, str(topic.message_thread_id))
-            thread_id_str = str(topic.message_thread_id)
-        except Exception as e:
-            bot_events_logger.error(f"Не удалось создать топик системных событий: {e}")
-            return
-    
-    # Формируем красивое сообщение
-    emoji_map = {"error": "❌", "success": "✅", "info": "ℹ️", "warning": "⚠️"}
-    emoji = emoji_map.get(event_type, "📝")
-    
-    safe_desc = hd.quote(str(description))
-    
-    html_text = f"{emoji} <b>{event_type.upper()}</b>\n"
-    html_text += f"📅 <code>{time_str}</code>\n"
-    html_text += f"📝 {safe_desc}"
-    
-    if user_id or username:
-        safe_username = hd.quote(str(username)) if username else None
-        display_name = f"@{safe_username}" if safe_username else f"ID: {user_id}"
-        html_text += f"\n👤 <b>Пользователь:</b> {display_name}"
-    
-    try:
-        await bot.send_message(
-            chat_id=chat_id,
-            message_thread_id=int(thread_id_str),
-            text=html_text,
-            parse_mode="HTML"
-        )
-    except TelegramBadRequest as e:
-        if "thread not found" in e.message.lower():
-            await set_setting(setting_key, "")
-        bot_events_logger.error(f"Ошибка отправки системного лога: {e.message}")
-    except Exception as e:
-        bot_events_logger.error(f"Ошибка логирования события: {e}")
