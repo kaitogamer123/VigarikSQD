@@ -16,6 +16,9 @@ logger = logging.getLogger(__name__)
 router = Router()
 
 
+
+
+            
 def detect_clan_by_chat(chat_id: int):
     for clan, data in CLAN_CHATS.items():
         if data["chat_id"] == chat_id:
