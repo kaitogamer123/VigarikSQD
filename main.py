@@ -174,6 +174,7 @@ async def main():
     # ─── ДОБАВЛЕНО: ЗАПУСК ФОНОВЫХ ЗАДАЧ ОБНОВЛЕНИЯ КУБКОВ И ТАЙМЕРА ─────────
     asyncio.create_task(auto_update_trophies_task(bot))
     asyncio.create_task(auto_refresh_timer_task(bot))
+    # Фоновый сборщик истории боёв всех игроков (каждые 10 минут)
     asyncio.create_task(auto_collect_stats_task(bot))
 
     await on_startup()

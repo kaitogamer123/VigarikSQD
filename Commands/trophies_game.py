@@ -1,6 +1,6 @@
 """
-Личный профиль Brawl Stars: команда /profileBS.
-Все бои из API навсегда сохраняются в battle_history.db — статистика считается
+Личный профиль Brawl Stars: команды /profileBS и /ProfileBSOther.
+Все бои из API навсегда сохраняются в player_stats.db — статистика считается
 из накопленной истории, а не только из последних ~25 боёв, которые отдаёт API.
 """
 import logging
@@ -17,7 +17,14 @@ from aiogram.utils.markdown import html_decoration as hd
 from config import CLAN_DISPLAY
 from database import get_all_members, get_member
 from services.api_service import get_player_battlelog, get_player_profile
-import battle_history_db as bh
+from player_stats_db import (
+    ensure_player_tracked,
+    get_recent_battles,
+    get_total_battles_count,
+    get_tracked_player,
+    get_window_summary,
+    save_battlelog,
+)
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -176,15 +183,19 @@ async def _load_bundle(user_id: int):
             "highest_trophies": member.get("trophies") or 0,
         }
 
-    # >>> Ключевое: сохраняем ВСЕ бои из API в постоянную историю
+    # Сохраняем новые бои в постоянную player_stats.db.
     try:
         api_battles = await get_player_battlelog(tag)
-        new_count = await bh.save_battles(tag, api_battles)
+        new_count = await save_battlelog(tag, api_battles)
         if new_count:
-            logger.info(f"[battle_history] {tag}: сохранено новых боёв: {new_count}")
-        await bh.save_trophy_snapshot(tag, profile.get("trophies"))
+            logger.info(f"[player_stats] {tag}: сохранено новых боёв: {new_count}")
+        await ensure_player_tracked(
+            tag,
+            profile.get("name") or member.get("game_nick") or "Игрок",
+            profile.get("trophies") or member.get("trophies") or 0,
+        )
     except Exception as e:
-        logger.error(f"[battle_history] ошибка сохранения для {tag}: {e}")
+        logger.error(f"[player_stats] ошибка сохранения для {tag}: {e}")
 
     game_stats = await _game_db_stats(tag)
     return member, profile, game_stats, "ok"
@@ -249,7 +260,7 @@ async def _period_text(period: str, member: dict, profile: dict, game_stats: dic
     tag = member.get("player_tag")
     title, hours, days = PERIODS[period]
 
-    summary = await bh.get_summary(tag, hours=hours, days=days)
+    summary = await get_window_summary(tag, hours=hours, days=days)
 
     tracker_map = {
         "hour": game_stats.get("trophies_hour_diff"),
@@ -272,11 +283,11 @@ async def _period_text(period: str, member: dict, profile: dict, game_stats: dic
         solo = (profile or {}).get("solo_wins") or 0
         duo = (profile or {}).get("duo_wins") or 0
 
-        first_snap = await bh.get_first_snapshot(tag)
+        first_snap = await get_tracked_player(tag)
         growth_line = ""
         if first_snap:
-            delta = int(trophies_now) - int(first_snap.get("trophies") or 0)
-            since = _parse_db_time(first_snap.get("taken_at"))
+            delta = int(trophies_now) - int(first_snap.get("start_trophies") or 0)
+            since = _parse_db_time(first_snap.get("first_seen"))
             since_str = since.strftime("%d.%m.%Y") if since else "начала отслеживания"
             growth_line = f"\n📈 Прирост с {since_str}: {_fmt_signed(delta)} кубков"
 
@@ -308,8 +319,8 @@ async def _period_text(period: str, member: dict, profile: dict, game_stats: dic
 
 async def _battles_text(member: dict, profile: dict) -> str:
     tag = member.get("player_tag")
-    rows = await bh.get_battles(tag, limit=15)
-    total = (await bh.get_summary(tag)).get("count", 0)
+    rows = await get_recent_battles(tag, limit=15)
+    total = await get_total_battles_count(tag)
 
     lines = [_header(member, profile), "", f"🎮 История боёв (всего сохранено: {total})"]
     if not rows:

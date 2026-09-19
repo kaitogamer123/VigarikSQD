@@ -1,67 +1,70 @@
 """
-Фоновый сборщик личной статистики.
-Каждые 10 минут опрашивает battlelog всех зарегистрированных игроков
-и дописывает только новые бои в player_stats.db.
+Фоновый сборщик личной статистики Brawl Stars.
+Каждые 10 минут сохраняет новые бои всех зарегистрированных игроков
+в единственную накопительную базу player_stats.db.
 """
 import asyncio
 import logging
 
 from database import get_all_members
-from player_stats_db import save_battlelog, init_player_stats_db
-from services.api_service import get_player_battlelog
+from player_stats_db import (
+    ensure_player_tracked,
+    init_player_stats_db,
+    save_battlelog,
+)
+from services.api_service import get_player_battlelog, get_player_profile
 
 logger = logging.getLogger(__name__)
 
-COLLECT_INTERVAL_SECONDS = 600  # 10 минут
-PAUSE_BETWEEN_PLAYERS = 0.4     # щадим лимиты Brawl Stars API
+COLLECT_INTERVAL_SECONDS = 10 * 60
+PAUSE_BETWEEN_PLAYERS = 0.6
 
 
-async def collect_once() -> dict:
-    """Один полный круг сбора. Возвращает счётчики для логов."""
-    stats = {"players": 0, "new_battles": 0, "skipped": 0}
-    try:
-        members = await get_all_members() or []
-    except Exception as e:
-        logger.error(f"collect_once: не удалось получить участников: {e}")
-        return stats
+async def collect_once() -> tuple[int, int]:
+    """Один проход. Возвращает (обработано игроков, добавлено новых боёв)."""
+    members = await get_all_members() or []
+    processed = 0
+    new_total = 0
 
     for member in members:
-        if not member:
+        if not member or member.get("registered") != 1:
             continue
         tag = member.get("player_tag")
-        user_id = member.get("user_id")
-        registered = member.get("registered")
-        if not tag or not user_id or registered != 1:
-            stats["skipped"] += 1
+        if not tag:
             continue
 
         try:
-            items = await get_player_battlelog(tag)
-            if items:
-                added = await save_battlelog(tag, items)
-                stats["new_battles"] += added
-            stats["players"] += 1
+            battles = await get_player_battlelog(tag)
+            new_total += await save_battlelog(tag, battles)
+
+            profile = await get_player_profile(tag)
+            if profile:
+                await ensure_player_tracked(
+                    tag,
+                    profile.get("name") or member.get("game_nick") or "Игрок",
+                    profile.get("trophies") or member.get("trophies") or 0,
+                )
+            processed += 1
         except Exception as e:
-            logger.error(f"collect_once: ошибка для {tag} ({member.get('game_nick')}): {e}")
+            logger.error(f"[stats_collector] {tag}: {e}")
 
         await asyncio.sleep(PAUSE_BETWEEN_PLAYERS)
 
-    return stats
+    return processed, new_total
 
 
-async def auto_collect_stats_task(bot) -> None:
-    """Запускается в main.py фоновой задачей."""
+async def auto_collect_stats_task(bot=None) -> None:
+    """Бесконечная фоновая задача, подключаемая в main.py."""
     await init_player_stats_db()
-    await asyncio.sleep(25)
+    await asyncio.sleep(40)
 
     while True:
         try:
-            stats = await collect_once()
+            processed, new_total = await collect_once()
             logger.info(
-                f"Сбор статистики: опрошено {stats['players']}, "
-                f"новых боёв {stats['new_battles']}, пропущено {stats['skipped']}"
+                f"[stats_collector] игроков: {processed}, новых боёв: {new_total}"
             )
         except Exception as e:
-            logger.error(f"Ошибка цикла сбора статистики: {e}")
+            logger.error(f"[stats_collector] сбой прохода: {e}")
 
         await asyncio.sleep(COLLECT_INTERVAL_SECONDS)
