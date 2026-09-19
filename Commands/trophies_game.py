@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 
 import aiosqlite
 from aiogram import Router, F
+from aiogram.filters import Command, or_f
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from aiogram.utils.markdown import html_decoration as hd
 
@@ -388,18 +389,13 @@ async def _answer_error(target, kind: str):
         await target.answer(text)
 
 
-def _is_profilebs_command(text: str | None) -> bool:
-    """Ловит /profilebs, /profileBS, /profile_bs и варианты с @ботом."""
-    if not text:
-        return False
-    cmd = text.strip().split()[0].lower()
-    cmd = cmd.split("@", 1)[0]
-    return cmd in {"/profilebs", "/profile_bs", "/profile-bs"}
-
-
-@router.message(F.text.func(_is_profilebs_command))
+@router.message(
+    or_f(
+        Command(commands=["profilebs", "profile_bs"], ignore_case=True, ignore_mention=True),
+        F.text.regexp(r"(?i)^/profile[_]?bs(@\w+)?(\s|$)"),
+    )
+)
 async def cmd_profile_bs(message: Message):
-    logger.info(f"/profilebs поймана от {message.from_user.id}")
     wait = await message.answer("⏳ Загружаю твой профиль из Brawl Stars...")
     member, profile, battles, game_stats, status = await _load_bundle(message.from_user.id)
     if status != "ok":
