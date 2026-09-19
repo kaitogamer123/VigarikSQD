@@ -30,6 +30,8 @@ from handlers.chat_events import router as chat_router
 from handlers.clan_list import router as clan_list_router
 from league.handlers import router as league_router
 from game_database import init_game_db
+from player_stats_db import init_player_stats_db
+from utils.stats_collector import auto_collect_stats_task
 from Commands.trophies_game import router as trophies_router
 from Commands.inactive import router as inactive_router
 
@@ -53,6 +55,7 @@ async def on_startup():
     """Выполняет технические задачи при старте сервера."""
     await init_db()
     await init_game_db()
+    await init_player_stats_db()
     logging.info("Database initialized successfully.")
     try:
         await sync_all_rosters(bot)
@@ -150,13 +153,13 @@ async def main():
     dp.include_router(reg_router)
     dp.include_router(proposals_router)
     dp.include_router(push_system_router)
-    dp.include_router(trophies_router)
-    dp.include_router(inactive_router)
     dp.include_router(chat_router)
     dp.include_router(clan_list_router)
     dp.include_router(admin_main_router)
     dp.include_router(change_name_router)
     dp.include_router(league_router)
+    dp.include_router(trophies_router)
+    dp.include_router(inactive_router)
 
     # ─── НАСТРОЙКА ПЛАНИРОВЩИКА ЗАДАЧ (APScheduler) ───────────────────────────
     scheduler = AsyncIOScheduler()
@@ -171,6 +174,7 @@ async def main():
     # ─── ДОБАВЛЕНО: ЗАПУСК ФОНОВЫХ ЗАДАЧ ОБНОВЛЕНИЯ КУБКОВ И ТАЙМЕРА ─────────
     asyncio.create_task(auto_update_trophies_task(bot))
     asyncio.create_task(auto_refresh_timer_task(bot))
+    asyncio.create_task(auto_collect_stats_task(bot))
 
     await on_startup()
     logging.info("Bot successfully initialized and started polling.")
