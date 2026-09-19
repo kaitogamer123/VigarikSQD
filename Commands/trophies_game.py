@@ -1,25 +1,32 @@
 """
 Личный профиль Brawl Stars: команда /profileBS.
 Старые клановые команды /TrophHour /Trophday /TropWeek /TrophMonth удалены.
-Игрок видит свои кубки, прирост за час/день/неделю/всё время и историю боёв.
+
+Статистика часов/дня/недели и история боёв берутся из НАКОПИТЕЛЬНОЙ базы
+player_stats.db (фоновый сборщик utils/stats_collector.py дописывает новые бои),
+поэтому история не ограничивается последними 25 боями из API.
 """
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
-import aiosqlite
 from aiogram import Router, F
-from aiogram.filters import Command, or_f
+from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from aiogram.utils.markdown import html_decoration as hd
 
 from config import CLAN_DISPLAY
 from database import get_member
+from player_stats_db import (
+    ensure_player_tracked,
+    get_recent_battles,
+    get_tracked_player,
+    get_window_summary,
+    save_battlelog,
+)
 from services.api_service import get_player_battlelog, get_player_profile
 
 logger = logging.getLogger(__name__)
 router = Router()
-
-GAME_DB_PATH = "game_clans.db"
 
 MODE_RU = {
     "gemGrab": "Захват кристаллов",
@@ -65,29 +72,45 @@ def profile_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
-def _norm_tag(tag: str) -> str:
-    return (tag or "").strip().upper().replace("#", "")
+def _fmt_signed(value: int) -> str:
+    value = int(value or 0)
+    return f"+{value}" if value > 0 else str(value)
 
 
-def _parse_battle_time(raw: str):
+def _mode_name(mode: str) -> str:
+    return MODE_RU.get(mode or "unknown", mode or "Неизвестно")
+
+
+def _result_emoji(row: dict) -> str:
+    result = (row.get("result") or "").lower()
+    if result == "victory":
+        return "✅"
+    if result == "defeat":
+        return "❌"
+    if result == "draw":
+        return "🤝"
+    if row.get("rank"):
+        return f"#{row['rank']}"
+    return "⚔️"
+
+
+def _parse_iso(raw: str):
     if not raw:
         return None
     try:
-        return datetime.strptime(str(raw)[:15], "%Y%m%dT%H%M%S").replace(tzinfo=timezone.utc)
+        return datetime.strptime(str(raw), "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
     except Exception:
         try:
-            return datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+            return datetime.fromisoformat(str(raw)).replace(tzinfo=timezone.utc)
         except Exception:
             return None
 
 
-def _human_ago(battle_dt) -> str:
-    if not battle_dt:
+def _human_ago(raw: str) -> str:
+    dt = _parse_iso(raw)
+    if not dt:
         return "недавно"
-    now = datetime.now(timezone.utc)
-    if battle_dt.tzinfo is None:
-        battle_dt = battle_dt.replace(tzinfo=timezone.utc)
-    diff = now - battle_dt
+    diff = datetime.now(timezone.utc) - dt
     minutes = int(diff.total_seconds() // 60)
     if minutes < 1:
         return "только что"
@@ -96,142 +119,7 @@ def _human_ago(battle_dt) -> str:
     hours = minutes // 60
     if hours < 24:
         return f"{hours} ч назад"
-    days = hours // 24
-    return f"{days} дн. назад"
-
-
-def _fmt_signed(value: int) -> str:
-    value = int(value or 0)
-    if value > 0:
-        return f"+{value}"
-    return str(value)
-
-
-def _mode_name(item: dict) -> str:
-    battle = item.get("battle") or {}
-    event = item.get("event") or {}
-    mode = event.get("mode") or battle.get("mode") or "unknown"
-    return MODE_RU.get(mode, str(mode))
-
-
-def _map_name(item: dict) -> str:
-    event = item.get("event") or {}
-    name = event.get("map")
-    return name if name else "Случайная карта"
-
-
-def _trophy_change(item: dict, player_tag: str) -> int:
-    battle = item.get("battle") or {}
-    if battle.get("trophyChange") is not None:
-        try:
-            return int(battle.get("trophyChange") or 0)
-        except (TypeError, ValueError):
-            return 0
-    my = _norm_tag(player_tag)
-    for p in battle.get("players") or []:
-        if _norm_tag(p.get("tag")) == my:
-            try:
-                return int(p.get("trophyChange") or 0)
-            except (TypeError, ValueError):
-                return 0
-    return 0
-
-
-def _battle_result_emoji(item: dict) -> str:
-    battle = item.get("battle") or {}
-    result = (battle.get("result") or "").lower()
-    if result == "victory":
-        return "✅"
-    if result == "defeat":
-        return "❌"
-    if result == "draw":
-        return "🤝"
-    rank = battle.get("rank")
-    if rank:
-        return f"#{rank}"
-    return "⚔️"
-
-
-def _filter_battles(items: list, hours: int = None, days: int = None) -> list:
-    now = datetime.now(timezone.utc)
-    out = []
-    for item in items:
-        t = _parse_battle_time(item.get("battleTime"))
-        if not t:
-            continue
-        if t.tzinfo is None:
-            t = t.replace(tzinfo=timezone.utc)
-        delta = now - t
-        if hours is not None and delta > timedelta(hours=hours):
-            continue
-        if days is not None and delta > timedelta(days=days):
-            continue
-        out.append(item)
-    return out
-
-
-def _summarize_battles(items: list, player_tag: str) -> dict:
-    wins = losses = draws = other = 0
-    trop = 0
-    for item in items:
-        trop += _trophy_change(item, player_tag)
-        battle = item.get("battle") or {}
-        result = (battle.get("result") or "").lower()
-        if result == "victory":
-            wins += 1
-        elif result == "defeat":
-            losses += 1
-        elif result == "draw":
-            draws += 1
-        else:
-            other += 1
-    return {
-        "count": len(items),
-        "wins": wins,
-        "losses": losses,
-        "draws": draws,
-        "other": other,
-        "trophies": trop,
-    }
-
-
-async def _game_db_stats(player_tag: str) -> dict:
-    """Читает прирост кубков из game_clans.db, если сборщик на сервере пишет туда данные."""
-    tag = _norm_tag(player_tag)
-    if not tag:
-        return {}
-    try:
-        async with aiosqlite.connect(GAME_DB_PATH, timeout=10.0) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute(
-                """
-                SELECT trophies, trophies_hour_diff, trophies_day_diff,
-                       trophies_week_diff, trophies_month_diff, last_played_at, game_nick
-                FROM clan_players
-                WHERE REPLACE(UPPER(player_tag), '#', '') = ?
-                LIMIT 1
-                """,
-                (tag,),
-            ) as cur:
-                row = await cur.fetchone()
-                return dict(row) if row else {}
-    except Exception as e:
-        logger.warning(f"Не удалось прочитать game_clans.db: {e}")
-        return {}
-
-
-async def _load_bundle(user_id: int):
-    member = await get_member(user_id)
-    if not member or not member.get("registered"):
-        return None, None, None, None, "unregistered"
-    tag = member.get("player_tag")
-    if not tag:
-        return member, None, None, None, "no_tag"
-
-    profile = await get_player_profile(tag)
-    battles = await get_player_battlelog(tag)
-    game_stats = await _game_db_stats(tag)
-    return member, profile, battles, game_stats, "ok"
+    return f"{hours // 24} дн. назад"
 
 
 def _header(member: dict, profile: dict) -> str:
@@ -264,103 +152,152 @@ def _header(member: dict, profile: dict) -> str:
     ).replace(",", " ")
 
 
-def _period_text(period: str, member: dict, profile: dict, battles: list, game_stats: dict) -> str:
-    tag = member.get("player_tag")
-    trophies_now = (profile or {}).get("trophies")
-    if trophies_now is None:
-        trophies_now = member.get("trophies") or 0
+def _stats_block(summary: dict) -> str:
+    count = summary.get("count", 0)
+    wins = summary.get("wins", 0)
+    losses = summary.get("losses", 0)
+    draws = summary.get("draws", 0)
+    trop = summary.get("trophies", 0)
+    winrate = round(wins / count * 100) if count else 0
+    emoji = "📈" if trop >= 0 else "📉"
+    return (
+        f"🎮 Боёв: {count}\n"
+        f"✅ Побед: {wins}   ❌ Поражений: {losses}   🤝 Ничьих: {draws}\n"
+        f"📊 Винрейт: {winrate}%\n"
+        f"{emoji} Кубков за период: {_fmt_signed(trop)}"
+    )
 
-    titles = {
-        "hour": ("⏱ Статистика за последний час", 1, None),
-        "day": ("📅 Статистика за последний день", 24, None),
-        "week": ("📆 Статистика за неделю", None, 7),
-        "all": ("🏆 Статистика за всё время", None, None),
+
+async def _load_bundle(user_id: int):
+    member = await get_member(user_id)
+    if not member or not member.get("registered"):
+        return None, None, None, "unregistered"
+    tag = member.get("player_tag")
+    if not tag:
+        return member, None, None, "no_tag"
+
+    profile = await get_player_profile(tag)
+    fresh_battles = await get_player_battlelog(tag)
+
+    # Сразу дописываем в накопительную базу только новые бои
+    try:
+        await save_battlelog(tag, fresh_battles)
+        nick = (profile or {}).get("name") or member.get("game_nick") or "Игрок"
+        trophies = (profile or {}).get("trophies") if profile else member.get("trophies")
+        await ensure_player_tracked(tag, nick, trophies or 0)
+    except Exception as e:
+        logger.error(f"Не удалось сохранить battlelog для {tag}: {e}")
+
+    return member, profile, tag, "ok"
+
+
+def _fallback_profile(member: dict) -> dict:
+    return {
+        "name": member.get("game_nick"),
+        "tag": member.get("player_tag"),
+        "trophies": member.get("trophies") or 0,
+        "highest_trophies": member.get("trophies") or 0,
     }
-    title, hours, days = titles[period]
+
+
+async def _period_text(period: str, member: dict, profile: dict, tag: str) -> str:
+    if period == "hour":
+        title = "⏱ Статистика за последний час"
+        summary = await get_window_summary(tag, hours=1)
+    elif period == "day":
+        title = "📅 Статистика за последние 24 часа"
+        summary = await get_window_summary(tag, hours=24)
+    elif period == "week":
+        title = "📆 Статистика за последние 7 дней"
+        summary = await get_window_summary(tag, days=7)
+    else:
+        title = "🏆 Статистика за всё время слежки"
+        summary = await get_window_summary(tag)
 
     if period == "all":
+        tracked = await get_tracked_player(tag) or {}
+        trophies_now = (profile or {}).get("trophies") or member.get("trophies") or 0
+        highest = (profile or {}).get("highest_trophies") or trophies_now
         trio = (profile or {}).get("trio_wins") or 0
         solo = (profile or {}).get("solo_wins") or 0
         duo = (profile or {}).get("duo_wins") or 0
-        highest = (profile or {}).get("highest_trophies") or trophies_now
-        month_diff = game_stats.get("trophies_month_diff")
-        extra_month = ""
-        if month_diff is not None:
-            extra_month = f"\n📈 Прирост за месяц (трекер клана): {_fmt_signed(month_diff)}"
+        start_trophies = tracked.get("start_trophies")
+        first_seen = tracked.get("first_seen")
+
+        delta_line = ""
+        if start_trophies is not None and first_seen:
+            delta = int(trophies_now) - int(start_trophies)
+            delta_line = f"\n📈 Кубков с {str(first_seen)[:10]}: {_fmt_signed(delta)}"
+
+        if summary.get("count", 0) == 0:
+            body = (
+                "📭 Пока нет сохранённых боёв.\n"
+                "История накопится автоматически после следующих матчей "
+                "(фоновый сбор каждые 10 минут)."
+            )
+        else:
+            body = _stats_block(summary)
+
         return (
             f"{_header(member, profile)}\n\n"
             f"{title}\n"
+            f"{body}\n\n"
             f"🏆 Текущие кубки: {int(trophies_now):,}\n"
             f"🥇 Максимум кубков: {int(highest):,}\n"
             f"🥇 Побед 3на3: {int(trio):,}\n"
             f"🧍 Побед соло: {int(solo):,}\n"
             f"👥 Побед дуо: {int(duo):,}"
-            f"{extra_month}\n\n"
+            f"{delta_line}\n\n"
             f"👇 Выбери другой период:"
         ).replace(",", " ")
 
-    filtered = _filter_battles(battles or [], hours=hours, days=days)
-    summary = _summarize_battles(filtered, tag)
-
-    tracker_map = {
-        "hour": game_stats.get("trophies_hour_diff"),
-        "day": game_stats.get("trophies_day_diff"),
-        "week": game_stats.get("trophies_week_diff"),
-    }
-    tracker_val = tracker_map.get(period)
-    tracker_line = ""
-    if tracker_val is not None:
-        tracker_line = f"\n🗂 Трекер клана: {_fmt_signed(tracker_val)} кубков"
-
-    if summary["count"] == 0:
-        hint = "API отдаёт только последние ~25 боёв. Если давно не играл — список будет пустым."
-        return (
-            f"{_header(member, profile)}\n\n"
-            f"{title}\n"
-            f"📭 За этот период боёв в истории API нет.\n"
-            f"{hint}"
-            f"{tracker_line}\n\n"
-            f"👇 Выбери другой период:"
+    if summary.get("count", 0) == 0:
+        body = (
+            "📭 За этот период сохранённых боёв нет.\n"
+            "Если ты только что сыграл — нажми «🔄 Обновить профиль» через несколько секунд."
         )
-
-    winrate = round(summary["wins"] / summary["count"] * 100) if summary["count"] else 0
-    trop_line = _fmt_signed(summary["trophies"])
-    trop_emoji = "📈" if summary["trophies"] >= 0 else "📉"
+    else:
+        body = _stats_block(summary)
 
     return (
         f"{_header(member, profile)}\n\n"
         f"{title}\n"
-        f"🎮 Боёв: {summary['count']}\n"
-        f"✅ Побед: {summary['wins']}   ❌ Поражений: {summary['losses']}   🤝 Ничьих: {summary['draws']}\n"
-        f"📊 Винрейт: {winrate}%\n"
-        f"{trop_emoji} Кубки по боям: {trop_line}"
-        f"{tracker_line}\n\n"
-        f"ℹ️ Считается по последним боям из Brawl Stars API.\n"
+        f"{body}\n\n"
+        f"ℹ️ Данные накапливаются ботом и больше не ограничены 25 боями API.\n"
         f"👇 Выбери другой период:"
     )
 
 
-def _battles_text(member: dict, profile: dict, battles: list) -> str:
-    tag = member.get("player_tag")
-    lines = [_header(member, profile), "", "🎮 История последних боёв"]
-    if not battles:
-        lines.append("📭 История боёв пуста. Сыграй матч и нажми «Обновить профиль».")
+async def _battles_text(member: dict, profile: dict, tag: str) -> str:
+    rows = await get_recent_battles(tag, limit=20)
+    total = await get_window_summary(tag)
+    total_count = total.get("count", 0)
+
+    lines = [_header(member, profile), "", "🎮 История боёв"]
+    if not rows:
+        lines.append("📭 История пуста. Сыграй матч и нажми «🔄 Обновить профиль».")
         lines.append("")
         lines.append("👇 Выбери период статистики:")
         return "\n".join(lines)
 
-    for item in battles[:12]:
-        emoji = _battle_result_emoji(item)
-        mode = _mode_name(item)
-        mp = _map_name(item)
-        trop = _fmt_signed(_trophy_change(item, tag))
-        ago = _human_ago(_parse_battle_time(item.get("battleTime")))
-        battle = item.get("battle") or {}
-        btype = battle.get("type") or ""
+    if total_count > len(rows):
+        lines.append(f"<i>Показаны последние {len(rows)} из {total_count} сохранённых боёв</i>")
+    else:
+        lines.append(f"<i>Всего сохранено боёв: {total_count}</i>")
+    lines.append("")
+
+    for row in rows:
+        emoji = _result_emoji(row)
+        mode = hd.quote(_mode_name(row.get("mode")))
+        mp = hd.quote(str(row.get("map") or "Случайная карта"))
+        trop = _fmt_signed(row.get("trophies") or 0)
+        ago = _human_ago(row.get("battle_time"))
+        btype = row.get("battle_type") or ""
         type_mark = " 🏅" if "rank" in str(btype).lower() else ""
+        when = str(row.get("battle_time") or "")[:16].replace("-", ".")
         lines.append(
-            f"{emoji} {hd.quote(mode)} — {trop} 🏆 · {hd.quote(str(mp))}{type_mark}\n"
-            f"    └ {ago}"
+            f"{emoji} {mode} — {trop} 🏆 · {mp}{type_mark}\n"
+            f"    └ {when} · {ago}"
         )
 
     lines.append("")
@@ -389,70 +326,56 @@ async def _answer_error(target, kind: str):
         await target.answer(text)
 
 
-@router.message(
-    or_f(
-        Command(commands=["profilebs", "profile_bs"], ignore_case=True, ignore_mention=True),
-        F.text.regexp(r"(?i)^/profile[_]?bs(@\w+)?(\s|$)"),
-    )
-)
-async def cmd_profile_bs(message: Message):
-    wait = await message.answer("⏳ Загружаю твой профиль из Brawl Stars...")
-    member, profile, battles, game_stats, status = await _load_bundle(message.from_user.id)
+async def _render(target, action: str):
+    if isinstance(target, CallbackQuery):
+        user_id = target.from_user.id
+    else:
+        user_id = target.from_user.id
+
+    member, profile, tag, status = await _load_bundle(user_id)
     if status != "ok":
+        await _answer_error(target, status)
+        return None
+
+    if not profile:
+        profile = _fallback_profile(member)
+
+    if action == "home":
+        return _home_text(member, profile)
+    if action == "battles":
+        return await _battles_text(member, profile, tag)
+    if action in ("hour", "day", "week", "all"):
+        return await _period_text(action, member, profile, tag)
+    return _home_text(member, profile)
+
+
+@router.message(Command(commands=["profileBS", "profilebs", "profile_bs"]))
+async def cmd_profile_bs(message: Message):
+    wait = await message.answer("⏳ Загружаю твой профиль и сохраняю свежие бои...")
+    text = await _render(message, "home")
+    if text is None:
         try:
             await wait.delete()
         except Exception:
             pass
-        await _answer_error(message, status)
         return
-
-    if not profile:
-        # Профиль API не ответил — всё равно показываем данные из базы бота
-        profile = {
-            "name": member.get("game_nick"),
-            "tag": member.get("player_tag"),
-            "trophies": member.get("trophies") or 0,
-            "highest_trophies": member.get("trophies") or 0,
-        }
-
     try:
-        await wait.edit_text(_home_text(member, profile), parse_mode="HTML", reply_markup=profile_keyboard())
+        await wait.edit_text(text, parse_mode="HTML", reply_markup=profile_keyboard())
     except Exception as e:
         logger.error(f"/profileBS render error: {e}")
-        await message.answer(_home_text(member, profile), parse_mode="HTML", reply_markup=profile_keyboard())
+        await message.answer(text, parse_mode="HTML", reply_markup=profile_keyboard())
 
 
 @router.callback_query(F.data.startswith("pbs:"))
 async def cb_profile_bs(call: CallbackQuery):
     action = call.data.split(":", 1)[1]
     await call.answer("⏳ Обновляю...")
-
-    member, profile, battles, game_stats, status = await _load_bundle(call.from_user.id)
-    if status != "ok":
-        await _answer_error(call, status)
+    text = await _render(call, action)
+    if text is None:
         return
-
-    if not profile:
-        profile = {
-            "name": member.get("game_nick"),
-            "tag": member.get("player_tag"),
-            "trophies": member.get("trophies") or 0,
-            "highest_trophies": member.get("trophies") or 0,
-        }
-
-    if action == "home":
-        text = _home_text(member, profile)
-    elif action == "battles":
-        text = _battles_text(member, profile, battles or [])
-    elif action in ("hour", "day", "week", "all"):
-        text = _period_text(action, member, profile, battles or [], game_stats or {})
-    else:
-        text = _home_text(member, profile)
-
     try:
         await call.message.edit_text(text, parse_mode="HTML", reply_markup=profile_keyboard())
     except Exception as e:
-        # «message is not modified» и прочие безопасные случаи
         if "message is not modified" in str(e).lower():
             return
         logger.error(f"profileBS edit error: {e}")
