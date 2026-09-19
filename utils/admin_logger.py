@@ -21,6 +21,15 @@ if not logger.handlers:
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
 
+# Отдельный логгер для системных событий бота (используется в handlers/start.py)
+bot_events_logger = logging.getLogger("bot_events")
+bot_events_logger.setLevel(logging.INFO)
+if not bot_events_logger.handlers:
+    bot_handler = logging.FileHandler("bot_events.log", encoding="utf-8")
+    bot_formatter = logging.Formatter("[%(asctime)s] %(levelname)s - %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    bot_handler.setFormatter(bot_formatter)
+    bot_events_logger.addHandler(bot_handler)
+
 
 def _safe_int(value, default=0) -> int:
     """Безопасно превращает значение в int. Никогда не падает на None/пустой строке/мусоре."""
@@ -225,3 +234,69 @@ async def log_user_chat(bot: Bot, user_id: int, username: str, first_name: str, 
         logger.error(f"Ошибка трансляции ЛС в топик: {getattr(e, 'message', e)}")
     except Exception as e:
         logger.error(f"Ошибка логгера чата: {e}")
+
+
+async def log_bot_event(bot: Bot, event_type: str, description: str, user_id: int = None, username: str = None):
+    """
+    Логирует значимые события бота (ошибки, успешные операции) в чат администрации.
+    event_type: "error", "success", "info", "warning"
+    """
+    time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    event_emoji = {"error": "❌", "success": "✅", "info": "ℹ️", "warning": "⚠️"}.get(event_type, "📝")
+    file_log = f"[{event_emoji} {event_type.upper()}] {description}"
+    if user_id or username:
+        file_log += f" (User: {username or user_id})"
+
+    bot_events_logger.log(
+        logging.ERROR if event_type == "error" else logging.INFO,
+        file_log
+    )
+
+    # В чат администрации шлём только ошибки, успехи и предупреждения
+    if event_type not in ["error", "success", "warning"]:
+        return
+
+    chat_id = config.LOGS_CHAT_ID or config.ADMIN_CHAT_ID
+    if not chat_id:
+        return
+
+    setting_key = "topic_id_bot_events"
+    thread_id_str = await get_setting(setting_key)
+    thread_id = _safe_int(thread_id_str, 0)
+
+    if not thread_id:
+        try:
+            topic = await bot.create_forum_topic(
+                chat_id=chat_id,
+                name="⚙️ Системные события и ошибки",
+                icon_color=0xFF6B6B
+            )
+            await set_setting(setting_key, str(topic.message_thread_id))
+            thread_id = topic.message_thread_id
+        except Exception as e:
+            bot_events_logger.error(f"Не удалось создать топик системных событий: {e}")
+            return
+
+    emoji = event_emoji
+    safe_desc = hd.quote(str(description)) if description is not None else ""
+    html_text = f"{emoji} {event_type.upper()} \n"
+    html_text += f"📅 {time_str} \n"
+    html_text += f"📝 {safe_desc}"
+    if user_id or username:
+        safe_username = hd.quote(str(username)) if username else None
+        display_name = f"@{safe_username}" if safe_username else f"ID: {user_id}"
+        html_text += f"\n👤 Пользователь: {display_name}"
+
+    try:
+        await bot.send_message(
+            chat_id=chat_id,
+            message_thread_id=thread_id,
+            text=html_text,
+            parse_mode="HTML"
+        )
+    except TelegramBadRequest as e:
+        if e.message and "thread not found" in e.message.lower():
+            await set_setting(setting_key, "")
+        bot_events_logger.error(f"Ошибка отправки системного лога: {getattr(e, 'message', e)}")
+    except Exception as e:
+        bot_events_logger.error(f"Ошибка логирования события: {e}")
