@@ -181,7 +181,6 @@ async def main():
         next_run_time=datetime.now() + timedelta(minutes=1),
     )
     scheduler.start()
-
     # ─── ДОБАВЛЕНО: ЗАПУСК ФОНОВЫХ ЗАДАЧ ОБНОВЛЕНИЯ КУБКОВ И ТАЙМЕРА ─────────
     asyncio.create_task(auto_update_trophies_task(bot))
     asyncio.create_task(auto_refresh_timer_task(bot))
