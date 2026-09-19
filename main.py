@@ -6,6 +6,7 @@
 import asyncio
 import logging
 import os
+from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
@@ -166,8 +167,14 @@ async def main():
     scheduler.add_job(
         check_and_update_usernames,
         trigger="interval",
-        hours=12,
-        args=[bot]
+        days=1,
+        args=[bot],
+        id="daily_telegram_username_check",
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+        # После деплоя первая проверка пройдёт через минуту, дальше раз в сутки.
+        next_run_time=datetime.now() + timedelta(minutes=1),
     )
     scheduler.start()
 
