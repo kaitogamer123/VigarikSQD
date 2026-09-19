@@ -35,19 +35,22 @@ def setup_logging_and_errors(dp: Dispatcher) -> None:
     async def global_error_handler(event: ErrorEvent):
         exc = event.exception
 
-        # Пытаемся достать пользователя, у которого возникла ошибка
-        user_info = "неизвестно"
+        user_id = None
+        username = None
         try:
             update = event.update
+            u = None
             if update.message and update.message.from_user:
                 u = update.message.from_user
-                user_info = f"@{u.username}" if u.username else f"ID:{u.id}"
             elif update.callback_query and update.callback_query.from_user:
                 u = update.callback_query.from_user
-                user_info = f"@{u.username}" if u.username else f"ID:{u.id}"
+            if u:
+                user_id = u.id
+                username = u.username
         except Exception:
             pass
 
+        user_info = f"@{username}" if username else (f"ID:{user_id}" if user_id else "неизвестно")
         tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
         logger.error(
             f"❌ Необработанная ошибка при обработке апдейта.\n"
@@ -56,5 +59,26 @@ def setup_logging_and_errors(dp: Dispatcher) -> None:
             f"🔻 Traceback:\n{tb}"
         )
 
-        # Возвращаем True — говорим aiogram, что ошибка обработана и бот продолжает работу.
+        # Дублируем краткую ошибку в админ-чат (как раньше через log_bot_event)
+        try:
+            from utils.admin_logger import log_bot_event
+            bot = None
+            try:
+                if event.update.message:
+                    bot = event.update.message.bot
+                elif event.update.callback_query:
+                    bot = event.update.callback_query.bot
+            except Exception:
+                bot = None
+            if bot:
+                await log_bot_event(
+                    bot=bot,
+                    event_type="error",
+                    description=f"Ошибка при обработке сообщения: {type(exc).__name__}: {exc}",
+                    user_id=user_id,
+                    username=username,
+                )
+        except Exception as e:
+            logger.error(f"Не удалось отправить ошибку в админ-чат: {e}")
+
         return True
