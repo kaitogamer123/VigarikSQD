@@ -15,11 +15,16 @@ from aiogram.types import Message
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from utils.username_monitor import check_and_update_usernames
-from config import TOKEN
+from utils.secrets import require_telegram_token
+
+# Токен берётся только из config_local.py или переменной окружения.
+# Значение из отслеживаемого Git-файла config.py намеренно не используется.
+TOKEN = require_telegram_token()
 from database import init_db
 
 # Импортируем правильную утилиту синхронизации и фоновые задачи
 from utils.roster_sync import sync_all_rosters, auto_update_trophies_task, auto_refresh_timer_task
+from utils.composition_departure_monitor import composition_departure_monitor_task
 
 # Хэндлеры базовой системы
 from handlers.change_name import router as change_name_router
@@ -28,6 +33,7 @@ from handlers.registration import router as reg_router
 from handlers.proposals import router as proposals_router
 from push_system import push_system_router
 from handlers.chat_events import router as chat_router
+from handlers.clan_conflicts import router as clan_conflicts_router
 from handlers.clan_list import router as clan_list_router
 from league.handlers import router as league_router
 from game_database import init_game_db
@@ -158,6 +164,7 @@ async def main():
     dp.include_router(reg_router)
     dp.include_router(proposals_router)
     dp.include_router(push_system_router)
+    dp.include_router(clan_conflicts_router)
     dp.include_router(chat_router)
     dp.include_router(clan_list_router)
     dp.include_router(admin_main_router)
@@ -181,11 +188,13 @@ async def main():
         next_run_time=datetime.now() + timedelta(minutes=1),
     )
     scheduler.start()
+
     # ─── ДОБАВЛЕНО: ЗАПУСК ФОНОВЫХ ЗАДАЧ ОБНОВЛЕНИЯ КУБКОВ И ТАЙМЕРА ─────────
     asyncio.create_task(auto_update_trophies_task(bot))
     asyncio.create_task(auto_refresh_timer_task(bot))
     # Фоновый сборщик истории боёв всех игроков (каждые 10 минут)
     asyncio.create_task(auto_collect_stats_task(bot))
+    asyncio.create_task(composition_departure_monitor_task(bot))
 
     await on_startup()
     logging.info("Bot successfully initialized and started polling.")

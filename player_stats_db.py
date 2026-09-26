@@ -165,7 +165,19 @@ async def get_tracked_player(player_tag: str) -> Optional[dict]:
         return dict(row) if row else None
 
 
-async def get_window_summary(player_tag: str, hours: int = None, days: int = None) -> dict:
+async def get_window_summary(
+    player_tag: str,
+    hours: int = None,
+    days: int = None,
+    since: str = None,
+) -> dict:
+    """
+    Возвращает статистику за окно времени.
+
+    Приоритет фильтров: since -> hours -> days. Параметр since нужен для
+    статистики «с момента входа в клан» и принимает SQLite-дату
+    вида YYYY-MM-DD HH:MM:SS.
+    """
     await init_player_stats_db()
     tag = norm_tag(player_tag)
     empty = {"count": 0, "wins": 0, "losses": 0, "draws": 0, "other": 0, "trophies": 0}
@@ -174,7 +186,10 @@ async def get_window_summary(player_tag: str, hours: int = None, days: int = Non
 
     where = "player_tag = ?"
     params: list = [tag]
-    if hours is not None:
+    if since:
+        where += " AND battle_time >= ?"
+        params.append(str(since).replace("T", " ")[:19])
+    elif hours is not None:
         where += " AND battle_time >= datetime('now', ?)"
         params.append(f"-{int(hours)} hours")
     elif days is not None:

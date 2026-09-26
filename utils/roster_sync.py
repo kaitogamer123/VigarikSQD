@@ -12,6 +12,8 @@ import database as db
 from config import CLAN_CHATS, CLAN_TAGS, ROSTER_TOPICS
 from services.api_service import get_player_profile
 from utils.formatting import format_roster
+from league.league_db import cancel_pending_departure, handle_clan_departure
+from utils.clan_account_service import get_all_twinks, get_clan_twinks, update_twink
 
 logger = logging.getLogger(__name__)
 NEXT_UPDATE_TIME = datetime.now() + timedelta(hours=1)
@@ -57,6 +59,21 @@ async def sync_roster_msg(bot: Bot, clan_key: str, force: bool = False) -> bool:
         return False
 
     members = await db.get_clan_members(clan_key)
+    # Твинки хранятся отдельно, но отображаются в общем ростере и ведут на
+    # Telegram-профиль владельца.
+    for twink in await get_clan_twinks(clan_key):
+        members.append({
+            "user_id": twink.get("owner_user_id"),
+            "username": twink.get("username"),
+            "first_name": twink.get("first_name"),
+            "last_name": twink.get("last_name"),
+            "game_nick": twink.get("game_nick"),
+            "player_tag": twink.get("player_tag"),
+            "trophies": twink.get("trophies", 0),
+            "clan": clan_key,
+            "role": "member",
+            "registered": 1,
+        })
     base_text = format_roster(clan_key, members)
 
     now = datetime.now()
@@ -187,13 +204,41 @@ async def auto_update_trophies_task(bot: Bot) -> None:
 
                     api_club_tag = _clean_tag(profile.get("clan_tag"))
                     configured_tag = _clean_tag((CLAN_TAGS or {}).get(clan_key))
+                    network_by_tag = {
+                        _clean_tag(value): key
+                        for key, value in (CLAN_TAGS or {}).items()
+                        if value
+                    }
+                    actual_network_clan = network_by_tag.get(api_club_tag)
 
                     # Удаляем только при двух достоверных непустых тегах. Ошибка API
                     # либо пустой конфиг не должны случайно удалить участника.
                     if api_club_tag and configured_tag and api_club_tag != configured_tag:
+                        # Переход между Squad/Academy/Events не является выходом
+                        # из сети. Не удаляем и не кикаем: окончательное действие
+                        # выберет администрация после входа игрока в новый чат.
+                        if actual_network_clan:
+                            cancel_pending_departure(user_id)
+                            logger.info(
+                                f"Игрок {member.get('game_nick')} перешёл из {clan_key} "
+                                f"в {actual_network_clan}; ожидается решение администрации."
+                            )
+                            continue
                         logger.info(
                             f"Игрок {member.get('game_nick')} ({tag}) вышел из {clan_key}."
                         )
+                        composition_result = handle_clan_departure(
+                            user_id,
+                            reason="brawl_stars",
+                            old_clan=clan_key,
+                            player_tag=tag,
+                        )
+                        if composition_result.get("action") == "leadership_pending":
+                            logger.info(
+                                f"Лидерство {composition_result['league_name']} сохранено до "
+                                f"{composition_result.get('check_after')}"
+                            )
+                            continue
                         await db.remove_member(user_id)
                         chat_info = (CLAN_CHATS or {}).get(clan_key) or {}
                         chat_id = chat_info.get("chat_id") if isinstance(chat_info, dict) else None
@@ -204,6 +249,9 @@ async def auto_update_trophies_task(bot: Bot) -> None:
                             except Exception as e:
                                 logger.error(f"Не удалось удалить ID {user_id} из Telegram-чата: {e}")
                         continue
+
+                    # Игрок снова подтверждён в своём клубе сети.
+                    cancel_pending_departure(user_id)
 
                     await db.upsert_member(
                         user_id=user_id,
@@ -221,6 +269,20 @@ async def auto_update_trophies_task(bot: Bot) -> None:
                 except Exception as e:
                     logger.error(f"Ошибка обновления профиля {tag}: {e}")
 
+                await asyncio.sleep(0.5)
+
+            # Обновляем игровые ники и кубки твинков из отдельного хранилища.
+            for twink in await get_all_twinks():
+                try:
+                    profile = await get_player_profile(twink.get("player_tag"))
+                    if profile:
+                        await update_twink(
+                            twink.get("player_tag"),
+                            profile.get("name") or twink.get("game_nick") or "Игрок",
+                            _safe_int(profile.get("trophies"), 0),
+                        )
+                except Exception as e:
+                    logger.error(f"Ошибка обновления твинка {twink.get('player_tag')}: {e}")
                 await asyncio.sleep(0.5)
 
             await sync_all_rosters(bot)
