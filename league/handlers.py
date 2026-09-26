@@ -11,12 +11,14 @@ from aiogram.types import (
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.utils.markdown import html_decoration as hd
 
+from database import get_member
 from league.league_db import (
     DEPUTY_PERMISSIONS, dissolve_league, get_connection as get_db,
     get_league_members, get_user_league, has_management_permission,
     init_league_db, leave_league, remove_deputy, set_deputy,
     toggle_deputy_permission, transfer_leadership,
 )
+from utils.keyboards import main_menu
 
 init_league_db()
 router = Router()
@@ -50,6 +52,7 @@ def _root_keyboard(composition, user_id: int):
             ["📝 Подать заявку в состав"],
             ["📩 Мои заявки", "📥 Приглашения в состав"],
             ["➕ Создать состав"],
+            ["◀️ Назад в главное меню"],
         ])
     is_leader = int(composition["leader_id"]) == int(user_id)
     is_deputy = bool(composition["is_deputy"])
@@ -57,34 +60,29 @@ def _root_keyboard(composition, user_id: int):
         rows = [["🌍 Все составы"], ["⚙️ Настройка состава"]]
         if is_leader or composition["can_review_apps"]:
             rows.append(["📋 Заявки в состав"])
+        rows.append(["◀️ Назад в главное меню"])
         return _reply(rows)
     return _reply([
         ["🌍 Все составы"],
         ["👥 Участники состава", "🚪 Выйти из состава"],
+        ["◀️ Назад в главное меню"],
     ])
 
 
 def _settings_keyboard(composition, user_id: int):
     is_leader = int(composition["leader_id"]) == int(user_id)
-    rows = [["👥 Участники состава"]]
-    if is_leader:
-        rows.extend([
-            ["💥 Распустить состав", "🚪 Выйти из состава"],
-            ["👑 Передать лидерство"],
-            ["🚪 Выгнать участника"],
-        ])
-    else:
-        rows.append(["🚪 Выйти из состава"])
-        if composition["can_kick"]:
-            rows.append(["🚪 Выгнать участника"])
-    if is_leader or composition["can_invite"]:
-        rows.append(["➕ Пригласить игрока"])
-    if is_leader or composition["can_toggle_open"]:
-        rows.append(["🔒 Закрыть набор / Открыть набор"])
-    if is_leader:
-        rows.append(["🛡 Управление заместителями"])
-    rows.append(["◀️ Назад в составы"])
-    return _reply(rows)
+    rows = [
+        ["👥 Участники состава"] + (
+            ["🔒 Закрыть набор / Открыть набор"]
+            if is_leader or composition["can_toggle_open"] else []
+        ),
+        ["👑 Передать лидерство", "🛡 Управление заместителями"] if is_leader else [],
+        (["🚪 Выгнать участника"] if is_leader or composition["can_kick"] else [])
+        + (["➕ Пригласить игрока"] if is_leader or composition["can_invite"] else []),
+        ["🚪 Выйти из состава"] + (["💥 Распустить состав"] if is_leader else []),
+        ["◀️ Назад в составы"],
+    ]
+    return _reply([row for row in rows if row])
 
 
 async def show_root(message: Message, state: FSMContext, user_id: int = None):
@@ -118,6 +116,13 @@ async def open_compositions(message: Message, state: FSMContext):
 @router.message(F.text == "◀️ Назад в составы")
 async def back_root_text(message: Message, state: FSMContext):
     await show_root(message, state)
+
+
+@router.message(F.text.in_({"◀️ Назад в главное меню", "Назад в главное меню"}))
+async def back_to_main_menu(message: Message, state: FSMContext):
+    await state.clear()
+    member = await get_member(message.from_user.id)
+    await message.answer("Главное меню:", reply_markup=main_menu(member))
 
 
 @router.callback_query(F.data.in_({"league:back_root", "league:back_invites"}))
