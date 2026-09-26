@@ -1,10 +1,11 @@
 """
 Топ пуша клана: команда /ClanTopPush.
-Шаги: выбор клана (3 кнопки) -> выбор периода (1 час / 3 часа / 24 часа)
+Шаги: выбор клана -> выбор периода (1 час / 3 часа / 24 часа / неделя / месяц)
 -> список участников, которые АПНУЛИ трофеи за выбранный период.
 Те, кто апнул 0, в список не выводятся.
 Данные — из накопительной базы player_stats.db.
 """
+import asyncio
 import logging
 import re
 
@@ -21,13 +22,10 @@ from aiogram.utils.markdown import html_decoration as hd
 
 from config import CLAN_CHATS, CLAN_DISPLAY, CLAN_HEADER_EMOJI
 from database import get_clan_members
-from player_stats_db import get_players_window_stats, norm_tag
+from player_stats_db import get_window_summary
 
 logger = logging.getLogger(__name__)
 router = Router()
-
-
-
 
 NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 
@@ -35,6 +33,8 @@ PERIODS = {
     "1": ("⏱ За последний час", 1),
     "3": ("🕒 За последние 3 часа", 3),
     "24": ("📅 За последние 24 часа", 24),
+    "168": ("📆 За последнюю неделю", 24 * 7),
+    "720": ("🗓 За последние 30 дней", 24 * 30),
 }
 
 
@@ -54,6 +54,10 @@ def _period_keyboard(clan_key: str) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="🕒 3 часа", callback_data=f"ctp:period:{clan_key}:3"),
         ],
         [InlineKeyboardButton(text="📅 24 часа", callback_data=f"ctp:period:{clan_key}:24")],
+        [
+            InlineKeyboardButton(text="📆 Неделя", callback_data=f"ctp:period:{clan_key}:168"),
+            InlineKeyboardButton(text="🗓 Месяц", callback_data=f"ctp:period:{clan_key}:720"),
+        ],
         [InlineKeyboardButton(text="◀️ Другой клан", callback_data="ctp:home")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -64,7 +68,11 @@ def _result_keyboard(clan_key: str) -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton(text="⏱ 1 час", callback_data=f"ctp:period:{clan_key}:1"),
             InlineKeyboardButton(text="🕒 3 часа", callback_data=f"ctp:period:{clan_key}:3"),
-            InlineKeyboardButton(text="📅 24 часа", callback_data=f"ctp:period:{clan_key}:24"),
+        ],
+        [InlineKeyboardButton(text="📅 24 часа", callback_data=f"ctp:period:{clan_key}:24")],
+        [
+            InlineKeyboardButton(text="📆 Неделя", callback_data=f"ctp:period:{clan_key}:168"),
+            InlineKeyboardButton(text="🗓 Месяц", callback_data=f"ctp:period:{clan_key}:720"),
         ],
         [InlineKeyboardButton(text="◀️ Другой клан", callback_data="ctp:home")],
     ]
@@ -91,13 +99,21 @@ def _is_top_push_command(message: Message) -> bool:
 
 async def build_top_push(clan_key: str, hours: int) -> str:
     members = await get_clan_members(clan_key)
-    tags = [m.get("player_tag") for m in members if m.get("player_tag")]
-    stats = await get_players_window_stats(tags, hours=hours)
+    members_with_tags = [m for m in members if m.get("player_tag")]
+
+    # Используем существующую функцию базы для одного игрока. Это совместимо
+    # и со старой player_stats_db.py, где массовой функции ещё не было.
+    summaries = await asyncio.gather(
+        *(get_window_summary(m.get("player_tag"), hours=hours) for m in members_with_tags),
+        return_exceptions=True,
+    )
 
     rows = []
-    for m in members:
-        tag = norm_tag(m.get("player_tag"))
-        s = stats.get(tag) or {}
+    for m, summary in zip(members_with_tags, summaries):
+        if isinstance(summary, Exception):
+            logger.error(f"Не удалось получить статистику {m.get('player_tag')}: {summary}")
+            continue
+        s = summary or {}
         trophies = int(s.get("trophies", 0))
         games = int(s.get("count", 0))
         # В топ идут только те, кто реально АПНУЛ трофеи (строго больше нуля).
@@ -114,7 +130,9 @@ async def build_top_push(clan_key: str, hours: int) -> str:
     title = hd.quote(str(_clan_title(clan_key)))
     period_title = {1: "⏱ Топ пуша за последний час",
                     3: "🕒 Топ пуша за последние 3 часа",
-                    24: "📅 Топ пуша за последние 24 часа"}.get(hours, f"Топ пуша за {hours} ч")
+                    24: "📅 Топ пуша за последние 24 часа",
+                    168: "📆 Топ пуша за последнюю неделю",
+                    720: "🗓 Топ пуша за последние 30 дней"}.get(hours, f"Топ пуша за {hours} ч")
 
     lines = [
         f"{emoji} <b>{title}</b> {emoji}",

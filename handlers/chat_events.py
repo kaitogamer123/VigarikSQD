@@ -8,17 +8,17 @@ from aiogram import Router, F, Bot
 from aiogram.types import ChatMemberUpdated, Message, User
 from aiogram.utils.markdown import html_decoration as hd
 
-from config import CLAN_CHATS, CLAN_DISPLAY
+from config import CLAN_CHATS, CLAN_DISPLAY, CLAN_TAGS
 from database import get_member, upsert_member, remove_member, add_push_pending
 from utils.roster_sync import sync_roster_msg
+from league.league_db import cancel_pending_departure, handle_clan_departure
+from handlers.clan_conflicts import send_clan_conflict_prompt
+from services.api_service import get_player_profile
 
 logger = logging.getLogger(__name__)
 router = Router()
 
 
-
-
-            
 def detect_clan_by_chat(chat_id: int):
     for clan, data in CLAN_CHATS.items():
         if data["chat_id"] == chat_id:
@@ -53,7 +53,39 @@ async def on_chat_member_update(event: ChatMemberUpdated, bot: Bot):
 
     # ─── ВХОД В КЛАН (TELEGRAM) ─────────────────────────────
     if new_status in ("member", "administrator") and old_status in ("left", "kicked", "left_chat_member"):
+        # Возвращение в любой чат сети отменяет ожидающую передачу лидерства.
+        cancel_pending_departure(user_id)
         member = await get_member(user_id)
+        if (
+            member
+            and member.get("player_tag")
+            and member.get("game_nick")
+            and member.get("clan")
+            and member.get("clan") != clan
+        ):
+            # Не перезаписываем клан автоматически. Администрация решит,
+            # является ли это переводом, твинком или административным доступом.
+            await upsert_member(
+                user_id=user_id,
+                username=user.username,
+                first_name=user.first_name,
+                last_name=user.last_name,
+            )
+            await send_clan_conflict_prompt(bot, user, member, clan)
+            try:
+                await bot.send_message(
+                    user_id,
+                    f"ℹ️ Ты вошёл в чат {CLAN_DISPLAY.get(clan, clan)}, но твой профиль "
+                    f"уже привязан к {CLAN_DISPLAY.get(member.get('clan'), member.get('clan'))}. "
+                    "Администрация получила запрос и выберет нужное действие.",
+                )
+            except Exception:
+                pass
+            logger.info(
+                f"Создан конфликт кланов для ID {user_id}: {member.get('clan')} -> {clan}"
+            )
+            return
+
         if not member:
             await upsert_member(
                 user_id=user_id,
@@ -103,13 +135,63 @@ async def on_chat_member_update(event: ChatMemberUpdated, bot: Bot):
     # ─── ВЫХОД ИЗ КЛАНА (TELEGRAM) ─────────────────────────
     elif new_status in ("left", "kicked"):
         member = await get_member(user_id)
-        if member:
-            # Мягко убираем основной аккаунт из списков клана в боте
-            await upsert_member(
-                user_id=user_id,
-                clan=None,
-                registered=0
+        # Если игровой аккаунт уже переведён в другой клан нашей сети, это не
+        # выход из сети. Сохраняем регистрацию и состав до входа в новый чат,
+        # где администрация получит четыре варианта решения.
+        moved_to_network_clan = None
+        if member and member.get("player_tag"):
+            try:
+                profile = await get_player_profile(member.get("player_tag"))
+                current_club = str((profile or {}).get("clan_tag") or "").upper().replace("#", "")
+                for key, configured_tag in (CLAN_TAGS or {}).items():
+                    if current_club and current_club == str(configured_tag or "").upper().replace("#", ""):
+                        if key != clan:
+                            moved_to_network_clan = key
+                        break
+            except Exception as e:
+                logger.debug(f"Не удалось проверить перевод ID {user_id} через Brawl Stars: {e}")
+
+        if moved_to_network_clan:
+            cancel_pending_departure(user_id)
+            logger.info(
+                f"ID {user_id} переводится {clan} -> {moved_to_network_clan}; "
+                "регистрация и состав сохранены до решения администрации"
             )
+            try:
+                await sync_roster_msg(bot, clan)
+            except Exception:
+                pass
+            return
+
+        # Выход из клана автоматически исключает игрока из состава. Если это
+        # лидер, передача откладывается на 24 часа и подтверждается по Telegram
+        # и Brawl Stars. Обычные участники удаляются сразу.
+        composition_result = handle_clan_departure(
+            user_id,
+            reason="telegram",
+            old_clan=clan,
+            player_tag=member.get("player_tag") if member else None,
+        )
+        if composition_result.get("action") == "leadership_pending":
+            try:
+                await bot.send_message(
+                    user_id,
+                    f"⏳ Ты вышел из чата клана. Лидерство составом "
+                    f"{composition_result['league_name']} сохранено за тобой на 24 часа.\n"
+                    "Если ты появишься в любом чате или клубе сети, ожидание отменится автоматически.",
+                )
+            except Exception:
+                pass
+            logger.info(
+                f"Передача лидерства {composition_result['league_name']} отложена до "
+                f"{composition_result.get('check_after')}"
+            )
+
+        if member:
+            # Для лидера во время 24-часового окна сохраняем регистрацию: это
+            # позволяет распознать переход в другой клан и показать админское решение.
+            if composition_result.get("action") != "leadership_pending":
+                await upsert_member(user_id=user_id, clan=None, registered=0)
 
             # Проверяем, есть ли у этого игрока твинки в нашей базе данных
             import aiosqlite

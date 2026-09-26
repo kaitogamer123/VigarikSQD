@@ -1,18 +1,12 @@
 @echo off
 chcp 65001 > nul
-title Управление базой данных VigarikSQD
+title VigarikSQD DB Manager
 
-echo Подключение к серверу и запуск панели базы данных...
+echo Connecting to server and starting DB panel...
 echo.
 
-ssh -t root@185.251.38.246 "cd ~/VigarikSQD && if [ -x venv/bin/python ]; then venv/bin/python db_manager_launcher.py; else python3 db_manager_launcher.py; fi"
+ssh -t root@185.251.38.246 "cd /root/VigarikSQD && ./venv/bin/python db_manager.py"
 
-if errorlevel 1 (
-    echo.
-    echo Панель завершилась с ошибкой. Проверь текст выше.
-) else (
-    echo.
-    echo Панель базы данных закрыта.
-)
-
+echo.
+echo Panel closed.
 pause
