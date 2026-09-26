@@ -143,6 +143,43 @@ async def get_all_twinks() -> list[dict]:
             return [dict(row) for row in await cursor.fetchall()]
 
 
+async def get_twink_by_tag(player_tag: str):
+    await init_clan_account_tables()
+
+    def _norm(value: str) -> str:
+        return str(value or "").strip().upper().replace("#", "")
+
+    wanted = _norm(player_tag)
+    if not wanted:
+        return None
+    async with aiosqlite.connect(DB_PATH, timeout=20.0) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM member_twinks") as cursor:
+            for row in await cursor.fetchall():
+                item = dict(row)
+                if _norm(item.get("player_tag")) == wanted:
+                    return item
+    return None
+
+
+async def delete_twink(player_tag: str) -> bool:
+    await init_clan_account_tables()
+
+    def _norm(value: str) -> str:
+        return str(value or "").strip().upper().replace("#", "")
+
+    wanted = _norm(player_tag)
+    if not wanted:
+        return False
+    async with aiosqlite.connect(DB_PATH, timeout=20.0) as db:
+        cursor = await db.execute(
+            "DELETE FROM member_twinks WHERE REPLACE(UPPER(player_tag), '#', '') = ?",
+            (wanted,),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+
+
 async def update_twink(player_tag: str, game_nick: str, trophies: int, clan: str = None) -> None:
     await init_clan_account_tables()
     async with aiosqlite.connect(DB_PATH, timeout=20.0) as db:
