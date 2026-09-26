@@ -17,7 +17,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from utils.username_monitor import check_and_update_usernames
 from utils.secrets import require_telegram_token
 
-# Токен берётся только из config_local.py или переменной окружения.
+# Токен берётся только из server_secrets.env или переменной окружения.
 # Значение из отслеживаемого Git-файла config.py намеренно не используется.
 TOKEN = require_telegram_token()
 from database import init_db
@@ -157,21 +157,21 @@ async def main():
         )
 
     # ─── РЕГИСТРАЦИЯ ВСЕХ РОУТЕРОВ В ДИСПЕТЧЕРЕ ────────────────────────────────
-    # Узкие команды-статистики подключаем первыми, чтобы групповой catch-all
-    # и FSM-хэндлеры не перехватывали их до обработки.
+    # Админские кнопки и ввод твинка должны обрабатываться до группового
+    # сборщика участников и общих FSM-обработчиков текстовых сообщений.
     dp.include_router(clan_stats_router)
     dp.include_router(start_router)
+    dp.include_router(admin_main_router)
     dp.include_router(reg_router)
+    dp.include_router(league_router)
     dp.include_router(proposals_router)
     dp.include_router(push_system_router)
     dp.include_router(clan_conflicts_router)
-    dp.include_router(chat_router)
-    dp.include_router(clan_list_router)
-    dp.include_router(admin_main_router)
     dp.include_router(change_name_router)
-    dp.include_router(league_router)
     dp.include_router(trophies_router)
     dp.include_router(inactive_router)
+    dp.include_router(clan_list_router)
+    dp.include_router(chat_router)
 
     # ─── НАСТРОЙКА ПЛАНИРОВЩИКА ЗАДАЧ (APScheduler) ───────────────────────────
     scheduler = AsyncIOScheduler()
@@ -196,8 +196,16 @@ async def main():
     asyncio.create_task(auto_collect_stats_task(bot))
     asyncio.create_task(composition_departure_monitor_task(bot))
 
-    await on_startup()
-    logging.info("Bot successfully initialized and started polling.")
+    # getUpdates is incompatible with an active Telegram webhook. Keep any
+    # queued updates when switching this bot back to polling.
+    webhook = await bot.get_webhook_info()
+    if webhook.url:
+        logging.warning("Active webhook detected; removing it before polling.")
+        await bot.delete_webhook(drop_pending_updates=False)
+        logging.info("Webhook removed; pending updates preserved.")
+
+    # start_polling invokes @dp.startup automatically; don't initialize twice.
+    logging.info("Starting bot polling.")
     await dp.start_polling(bot)
 
 

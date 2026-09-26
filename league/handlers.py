@@ -2,6 +2,7 @@
 import sqlite3
 
 from aiogram import Bot, F, Router
+from aiogram.filters import StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
@@ -36,6 +37,14 @@ class LeagueStates(StatesGroup):
     waiting_for_tag = State()
     waiting_invite_target = State()
     waiting_apply_text = State()
+
+
+def _input_keyboard():
+    return _reply([["◀️ Назад", "❌ Отмена"]])
+
+
+def _back_row(destination: str, label: str = "◀️ Назад"):
+    return [InlineKeyboardButton(text=label, callback_data=destination)]
 
 
 def _reply(rows):
@@ -125,7 +134,35 @@ async def back_to_main_menu(message: Message, state: FSMContext):
     await message.answer("Главное меню:", reply_markup=main_menu(member))
 
 
-@router.callback_query(F.data.in_({"league:back_root", "league:back_invites"}))
+@router.message(
+    StateFilter(
+        LeagueStates.waiting_for_name,
+        LeagueStates.waiting_for_tag,
+        LeagueStates.waiting_invite_target,
+        LeagueStates.waiting_apply_text,
+    ),
+    F.text.in_({"◀️ Назад", "❌ Отмена"}),
+)
+async def back_from_composition_input(message: Message, state: FSMContext):
+    current = await state.get_state()
+    cancelled = message.text == "❌ Отмена"
+    if not cancelled and current == LeagueStates.waiting_for_tag.state:
+        await state.set_state(LeagueStates.waiting_for_name)
+        await message.answer("Введи название состава:", reply_markup=_input_keyboard())
+        return
+
+    await state.clear()
+    if not cancelled and current == LeagueStates.waiting_apply_text.state:
+        await show_root(message, state)
+        await _send_all(message)
+        return
+    if current == LeagueStates.waiting_invite_target.state and get_user_league(message.from_user.id):
+        await open_settings(message)
+        return
+    await show_root(message, state)
+
+
+@router.callback_query(F.data == "league:back_root")
 async def back_root_callback(call: CallbackQuery, state: FSMContext):
     """Совместимость с кнопками в сообщениях, отправленных старой версией."""
     await state.clear()
@@ -135,6 +172,21 @@ async def back_root_callback(call: CallbackQuery, state: FSMContext):
         pass
     await show_root(call.message, state, user_id=call.from_user.id)
     await call.answer()
+
+
+@router.callback_query(F.data == "comp:back:settings")
+async def back_to_settings_callback(call: CallbackQuery, state: FSMContext):
+    composition = get_user_league(call.from_user.id)
+    if not composition or not (composition["is_deputy"] or int(composition["leader_id"]) == call.from_user.id):
+        await call.answer("Настройки больше недоступны", show_alert=True)
+        return
+    await state.clear()
+    await call.answer()
+    await call.message.edit_text("◀️ Возврат в настройки состава.", reply_markup=None)
+    await call.message.answer(
+        "⚙️ Настройка состава. Выбери действие:",
+        reply_markup=_settings_keyboard(composition, call.from_user.id),
+    )
 
 
 @router.message(F.text == "⚙️ Настройка состава")
@@ -189,7 +241,7 @@ async def create_start(message: Message, state: FSMContext):
         await message.answer("❌ Ты уже состоишь в составе.")
         return
     await state.set_state(LeagueStates.waiting_for_name)
-    await message.answer("Напиши полное название нового состава:")
+    await message.answer("Напиши полное название нового состава:", reply_markup=_input_keyboard())
 
 
 @router.message(LeagueStates.waiting_for_name)
@@ -200,7 +252,7 @@ async def create_name(message: Message, state: FSMContext):
         return
     await state.update_data(composition_name=name)
     await state.set_state(LeagueStates.waiting_for_tag)
-    await message.answer("Напиши сокращённый тег состава (до 5 символов):")
+    await message.answer("Напиши сокращённый тег состава (до 5 символов):", reply_markup=_input_keyboard())
 
 
 @router.message(LeagueStates.waiting_for_tag)
@@ -251,6 +303,7 @@ async def _send_all(message: Message, edit: bool = False):
     for row in rows:
         builder.button(text=f"🏆 {row['name']} [{row['tag']}] ({row['count_members']}/4)",
                        callback_data=f"league:info:{row['id']}")
+    builder.button(text="◀️ В составы", callback_data="league:back_root")
     builder.adjust(1)
     text = "🌍 <b>Все составы</b>" if rows else "📭 Составов пока нет."
     if edit:
@@ -265,7 +318,8 @@ async def all_compositions(message: Message):
 
 
 @router.callback_query(F.data == "league:all_list")
-async def all_compositions_callback(call: CallbackQuery):
+async def all_compositions_callback(call: CallbackQuery, state: FSMContext):
+    await state.clear()
     await _send_all(call.message, edit=True); await call.answer()
 
 
@@ -299,7 +353,10 @@ async def apply_start(call: CallbackQuery, state: FSMContext):
         await call.answer("Ты уже состоишь в составе", show_alert=True); return
     await state.update_data(target_league_id=int(call.data.rsplit(":", 1)[-1]))
     await state.set_state(LeagueStates.waiting_apply_text)
-    await call.message.answer("Напиши коротко, почему хочешь вступить в этот состав:"); await call.answer()
+    await call.message.answer(
+        "Напиши коротко, почему хочешь вступить в этот состав:",
+        reply_markup=_input_keyboard(),
+    ); await call.answer()
 
 
 @router.message(LeagueStates.waiting_apply_text)
@@ -314,28 +371,47 @@ async def apply_text(message: Message, state: FSMContext):
         conn.execute("INSERT INTO league_applications (league_id, user_id, text_reason) VALUES (?, ?, ?)",
                      (data.get("target_league_id"), message.from_user.id, reason)); conn.commit()
     conn.close(); await state.clear(); await message.answer("✅ Заявка успешно отправлена в состав!")
+    await show_root(message, state)
+
+
+async def _show_my_apps(message: Message, user_id: int, edit: bool = False):
+    conn = get_db(); rows = conn.execute("""
+        SELECT a.id, l.name, l.tag FROM league_applications a
+        JOIN leagues l ON l.id = a.league_id WHERE a.user_id = ? ORDER BY a.sent_at DESC
+    """, (user_id,)).fetchall(); conn.close()
+    buttons = [
+        [InlineKeyboardButton(text=f"❌ Отозвать: {r['name']} [{r['tag']}]",
+                              callback_data=f"league:withdraw_app:{r['id']}")] for r in rows
+    ]
+    buttons.append(_back_row("league:back_root", "◀️ В составы"))
+    text = "📩 Твои заявки:" if rows else "📭 У тебя нет активных заявок."
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    if edit:
+        await message.edit_text(text, reply_markup=kb)
+    else:
+        await message.answer(text, reply_markup=kb)
 
 
 @router.message(F.text == "📩 Мои заявки")
 async def my_apps(message: Message):
-    conn = get_db(); rows = conn.execute("""
-        SELECT a.id, l.name, l.tag FROM league_applications a
-        JOIN leagues l ON l.id = a.league_id WHERE a.user_id = ? ORDER BY a.sent_at DESC
-    """, (message.from_user.id,)).fetchall(); conn.close()
-    if not rows:
-        await message.answer("📭 У тебя нет активных заявок."); return
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"❌ Отозвать: {r['name']} [{r['tag']}]",
-                              callback_data=f"league:withdraw_app:{r['id']}")] for r in rows
-    ])
-    await message.answer("📩 Твои заявки:", reply_markup=kb)
+    await _show_my_apps(message, message.from_user.id)
+
+
+@router.callback_query(F.data == "comp:back:myapps")
+async def my_apps_callback(call: CallbackQuery):
+    await _show_my_apps(call.message, call.from_user.id, edit=True)
+    await call.answer()
 
 
 @router.callback_query(F.data.startswith("league:withdraw_app:"))
 async def withdraw_app(call: CallbackQuery):
     app_id = int(call.data.rsplit(":", 1)[-1]); conn = get_db()
     conn.execute("DELETE FROM league_applications WHERE id = ? AND user_id = ?", (app_id, call.from_user.id))
-    conn.commit(); conn.close(); await call.message.edit_text("✅ Заявка отозвана."); await call.answer()
+    conn.commit(); conn.close()
+    await call.message.edit_text(
+        "✅ Заявка отозвана.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[_back_row("comp:back:myapps", "◀️ К моим заявкам")]),
+    ); await call.answer()
 
 
 # ─── Просмотр участников / набор ─────────────────────────────────────────────
@@ -352,7 +428,13 @@ async def view_members(message: Message):
             "🛡 Заместитель" if member["role"] == "заместитель" else "👤 Участник"
         )
         lines.append(f"{member['slot_index']}. {hd.quote(member['game_nick'] or 'Игрок')} — {role}")
-    await message.answer("\n".join(lines), parse_mode="HTML")
+    is_manager = bool(composition["is_deputy"] or int(composition["leader_id"]) == message.from_user.id)
+    destination = "comp:back:settings" if is_manager else "league:back_root"
+    await message.answer(
+        "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[_back_row(destination)]),
+    )
 
 
 @router.message(F.text == "🔒 Закрыть набор / Открыть набор")
@@ -363,7 +445,7 @@ async def toggle_open(message: Message, state: FSMContext):
     conn = get_db(); conn.execute("UPDATE leagues SET is_open = ? WHERE id = ?", (value, composition["id"]))
     conn.commit(); conn.close()
     await message.answer(f"✅ Набор теперь {'открыт' if value else 'закрыт'}.")
-    await show_root(message, state)
+    await open_settings(message)
 
 
 # ─── Приглашения ──────────────────────────────────────────────────────────────
@@ -372,7 +454,10 @@ async def invite_start(message: Message, state: FSMContext):
     if not has_management_permission(message.from_user.id, "can_invite"):
         await message.answer("❌ Нет права приглашать игроков."); return
     await state.set_state(LeagueStates.waiting_invite_target)
-    await message.answer("Отправь Telegram ID, игровой тег или точный игровой ник участника:")
+    await message.answer(
+        "Отправь Telegram ID, игровой тег или точный игровой ник участника:",
+        reply_markup=_input_keyboard(),
+    )
 
 
 @router.message(LeagueStates.waiting_invite_target)
@@ -405,30 +490,54 @@ async def invite_target(message: Message, state: FSMContext):
         await message.answer("❌ Этому игроку уже отправлено приглашение.")
     finally:
         conn.close(); await state.clear()
+        await open_settings(message)
+
+
+async def _show_invitations(message: Message, user_id: int, edit: bool = False):
+    conn = get_db(); rows = conn.execute("""
+        SELECT i.id, l.name, l.tag FROM league_invites i JOIN leagues l ON l.id = i.league_id
+        WHERE i.invitee_id = ?
+    """, (user_id,)).fetchall(); conn.close()
+    buttons = [
+        [InlineKeyboardButton(text=f"🏆 {r['name']} [{r['tag']}]", callback_data=f"league:invite_view:{r['id']}")]
+        for r in rows
+    ]
+    buttons.append(_back_row("league:back_root", "◀️ В составы"))
+    text = "📥 Приглашения в составы:" if rows else "📭 У тебя нет приглашений в составы."
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    if edit:
+        await message.edit_text(text, reply_markup=kb)
+    else:
+        await message.answer(text, reply_markup=kb)
 
 
 @router.message(F.text.in_({"📥 Приглашения в состав", "📥 Приглашения в лигу"}))
 async def invitations(message: Message):
-    conn = get_db(); rows = conn.execute("""
-        SELECT i.id, l.name, l.tag FROM league_invites i JOIN leagues l ON l.id = i.league_id
-        WHERE i.invitee_id = ?
-    """, (message.from_user.id,)).fetchall(); conn.close()
-    if not rows:
-        await message.answer("📭 У тебя нет приглашений в составы."); return
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"🏆 {r['name']} [{r['tag']}]", callback_data=f"league:invite_view:{r['id']}")]
-        for r in rows
-    ])
-    await message.answer("📥 Приглашения в составы:", reply_markup=kb)
+    await _show_invitations(message, message.from_user.id)
+
+
+@router.callback_query(F.data.in_({"comp:back:invites", "league:back_invites"}))
+async def invitations_callback(call: CallbackQuery):
+    await _show_invitations(call.message, call.from_user.id, edit=True)
+    await call.answer()
 
 
 @router.callback_query(F.data.startswith("league:invite_view:"))
 async def invitation_view(call: CallbackQuery):
     invite_id = int(call.data.rsplit(":", 1)[-1])
+    conn = get_db()
+    invitation = conn.execute(
+        "SELECT id FROM league_invites WHERE id = ? AND invitee_id = ?",
+        (invite_id, call.from_user.id),
+    ).fetchone()
+    conn.close()
+    if not invitation:
+        await call.answer("Приглашение устарело", show_alert=True)
+        return
     kb = InlineKeyboardMarkup(inline_keyboard=[[ 
         InlineKeyboardButton(text="✅ Принять", callback_data=f"league:invite_accept:{invite_id}"),
         InlineKeyboardButton(text="❌ Отклонить", callback_data=f"league:invite_reject:{invite_id}"),
-    ]])
+    ], _back_row("comp:back:invites", "◀️ К приглашениям")])
     await call.message.edit_text("Принять приглашение в состав?", reply_markup=kb); await call.answer()
 
 
@@ -443,26 +552,35 @@ async def invitation_accept(call: CallbackQuery):
         conn.close(); await call.answer("Нет места или приглашение устарело", show_alert=True); return
     conn.execute("DELETE FROM league_invites WHERE invitee_id = ?", (call.from_user.id,))
     conn.execute("DELETE FROM league_applications WHERE user_id = ?", (call.from_user.id,))
-    conn.commit(); conn.close(); await call.message.edit_text("✅ Ты вступил в состав!"); await call.answer()
+    conn.commit(); conn.close()
+    await call.message.edit_text(
+        "✅ Ты вступил в состав!",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[_back_row("league:back_root", "◀️ В составы")]),
+    ); await call.answer()
 
 
 @router.callback_query(F.data.startswith("league:invite_reject:"))
 async def invitation_reject(call: CallbackQuery):
     invite_id = int(call.data.rsplit(":", 1)[-1]); conn = get_db()
     conn.execute("DELETE FROM league_invites WHERE id = ? AND invitee_id = ?", (invite_id, call.from_user.id))
-    conn.commit(); conn.close(); await call.message.edit_text("✅ Приглашение отклонено."); await call.answer()
+    conn.commit(); conn.close()
+    await call.message.edit_text(
+        "✅ Приглашение отклонено.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[_back_row("comp:back:invites", "◀️ К приглашениям")]),
+    ); await call.answer()
 
 
 # ─── Заявки для управления ────────────────────────────────────────────────────
-@router.message(F.text.in_({"📋 Заявки в состав", "📋 Просмотреть заявки"}))
-async def incoming_apps(message: Message):
-    if not has_management_permission(message.from_user.id, "can_review_apps"):
-        await message.answer("❌ Нет права работать с заявками."); return
-    composition = get_user_league(message.from_user.id); conn = get_db()
+async def _show_incoming_apps(message: Message, user_id: int, edit: bool = False):
+    if not has_management_permission(user_id, "can_review_apps"):
+        if edit:
+            await message.edit_text("❌ Нет права работать с заявками.")
+        else:
+            await message.answer("❌ Нет права работать с заявками.")
+        return
+    composition = get_user_league(user_id); conn = get_db()
     rows = conn.execute("SELECT * FROM league_applications WHERE league_id = ? ORDER BY sent_at",
                         (composition["id"],)).fetchall(); conn.close()
-    if not rows:
-        await message.answer("📭 Входящих заявок нет."); return
     main = sqlite3.connect("vigarik.db"); main.row_factory = sqlite3.Row
     buttons = []
     for row in rows:
@@ -470,8 +588,25 @@ async def incoming_apps(message: Message):
         buttons.append([InlineKeyboardButton(
             text=f"📩 {user['game_nick'] if user and user['game_nick'] else row['user_id']}",
             callback_data=f"league:app_detail:{row['id']}")])
-    main.close(); await message.answer("📋 Заявки в состав:",
-                                       reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    main.close()
+    buttons.append(_back_row("comp:back:settings", "◀️ В настройки"))
+    text = "📋 Заявки в состав:" if rows else "📭 Входящих заявок нет."
+    markup = InlineKeyboardMarkup(inline_keyboard=buttons)
+    if edit:
+        await message.edit_text(text, reply_markup=markup)
+    else:
+        await message.answer(text, reply_markup=markup)
+
+
+@router.message(F.text.in_({"📋 Заявки в состав", "📋 Просмотреть заявки"}))
+async def incoming_apps(message: Message):
+    await _show_incoming_apps(message, message.from_user.id)
+
+
+@router.callback_query(F.data == "comp:back:apps")
+async def incoming_apps_callback(call: CallbackQuery):
+    await _show_incoming_apps(call.message, call.from_user.id, edit=True)
+    await call.answer()
 
 
 @router.callback_query(F.data.startswith("league:app_detail:"))
@@ -480,12 +615,13 @@ async def app_detail(call: CallbackQuery):
         await call.answer("Нет права работать с заявками", show_alert=True); return
     app_id = int(call.data.rsplit(":", 1)[-1]); conn = get_db()
     app = conn.execute("SELECT * FROM league_applications WHERE id = ?", (app_id,)).fetchone(); conn.close()
-    if not app:
+    composition = get_user_league(call.from_user.id)
+    if not app or not composition or app["league_id"] != composition["id"]:
         await call.answer("Заявка устарела", show_alert=True); return
     kb = InlineKeyboardMarkup(inline_keyboard=[[ 
         InlineKeyboardButton(text="✅ Принять", callback_data=f"league:accept:{app_id}"),
         InlineKeyboardButton(text="❌ Отклонить", callback_data=f"league:reject:{app_id}"),
-    ]])
+    ], _back_row("comp:back:apps", "◀️ К заявкам")])
     await call.message.edit_text(
         f"📩 Заявка от ID <code>{app['user_id']}</code>:\n\n{hd.quote(app['text_reason'] or 'Без текста')}",
         parse_mode="HTML", reply_markup=kb); await call.answer()
@@ -498,11 +634,15 @@ async def app_accept(call: CallbackQuery):
     app_id = int(call.data.rsplit(":", 1)[-1]); conn = get_db()
     app = conn.execute("SELECT * FROM league_applications WHERE id = ?", (app_id,)).fetchone()
     composition = get_user_league(call.from_user.id)
-    if not app or app["league_id"] != composition["id"] or not _fill_slot(conn, app["league_id"], app["user_id"]):
+    if not app or not composition or app["league_id"] != composition["id"] or not _fill_slot(conn, app["league_id"], app["user_id"]):
         conn.close(); await call.answer("Нет места, игрок уже вступил или заявка устарела", show_alert=True); return
     conn.execute("DELETE FROM league_applications WHERE user_id = ?", (app["user_id"],))
     conn.execute("DELETE FROM league_invites WHERE invitee_id = ?", (app["user_id"],))
-    conn.commit(); conn.close(); await call.message.edit_text("✅ Игрок принят в состав!"); await call.answer()
+    conn.commit(); conn.close()
+    await call.message.edit_text(
+        "✅ Игрок принят в состав!",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[_back_row("comp:back:apps", "◀️ К заявкам")]),
+    ); await call.answer()
 
 
 @router.callback_query(F.data.startswith("league:reject:"))
@@ -510,23 +650,53 @@ async def app_reject(call: CallbackQuery):
     if not has_management_permission(call.from_user.id, "can_review_apps"):
         await call.answer("Нет права", show_alert=True); return
     app_id = int(call.data.rsplit(":", 1)[-1]); conn = get_db()
-    conn.execute("DELETE FROM league_applications WHERE id = ?", (app_id,)); conn.commit(); conn.close()
-    await call.message.edit_text("✅ Заявка отклонена."); await call.answer()
+    composition = get_user_league(call.from_user.id)
+    cursor = conn.execute(
+        "DELETE FROM league_applications WHERE id = ? AND league_id = ?",
+        (app_id, composition["id"]),
+    )
+    deleted = cursor.rowcount > 0
+    conn.commit(); conn.close()
+    if not deleted:
+        await call.answer("Заявка устарела", show_alert=True)
+        return
+    await call.message.edit_text(
+        "✅ Заявка отклонена.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[_back_row("comp:back:apps", "◀️ К заявкам")]),
+    ); await call.answer()
 
 
 # ─── Исключение участника ─────────────────────────────────────────────────────
-@router.message(F.text == "🚪 Выгнать участника")
-async def kick_choose(message: Message):
-    if not has_management_permission(message.from_user.id, "can_kick"):
-        await message.answer("❌ Нет права исключать участников."); return
-    composition = get_user_league(message.from_user.id)
+async def _show_kick_choices(message: Message, user_id: int, edit: bool = False):
+    composition = get_user_league(user_id)
+    if not composition or not has_management_permission(user_id, "can_kick"):
+        if edit:
+            await message.edit_text("❌ Нет права исключать участников.")
+        else:
+            await message.answer("❌ Нет права исключать участников.")
+        return
     buttons = [[InlineKeyboardButton(text=f"🚪 {m['game_nick']}",
                                      callback_data=f"comp:kick:{m['user_id']}")]
                for m in get_league_members(composition["id"], True)
-               if int(m["user_id"]) != int(composition["leader_id"]) and int(m["user_id"]) != message.from_user.id]
-    if not buttons:
-        await message.answer("📭 Некого исключать."); return
-    await message.answer("Кого исключить из состава?", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+               if int(m["user_id"]) not in {int(composition["leader_id"]), user_id}]
+    buttons.append(_back_row("comp:back:settings", "◀️ В настройки"))
+    text = "Кого исключить из состава?" if len(buttons) > 1 else "📭 Некого исключать."
+    markup = InlineKeyboardMarkup(inline_keyboard=buttons)
+    if edit:
+        await message.edit_text(text, reply_markup=markup)
+    else:
+        await message.answer(text, reply_markup=markup)
+
+
+@router.message(F.text == "🚪 Выгнать участника")
+async def kick_choose(message: Message):
+    await _show_kick_choices(message, message.from_user.id)
+
+
+@router.callback_query(F.data == "comp:back:kick")
+async def kick_choose_callback(call: CallbackQuery):
+    await _show_kick_choices(call.message, call.from_user.id, edit=True)
+    await call.answer()
 
 
 @router.callback_query(F.data.startswith("comp:kick:"))
@@ -536,8 +706,7 @@ async def kick_confirm(call: CallbackQuery):
         await call.answer("Нет права", show_alert=True); return
     kb = InlineKeyboardMarkup(inline_keyboard=[[ 
         InlineKeyboardButton(text="✅ Да, исключить", callback_data=f"comp:kickyes:{target}"),
-        InlineKeyboardButton(text="❌ Нет", callback_data="comp:cancel"),
-    ]])
+    ], _back_row("comp:back:kick")])
     await call.message.edit_text("Вы уверены, что хотите исключить участника?", reply_markup=kb); await call.answer()
 
 
@@ -553,8 +722,11 @@ async def kick_yes(call: CallbackQuery, bot: Bot):
     conn.close()
     if not row or not leave_league(target):
         await call.answer("Участник уже вышел", show_alert=True); return
-    await call.message.edit_text(f"✅ {hd.quote(row['game_nick'] or str(target))} исключён из состава.",
-                                 parse_mode="HTML"); await call.answer()
+    await call.message.edit_text(
+        f"✅ {hd.quote(row['game_nick'] or str(target))} исключён из состава.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[_back_row("comp:back:settings", "◀️ В настройки")]),
+    ); await call.answer()
     try: await bot.send_message(target, f"🚪 Ты исключён из состава {composition['name']}.")
     except Exception: pass
 
@@ -567,8 +739,7 @@ async def dissolve_confirm(message: Message):
         await message.answer("❌ Только лидер может распустить состав."); return
     kb = InlineKeyboardMarkup(inline_keyboard=[[ 
         InlineKeyboardButton(text="✅ Да, распустить", callback_data="comp:dissolve:yes"),
-        InlineKeyboardButton(text="❌ Нет", callback_data="comp:cancel"),
-    ]])
+    ], _back_row("comp:back:settings")])
     await message.answer("⚠️ Вы уверены, что хотите распустить состав? Это действие необратимо.", reply_markup=kb)
 
 
@@ -578,25 +749,51 @@ async def dissolve_yes(call: CallbackQuery):
     if not composition or int(composition["leader_id"]) != call.from_user.id:
         await call.answer("Только лидер может распустить состав", show_alert=True); return
     name = composition["name"]; dissolve_league(composition["id"])
-    await call.message.edit_text(f"✅ Состав {hd.quote(name)} успешно распущен.", parse_mode="HTML"); await call.answer()
+    await call.message.edit_text(
+        f"✅ Состав {hd.quote(name)} успешно распущен.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[_back_row("league:back_root", "◀️ В составы")]),
+    ); await call.answer()
 
 
 def _member_choice(composition, prefix: str):
+    back = "comp:back:settings"
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"👤 {m['game_nick']}", callback_data=f"{prefix}:{m['user_id']}")]
         for m in get_league_members(composition["id"], True)
         if int(m["user_id"]) != int(composition["leader_id"])
-    ] + [[InlineKeyboardButton(text="❌ Отмена", callback_data="comp:cancel")]])
+    ] + [_back_row(back, "◀️ В настройки")])
+
+
+async def _show_transfer_choices(message: Message, user_id: int, edit: bool = False):
+    composition = get_user_league(user_id)
+    if not composition or int(composition["leader_id"]) != user_id:
+        if edit:
+            await message.edit_text("❌ Только лидер может передать лидерство.")
+        else:
+            await message.answer("❌ Только лидер может передать лидерство.")
+        return
+    if len(get_league_members(composition["id"], True)) <= 1:
+        text = "❌ В составе нет участника, которому можно передать лидерство."
+        markup = InlineKeyboardMarkup(inline_keyboard=[_back_row("comp:back:settings", "◀️ В настройки")])
+    else:
+        text = "Кому передать лидерство?"
+        markup = _member_choice(composition, "comp:transfer")
+    if edit:
+        await message.edit_text(text, reply_markup=markup)
+    else:
+        await message.answer(text, reply_markup=markup)
 
 
 @router.message(F.text.in_({"👑 Передать лидерство", "👑 Передать лидерку"}))
 async def transfer_choose(message: Message):
-    composition = get_user_league(message.from_user.id)
-    if not composition or int(composition["leader_id"]) != message.from_user.id:
-        await message.answer("❌ Только лидер может передать лидерство."); return
-    if len(get_league_members(composition["id"], True)) <= 1:
-        await message.answer("❌ В составе нет участника, которому можно передать лидерство."); return
-    await message.answer("Кому передать лидерство?", reply_markup=_member_choice(composition, "comp:transfer"))
+    await _show_transfer_choices(message, message.from_user.id)
+
+
+@router.callback_query(F.data == "comp:back:transfer")
+async def transfer_choose_callback(call: CallbackQuery):
+    await _show_transfer_choices(call.message, call.from_user.id, edit=True)
+    await call.answer()
 
 
 @router.callback_query(F.data.startswith("comp:transfer:"))
@@ -604,8 +801,7 @@ async def transfer_confirm(call: CallbackQuery):
     target = int(call.data.rsplit(":", 1)[-1])
     kb = InlineKeyboardMarkup(inline_keyboard=[[ 
         InlineKeyboardButton(text="✅ Да", callback_data=f"comp:transferyes:{target}"),
-        InlineKeyboardButton(text="❌ Нет", callback_data="comp:cancel"),
-    ]])
+    ], _back_row("comp:back:transfer")])
     await call.message.edit_text("Подтвердить передачу лидерства этому участнику?", reply_markup=kb); await call.answer()
 
 
@@ -616,40 +812,62 @@ async def transfer_yes(call: CallbackQuery, bot: Bot):
         await call.answer("Нет права", show_alert=True); return
     if not transfer_leadership(composition["id"], call.from_user.id, target):
         await call.answer("Передача не выполнена", show_alert=True); return
-    await call.message.edit_text("✅ Лидерство успешно передано."); await call.answer()
+    await call.message.edit_text(
+        "✅ Лидерство успешно передано.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[_back_row("league:back_root", "◀️ В составы")]),
+    ); await call.answer()
     try: await bot.send_message(target, f"👑 Тебе передано лидерство составом {composition['name']}.")
     except Exception: pass
 
 
-@router.message(F.text.in_({"🚪 Выйти из состава", "🚪 Выйти из лиги"}))
-async def leave_start(message: Message):
-    composition = get_user_league(message.from_user.id)
+async def _show_leave_prompt(message: Message, user_id: int, edit: bool = False):
+    composition = get_user_league(user_id)
     if not composition:
-        await message.answer("❌ Ты не состоишь в составе."); return
-    is_leader = int(composition["leader_id"]) == message.from_user.id
+        if edit:
+            await message.edit_text("❌ Ты не состоишь в составе.")
+        else:
+            await message.answer("❌ Ты не состоишь в составе.")
+        return
+    is_leader = int(composition["leader_id"]) == user_id
     occupied = get_league_members(composition["id"], True)
     if not is_leader:
         kb = InlineKeyboardMarkup(inline_keyboard=[[ 
             InlineKeyboardButton(text="✅ Да, выйти", callback_data="comp:leave:yes"),
-            InlineKeyboardButton(text="❌ Нет", callback_data="comp:cancel"),
-        ]])
-        await message.answer("Вы уверены, что хотите выйти из состава?", reply_markup=kb); return
-    if len(occupied) == 1:
+        ], _back_row("league:back_root", "◀️ В составы")])
+        text = "Вы уверены, что хотите выйти из состава?"
+    elif len(occupied) == 1:
         kb = InlineKeyboardMarkup(inline_keyboard=[[ 
             InlineKeyboardButton(text="✅ Да, распустить", callback_data="comp:dissolve:yes"),
-            InlineKeyboardButton(text="❌ Нет", callback_data="comp:cancel"),
-        ]])
-        await message.answer("Ты единственный участник. Выйти можно только распустив состав. Продолжить?",
-                             reply_markup=kb); return
-    await message.answer("Кому передать состав перед выходом?",
-                         reply_markup=_member_choice(composition, "comp:leaveto"))
+        ], _back_row("comp:back:settings", "◀️ В настройки")])
+        text = "Ты единственный участник. Выйти можно только распустив состав. Продолжить?"
+    else:
+        kb = _member_choice(composition, "comp:leaveto")
+        text = "Кому передать состав перед выходом?"
+    if edit:
+        await message.edit_text(text, reply_markup=kb)
+    else:
+        await message.answer(text, reply_markup=kb)
+
+
+@router.message(F.text.in_({"🚪 Выйти из состава", "🚪 Выйти из лиги"}))
+async def leave_start(message: Message):
+    await _show_leave_prompt(message, message.from_user.id)
+
+
+@router.callback_query(F.data == "comp:back:leave")
+async def leave_start_callback(call: CallbackQuery):
+    await _show_leave_prompt(call.message, call.from_user.id, edit=True)
+    await call.answer()
 
 
 @router.callback_query(F.data == "comp:leave:yes")
 async def leave_yes(call: CallbackQuery):
     if not leave_league(call.from_user.id):
         await call.answer("Не удалось выйти", show_alert=True); return
-    await call.message.edit_text("✅ Ты успешно вышел из состава."); await call.answer()
+    await call.message.edit_text(
+        "✅ Ты успешно вышел из состава.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[_back_row("league:back_root", "◀️ В составы")]),
+    ); await call.answer()
 
 
 @router.callback_query(F.data.startswith("comp:leaveto:"))
@@ -657,8 +875,7 @@ async def leader_leave_confirm(call: CallbackQuery):
     target = int(call.data.rsplit(":", 1)[-1])
     kb = InlineKeyboardMarkup(inline_keyboard=[[ 
         InlineKeyboardButton(text="✅ Передать и выйти", callback_data=f"comp:leaveleadyes:{target}"),
-        InlineKeyboardButton(text="❌ Нет", callback_data="comp:cancel"),
-    ]])
+    ], _back_row("comp:back:leave")])
     await call.message.edit_text("Передать этому участнику состав и выйти?", reply_markup=kb); await call.answer()
 
 
@@ -669,14 +886,23 @@ async def leader_leave_yes(call: CallbackQuery, bot: Bot):
         await call.answer("Нет права", show_alert=True); return
     if not transfer_leadership(composition["id"], call.from_user.id, target, remove_old=True):
         await call.answer("Не удалось передать состав", show_alert=True); return
-    await call.message.edit_text("✅ Состав передан, ты успешно вышел."); await call.answer()
+    await call.message.edit_text(
+        "✅ Состав передан, ты успешно вышел.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[_back_row("league:back_root", "◀️ В составы")]),
+    ); await call.answer()
     try: await bot.send_message(target, f"👑 Тебе передан состав {composition['name']} после выхода лидера.")
     except Exception: pass
 
 
 @router.callback_query(F.data == "comp:cancel")
 async def cancel_action(call: CallbackQuery):
-    await call.message.edit_text("❌ Действие отменено."); await call.answer()
+    composition = get_user_league(call.from_user.id)
+    is_manager = bool(composition and (composition["is_deputy"] or int(composition["leader_id"]) == call.from_user.id))
+    destination = "comp:back:settings" if is_manager else "league:back_root"
+    await call.message.edit_text(
+        "❌ Действие отменено.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[_back_row(destination)]),
+    ); await call.answer()
 
 
 # ─── Заместители ──────────────────────────────────────────────────────────────
@@ -694,22 +920,27 @@ def _deputy_panel(league_id: int, user_id: int):
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def _deputy_list_keyboard(composition, leader_id: int):
+    buttons = []
+    for member in get_league_members(composition["id"], True):
+        if int(member["user_id"]) == leader_id:
+            continue
+        marker = "🛡" if member["role"] == "заместитель" else "👤"
+        buttons.append([InlineKeyboardButton(text=f"{marker} {member['game_nick']}",
+                                             callback_data=f"comp:deputy:{member['user_id']}")])
+    buttons.append(_back_row("comp:back:settings", "◀️ В настройки"))
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
 @router.message(F.text == "🛡 Управление заместителями")
 async def deputies(message: Message):
     composition = get_user_league(message.from_user.id)
     if not composition or int(composition["leader_id"]) != message.from_user.id:
         await message.answer("❌ Назначать заместителей может только лидер."); return
-    buttons = []
-    for member in get_league_members(composition["id"], True):
-        if int(member["user_id"]) == message.from_user.id:
-            continue
-        marker = "🛡" if member["role"] == "заместитель" else "👤"
-        buttons.append([InlineKeyboardButton(text=f"{marker} {member['game_nick']}",
-                                             callback_data=f"comp:deputy:{member['user_id']}")])
-    if not buttons:
-        await message.answer("📭 В составе нет участников для назначения."); return
-    await message.answer("🛡 Выбери участника для назначения или настройки заместителя:",
-                         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    members = get_league_members(composition["id"], True)
+    text = ("🛡 Выбери участника для назначения или настройки заместителя:"
+            if len(members) > 1 else "📭 В составе нет участников для назначения.")
+    await message.answer(text, reply_markup=_deputy_list_keyboard(composition, message.from_user.id))
 
 
 @router.callback_query(F.data == "comp:deputies:list")
@@ -717,12 +948,12 @@ async def deputies_callback(call: CallbackQuery):
     composition = get_user_league(call.from_user.id)
     if not composition or int(composition["leader_id"]) != call.from_user.id:
         await call.answer("Нет права", show_alert=True); return
-    buttons = [[InlineKeyboardButton(
-        text=f"{'🛡' if m['role'] == 'заместитель' else '👤'} {m['game_nick']}",
-        callback_data=f"comp:deputy:{m['user_id']}")]
-        for m in get_league_members(composition["id"], True) if int(m["user_id"]) != call.from_user.id]
-    await call.message.edit_text("Выбери участника:",
-                                 reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)); await call.answer()
+    members = get_league_members(composition["id"], True)
+    text = "Выбери участника:" if len(members) > 1 else "📭 В составе нет участников для назначения."
+    await call.message.edit_text(
+        text,
+        reply_markup=_deputy_list_keyboard(composition, call.from_user.id),
+    ); await call.answer()
 
 
 @router.callback_query(F.data.startswith("comp:deputy:"))
@@ -764,6 +995,9 @@ async def deputy_permission(call: CallbackQuery):
 @router.callback_query(F.data.startswith("comp:depremove:"))
 async def deputy_remove_confirm(call: CallbackQuery):
     target = int(call.data.rsplit(":", 1)[-1])
+    composition = get_user_league(call.from_user.id)
+    if not composition or int(composition["leader_id"]) != call.from_user.id:
+        await call.answer("Нет права", show_alert=True); return
     kb = InlineKeyboardMarkup(inline_keyboard=[[ 
         InlineKeyboardButton(text="✅ Да, снять", callback_data=f"comp:depremoveyes:{target}"),
         InlineKeyboardButton(text="❌ Нет", callback_data=f"comp:deputy:{target}"),
@@ -778,6 +1012,9 @@ async def deputy_remove_yes(call: CallbackQuery, bot: Bot):
     if not composition or int(composition["leader_id"]) != call.from_user.id:
         await call.answer("Нет права", show_alert=True); return
     remove_deputy(composition["id"], target)
-    await call.message.edit_text("✅ Заместитель снят. Память о назначении удалена."); await call.answer()
+    await call.message.edit_text(
+        "✅ Заместитель снят. Память о назначении удалена.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[_back_row("comp:deputies:list", "◀️ К заместителям")]),
+    ); await call.answer()
     try: await bot.send_message(target, f"ℹ️ Ты больше не заместитель состава {composition['name']}.")
     except Exception: pass
