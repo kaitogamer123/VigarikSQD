@@ -186,7 +186,28 @@ async def twink_start(call: CallbackQuery, state: FSMContext):
     await state.update_data(conflict_id=conflict_id)
     await call.message.answer(
         "➕ Отправь следующим сообщением тег твинк-аккаунта Brawl Stars.\n"
-        "Для отмены: /cancel"
+        "Для отмены: /cancel",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="◀️ Назад к выбору действия", callback_data=f"clconf:twink_back:{conflict_id}")
+        ]]),
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("clconf:twink_back:"))
+async def twink_back(call: CallbackQuery, state: FSMContext):
+    if not await _is_admin(call.from_user.id):
+        await call.answer("Нет прав", show_alert=True)
+        return
+    conflict_id = int(call.data.rsplit(":", 1)[-1])
+    conflict = await get_conflict(conflict_id)
+    await state.clear()
+    if not conflict or conflict.get("status") != "pending":
+        await call.answer("Это решение уже обработано", show_alert=True)
+        return
+    await call.message.edit_text(
+        "Выбери действие для участника:",
+        reply_markup=_actions_keyboard(conflict_id),
     )
     await call.answer()
 
@@ -220,13 +241,17 @@ async def twink_finish(message: Message, state: FSMContext, bot: Bot):
             "Введи другой тег или отправь /cancel."
         )
         return
-    await add_twink(
-        conflict["user_id"],
-        profile.get("tag") or raw,
-        profile.get("name") or "Игрок",
-        profile.get("trophies") or 0,
-        conflict["new_clan"],
-    )
+    try:
+        await add_twink(
+            conflict["user_id"],
+            profile.get("tag") or raw,
+            profile.get("name") or "Игрок",
+            profile.get("trophies") or 0,
+            conflict["new_clan"],
+        )
+    except ValueError as exc:
+        await message.answer(f"❌ {exc} Введи другой тег или отправь /cancel.")
+        return
     await resolve_conflict(conflict["id"], "twink", message.from_user.id)
     cancel_pending_departure(conflict["user_id"])
     await state.clear()

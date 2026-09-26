@@ -93,18 +93,32 @@ async def add_twink(owner_user_id: int, player_tag: str, game_nick: str,
     if not clean_tag.startswith("#"):
         clean_tag = f"#{clean_tag}"
     async with aiosqlite.connect(DB_PATH, timeout=20.0) as db:
-        await db.execute("""
-            INSERT INTO member_twinks
-                (owner_user_id, player_tag, game_nick, trophies, clan)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(player_tag) DO UPDATE SET
-                owner_user_id = excluded.owner_user_id,
-                game_nick = excluded.game_nick,
-                trophies = excluded.trophies,
-                clan = excluded.clan,
-                updated_at = datetime('now')
-        """, (owner_user_id, clean_tag, game_nick, int(trophies or 0), clan))
-        await db.commit()
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            async with db.execute(
+                "SELECT 1 FROM members WHERE REPLACE(UPPER(player_tag), '#', '') = ? LIMIT 1",
+                (clean_tag[1:],),
+            ) as cursor:
+                if await cursor.fetchone():
+                    raise ValueError("Этот игровой тег уже зарегистрирован как основной аккаунт.")
+
+            cursor = await db.execute("""
+                INSERT INTO member_twinks
+                    (owner_user_id, player_tag, game_nick, trophies, clan)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(player_tag) DO UPDATE SET
+                    game_nick = excluded.game_nick,
+                    trophies = excluded.trophies,
+                    clan = excluded.clan,
+                    updated_at = datetime('now')
+                WHERE member_twinks.owner_user_id = excluded.owner_user_id
+            """, (owner_user_id, clean_tag, game_nick, int(trophies or 0), clan))
+            if cursor.rowcount == 0:
+                raise ValueError("Этот твинк уже привязан к другому владельцу.")
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
 
 
 async def get_clan_twinks(clan: str) -> list[dict]:
