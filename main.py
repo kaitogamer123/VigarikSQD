@@ -36,6 +36,8 @@ from handlers.chat_events import router as chat_router
 from handlers.clan_conflicts import router as clan_conflicts_router
 from handlers.clan_list import router as clan_list_router
 from league.handlers import router as league_router
+from league.competitive import router as competitive_router
+from league.competitive import scrim_watchdog_task
 from game_database import init_game_db
 from player_stats_db import init_player_stats_db
 from utils.stats_collector import auto_collect_stats_task
@@ -160,6 +162,7 @@ async def main():
     # Админские кнопки и ввод твинка должны обрабатываться до группового
     # сборщика участников и общих FSM-обработчиков текстовых сообщений.
     dp.include_router(clan_stats_router)
+    dp.include_router(competitive_router)
     dp.include_router(start_router)
     dp.include_router(admin_main_router)
     dp.include_router(reg_router)
@@ -195,6 +198,7 @@ async def main():
     # Фоновый сборщик истории боёв всех игроков (каждые 10 минут)
     asyncio.create_task(auto_collect_stats_task(bot))
     asyncio.create_task(composition_departure_monitor_task(bot))
+    asyncio.create_task(scrim_watchdog_task(bot))
 
     # getUpdates is incompatible with an active Telegram webhook. Keep any
     # queued updates when switching this bot back to polling.

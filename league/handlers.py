@@ -65,15 +65,29 @@ def _root_keyboard(composition, user_id: int):
         ])
     is_leader = int(composition["leader_id"]) == int(user_id)
     is_deputy = bool(composition["is_deputy"])
-    if is_leader or is_deputy:
+    try:
+        verified = int(composition["is_verified"] or 0) == 1
+    except Exception:
+        verified = False
+    if is_leader:
+        leagues_btn = "⚔️ Лиги" if verified else "✅ Верифицировать состав"
+        return _reply([
+            ["🌍 Все составы", leagues_btn],
+            ["⚙️ Настройка состава", "📋 Заявки в состав"],
+            ["📜 История матчей"],
+            ["◀️ Назад в главное меню"],
+        ])
+    if is_deputy:
         rows = [["🌍 Все составы"], ["⚙️ Настройка состава"]]
-        if is_leader or composition["can_review_apps"]:
+        if composition["can_review_apps"]:
             rows.append(["📋 Заявки в состав"])
+        rows.append(["📜 История матчей"])
         rows.append(["◀️ Назад в главное меню"])
         return _reply(rows)
     return _reply([
         ["🌍 Все составы"],
         ["👥 Участники состава", "🚪 Выйти из состава"],
+        ["📜 История матчей"],
         ["◀️ Назад в главное меню"],
     ])
 
@@ -109,10 +123,20 @@ async def show_root(message: Message, state: FSMContext, user_id: int = None):
         role = "👑 Лидер" if int(composition["leader_id"]) == user_id else (
             "🛡 Заместитель" if composition["is_deputy"] else "👤 Участник"
         )
+        try:
+            verified = int(composition["is_verified"] or 0) == 1
+        except Exception:
+            verified = False
+        try:
+            mmr = int(composition["mmr"] or 0)
+        except Exception:
+            mmr = 0
+        verify_line = "🟠 Верифицирован ✅" if verified else "⚪️ Не верифицирован"
         text = (
             f"🏆 <b>Ваш состав: {hd.quote(composition['name'])} "
             f"[{hd.quote(composition['tag'])}]</b>\n"
-            f"Статус набора: {status}\nРоль: {role}"
+            f"Статус набора: {status}\nРоль: {role}\n"
+            f"{verify_line} | 🌟 MMR: {mmr}"
         )
     await message.answer(text, parse_mode="HTML", reply_markup=_root_keyboard(composition, user_id))
 
@@ -294,18 +318,39 @@ async def create_tag(message: Message, state: FSMContext):
 # ─── Все составы / заявки ────────────────────────────────────────────────────
 async def _send_all(message: Message, edit: bool = False):
     conn = get_db()
-    rows = conn.execute("""
-        SELECT l.*, (SELECT COUNT(*) FROM league_members m
-        WHERE m.league_id = l.id AND m.user_id IS NOT NULL) AS count_members
-        FROM leagues l ORDER BY count_members DESC, l.id DESC
-    """).fetchall(); conn.close()
+    try:
+        rows = conn.execute("""
+            SELECT l.*, (SELECT COUNT(*) FROM league_members m
+            WHERE m.league_id = l.id AND m.user_id IS NOT NULL) AS count_members
+            FROM leagues l ORDER BY COALESCE(l.is_verified, 0) DESC, COALESCE(l.mmr, 0) DESC, l.id DESC
+        """).fetchall()
+    except Exception:
+        rows = conn.execute("""
+            SELECT l.*, (SELECT COUNT(*) FROM league_members m
+            WHERE m.league_id = l.id AND m.user_id IS NOT NULL) AS count_members
+            FROM leagues l ORDER BY count_members DESC, l.id DESC
+        """).fetchall()
+    conn.close()
     builder = InlineKeyboardBuilder()
     for row in rows:
-        builder.button(text=f"🏆 {row['name']} [{row['tag']}] ({row['count_members']}/4)",
+        try:
+            verified = int(row["is_verified"] or 0) == 1
+        except Exception:
+            verified = False
+        try:
+            mmr = int(row["mmr"] or 0)
+        except Exception:
+            mmr = 0
+        mark = "🟠 " if verified else ""
+        name = str(row['name'])
+        if len(name) > 18:
+            name = name[:17] + "…"
+        builder.button(text=f"{mark}{name} [{row['tag']}] | {mmr}MMR🌟",
                        callback_data=f"league:info:{row['id']}")
     builder.button(text="◀️ В составы", callback_data="league:back_root")
     builder.adjust(1)
-    text = "🌍 <b>Все составы</b>" if rows else "📭 Составов пока нет."
+    text = ("🌍 <b>Все составы</b>\n🟠 — верифицирован (может играть скримы)"
+            if rows else "📭 Составов пока нет.")
     if edit:
         await message.edit_text(text, parse_mode="HTML", reply_markup=builder.as_markup())
     else:
@@ -331,7 +376,16 @@ async def composition_info(call: CallbackQuery):
     conn.close()
     if not composition:
         await call.answer("Состав не найден", show_alert=True); return
-    lines = [f"🏆 <b>{hd.quote(composition['name'])} [{hd.quote(composition['tag'])}]</b>"]
+    try:
+        verified = int(composition["is_verified"] or 0) == 1
+    except Exception:
+        verified = False
+    try:
+        mmr = int(composition["mmr"] or 0)
+    except Exception:
+        mmr = 0
+    lines = [f"🏆 <b>{hd.quote(composition['name'])} [{hd.quote(composition['tag'])}]</b>",
+             f"{'🟠 Верифицирован ✅' if verified else '⚪️ Не верифицирован'} | 🌟 MMR: {mmr}"]
     for member in members:
         if not member["user_id"]:
             lines.append(f"{member['slot_index']}. — Свободное место —")

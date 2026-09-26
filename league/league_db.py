@@ -1,10 +1,17 @@
 """SQLite-слой системы составов (историческое имя модуля league сохранено)."""
+import json
 import os
 import sqlite3
 from typing import Optional
 
 DB_PATH = os.path.join("league", "league.db")
 DEPUTY_PERMISSIONS = ("can_review_apps", "can_invite", "can_kick", "can_toggle_open")
+
+# MMR-настройки скримов: (победа за карту, поражение за карту)
+MMR_NORMAL = (10, -7)
+MMR_RANDOM = (15, -10)
+
+SCRIM_ACTIVE_STATUSES = ("searching", "invited", "scheduled", "awaiting_scores")
 
 
 def get_connection():
@@ -27,7 +34,8 @@ def init_league_db():
         CREATE TABLE IF NOT EXISTS leagues (
             id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, tag TEXT NOT NULL,
             leader_id INTEGER NOT NULL, is_open INTEGER DEFAULT 1,
-            record_league INTEGER DEFAULT 0, created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            record_league INTEGER DEFAULT 0, created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            is_verified INTEGER DEFAULT 0, mmr INTEGER DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS league_members (
             id INTEGER PRIMARY KEY AUTOINCREMENT, league_id INTEGER, slot_index INTEGER,
@@ -63,15 +71,57 @@ def init_league_db():
             check_after DATETIME NOT NULL,
             FOREIGN KEY (league_id) REFERENCES leagues(id) ON DELETE CASCADE
         );
+        CREATE TABLE IF NOT EXISTS league_verify_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            league_id INTEGER NOT NULL,
+            leader_id INTEGER NOT NULL,
+            status TEXT DEFAULT 'pending',
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            decided_at DATETIME,
+            decided_by INTEGER,
+            FOREIGN KEY (league_id) REFERENCES leagues(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS scrims (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scrim_type TEXT NOT NULL,
+            format TEXT NOT NULL,
+            challenger_league_id INTEGER NOT NULL,
+            opponent_league_id INTEGER,
+            challenger_leader_id INTEGER NOT NULL,
+            opponent_leader_id INTEGER,
+            challenger_name TEXT DEFAULT '',
+            challenger_tag TEXT DEFAULT '',
+            opponent_name TEXT DEFAULT '',
+            opponent_tag TEXT DEFAULT '',
+            scheduled_text TEXT DEFAULT '',
+            status TEXT DEFAULT 'invited',
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            invite_expires_at DATETIME,
+            challenger_score_a INTEGER,
+            challenger_score_b INTEGER,
+            opponent_score_a INTEGER,
+            opponent_score_b INTEGER,
+            challenger_shots TEXT DEFAULT '[]',
+            opponent_shots TEXT DEFAULT '[]',
+            mmr_challenger INTEGER,
+            mmr_opponent INTEGER,
+            completed_at DATETIME
+        );
         CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_invite ON league_invites (league_id, invitee_id);
         CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_league_member
             ON league_members (league_id, user_id) WHERE user_id IS NOT NULL;
         CREATE INDEX IF NOT EXISTS idx_deputies_order ON league_deputies (league_id, appointed_at, id);
         CREATE INDEX IF NOT EXISTS idx_composition_departures_due
             ON composition_departures (check_after);
+        CREATE INDEX IF NOT EXISTS idx_scrims_status ON scrims (status);
+        CREATE INDEX IF NOT EXISTS idx_scrims_leagues ON scrims (challenger_league_id, opponent_league_id);
     """)
     if "joined_at" not in _columns(conn, "league_members"):
         cur.execute("ALTER TABLE league_members ADD COLUMN joined_at DATETIME")
+    if "is_verified" not in _columns(conn, "leagues"):
+        cur.execute("ALTER TABLE leagues ADD COLUMN is_verified INTEGER DEFAULT 0")
+    if "mmr" not in _columns(conn, "leagues"):
+        cur.execute("ALTER TABLE leagues ADD COLUMN mmr INTEGER DEFAULT 0")
     cur.execute(
         "CREATE INDEX IF NOT EXISTS idx_league_members_joined "
         "ON league_members (league_id, joined_at, id)"
@@ -107,6 +157,44 @@ def get_user_league(user_id: int):
     return row
 
 
+def get_league(league_id: int):
+    conn = get_connection()
+    row = conn.execute("SELECT * FROM leagues WHERE id = ?", (league_id,)).fetchone()
+    conn.close()
+    return row
+
+
+def get_verified_leagues(exclude_id: int = None):
+    conn = get_connection()
+    if exclude_id:
+        rows = conn.execute(
+            "SELECT * FROM leagues WHERE is_verified = 1 AND id != ? ORDER BY mmr DESC, name",
+            (exclude_id,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM leagues WHERE is_verified = 1 ORDER BY mmr DESC, name"
+        ).fetchall()
+    conn.close()
+    return rows
+
+
+def set_league_verified(league_id: int, value: bool = True) -> None:
+    conn = get_connection()
+    conn.execute("UPDATE leagues SET is_verified = ? WHERE id = ?", (1 if value else 0, league_id))
+    conn.commit()
+    conn.close()
+
+
+def add_mmr(league_id: int, delta: int) -> int:
+    conn = get_connection()
+    conn.execute("UPDATE leagues SET mmr = COALESCE(mmr, 0) + ? WHERE id = ?", (int(delta), league_id))
+    row = conn.execute("SELECT mmr FROM leagues WHERE id = ?", (league_id,)).fetchone()
+    conn.commit()
+    conn.close()
+    return int(row["mmr"]) if row else 0
+
+
 def get_league_members(league_id: int, occupied_only: bool = False):
     conn = get_connection()
     occupied = "AND m.user_id IS NOT NULL" if occupied_only else ""
@@ -122,6 +210,25 @@ def get_league_members(league_id: int, occupied_only: bool = False):
     """, (league_id,)).fetchall()
     conn.close()
     return rows
+
+
+def count_clan_members(user_ids) -> int:
+    """Сколько из user_ids состоят в клане (зарегистрированы в vigarik.db)."""
+    ids = [int(x) for x in (user_ids or []) if x]
+    if not ids:
+        return 0
+    try:
+        import sqlite3 as _sq
+        conn = _sq.connect("vigarik.db", timeout=10.0)
+        placeholders = ",".join("?" for _ in ids)
+        row = conn.execute(
+            f"SELECT COUNT(*) FROM members WHERE user_id IN ({placeholders}) AND registered = 1",
+            ids,
+        ).fetchone()
+        conn.close()
+        return int(row[0]) if row else 0
+    except Exception:
+        return 0
 
 
 def has_management_permission(user_id: int, permission: str) -> bool:
@@ -181,8 +288,11 @@ def toggle_deputy_permission(league_id: int, user_id: int, permission: str) -> O
 def dissolve_league(league_id: int) -> None:
     conn = get_connection()
     for table in ("league_members", "league_deputies", "league_applications", "league_invites",
-                  "composition_departures"):
-        conn.execute(f"DELETE FROM {table} WHERE league_id = ?", (league_id,))
+                  "composition_departures", "league_verify_requests"):
+        try:
+            conn.execute(f"DELETE FROM {table} WHERE league_id = ?", (league_id,))
+        except Exception:
+            pass
     conn.execute("DELETE FROM leagues WHERE id = ?", (league_id,))
     conn.commit(); conn.close()
 
@@ -221,6 +331,11 @@ def transfer_leadership(league_id: int, old_leader_id: int, new_leader_id: int,
     conn.execute("UPDATE leagues SET leader_id = ? WHERE id = ?", (new_leader_id, league_id))
     conn.execute("DELETE FROM composition_departures WHERE user_id IN (?, ?)",
                  (old_leader_id, new_leader_id))
+    # Активные скримы уходят за составом; лидерство в скримах обновляем.
+    conn.execute("UPDATE scrims SET challenger_leader_id = ? WHERE challenger_league_id = ? AND status IN ('searching','invited','scheduled','awaiting_scores') AND challenger_leader_id = ?",
+                 (new_leader_id, league_id, old_leader_id))
+    conn.execute("UPDATE scrims SET opponent_leader_id = ? WHERE opponent_league_id = ? AND status IN ('searching','invited','scheduled','awaiting_scores') AND opponent_leader_id = ?",
+                 (new_leader_id, league_id, old_leader_id))
     conn.commit(); conn.close()
     return True
 
@@ -328,6 +443,265 @@ def handle_clan_departure(user_id: int, reason: str = "telegram", old_clan: str 
                 "check_after": row["check_after"] if row else None}
     leave_league(user_id)
     return {"action": "member_removed", "league_name": name}
+
+
+# ─── Верификация составов ────────────────────────────────────────────────
+
+def get_pending_verify_request(league_id: int):
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT * FROM league_verify_requests WHERE league_id = ? AND status = 'pending' ORDER BY id DESC LIMIT 1",
+        (league_id,),
+    ).fetchone()
+    conn.close()
+    return row
+
+
+def create_verify_request(league_id: int, leader_id: int):
+    if get_pending_verify_request(league_id):
+        return None
+    league = get_league(league_id)
+    if not league or int(league["is_verified"] or 0) == 1:
+        return None
+    conn = get_connection()
+    cur = conn.execute(
+        "INSERT INTO league_verify_requests (league_id, leader_id, status) VALUES (?, ?, 'pending')",
+        (league_id, leader_id),
+    )
+    req_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return req_id
+
+
+def get_verify_request(req_id: int):
+    conn = get_connection()
+    row = conn.execute("SELECT * FROM league_verify_requests WHERE id = ?", (req_id,)).fetchone()
+    conn.close()
+    return row
+
+
+def decide_verify_request(req_id: int, status: str, decided_by: int) -> bool:
+    conn = get_connection()
+    cur = conn.execute(
+        "UPDATE league_verify_requests SET status = ?, decided_at = CURRENT_TIMESTAMP, decided_by = ? "
+        "WHERE id = ? AND status = 'pending'",
+        (status, decided_by, req_id),
+    )
+    ok = cur.rowcount > 0
+    conn.commit()
+    conn.close()
+    return ok
+
+
+# ─── Скримы ──────────────────────────────────────────────────────────────
+
+def create_scrim(scrim_type: str, fmt: str, challenger_league_id: int, challenger_leader_id: int,
+                 scheduled_text: str = "", opponent_league_id=None, opponent_leader_id=None,
+                 status: str = "invited", expire_hours: int = 24) -> int:
+    challenger = get_league(challenger_league_id)
+    opponent = get_league(opponent_league_id) if opponent_league_id else None
+    conn = get_connection()
+    cur = conn.execute("""
+        INSERT INTO scrims (scrim_type, format, challenger_league_id, opponent_league_id,
+            challenger_leader_id, opponent_leader_id, challenger_name, challenger_tag,
+            opponent_name, opponent_tag, scheduled_text, status, invite_expires_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now', ?))
+    """, (
+        scrim_type, fmt, challenger_league_id, opponent_league_id,
+        challenger_leader_id, opponent_leader_id,
+        challenger["name"] if challenger else "", challenger["tag"] if challenger else "",
+        opponent["name"] if opponent else "", opponent["tag"] if opponent else "",
+        scheduled_text or "", status, f"+{int(expire_hours)} hours",
+    ))
+    scrim_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return scrim_id
+
+
+def get_scrim(scrim_id: int):
+    conn = get_connection()
+    row = conn.execute("SELECT * FROM scrims WHERE id = ?", (scrim_id,)).fetchone()
+    conn.close()
+    return row
+
+
+def set_scrim_status(scrim_id: int, status: str) -> None:
+    conn = get_connection()
+    conn.execute("UPDATE scrims SET status = ? WHERE id = ?", (status, scrim_id))
+    conn.commit()
+    conn.close()
+
+
+def claim_random_scrim(scrim_id: int, league_id: int, leader_id: int) -> bool:
+    league = get_league(league_id)
+    if not league:
+        return False
+    conn = get_connection()
+    cur = conn.execute(
+        "UPDATE scrims SET opponent_league_id = ?, opponent_leader_id = ?, opponent_name = ?, "
+        "opponent_tag = ?, status = 'scheduled' WHERE id = ? AND status = 'searching'",
+        (league_id, leader_id, league["name"], league["tag"], scrim_id),
+    )
+    ok = cur.rowcount > 0
+    conn.commit()
+    conn.close()
+    return ok
+
+
+def save_score_report(scrim_id: int, side: str, score_a: int, score_b: int) -> None:
+    # NB: обе стороны пишут счёт в едином формате "нападающие/принявшие"
+    conn = get_connection()
+    if side == "challenger":
+        conn.execute("UPDATE scrims SET challenger_score_a = ?, challenger_score_b = ? WHERE id = ?",
+                     (int(score_a), int(score_b), scrim_id))
+    else:
+        conn.execute("UPDATE scrims SET opponent_score_a = ?, opponent_score_b = ? WHERE id = ?",
+                     (int(score_a), int(score_b), scrim_id))
+    conn.execute("UPDATE scrims SET status = 'awaiting_scores' WHERE id = ? AND status = 'scheduled'", (scrim_id,))
+    conn.commit()
+    conn.close()
+
+
+def clear_score_reports(scrim_id: int) -> None:
+    conn = get_connection()
+    conn.execute(
+        "UPDATE scrims SET challenger_score_a = NULL, challenger_score_b = NULL, "
+        "opponent_score_a = NULL, opponent_score_b = NULL, status = 'scheduled' WHERE id = ?",
+        (scrim_id,),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _shots_list(raw) -> list:
+    try:
+        data = json.loads(raw or "[]")
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def add_scrim_screenshot(scrim_id: int, side: str, file_id: str) -> int:
+    conn = get_connection()
+    row = conn.execute("SELECT challenger_shots, opponent_shots FROM scrims WHERE id = ?", (scrim_id,)).fetchone()
+    if not row:
+        conn.close()
+        return 0
+    col = "challenger_shots" if side == "challenger" else "opponent_shots"
+    shots = _shots_list(row[col])
+    shots.append(file_id)
+    conn.execute(f"UPDATE scrims SET {col} = ? WHERE id = ?", (json.dumps(shots), scrim_id))
+    conn.commit()
+    conn.close()
+    return len(shots)
+
+
+def get_scrim_shots_count(scrim_id: int, side: str) -> int:
+    conn = get_connection()
+    row = conn.execute("SELECT challenger_shots, opponent_shots FROM scrims WHERE id = ?", (scrim_id,)).fetchone()
+    conn.close()
+    if not row:
+        return 0
+    col = "challenger_shots" if side == "challenger" else "opponent_shots"
+    return len(_shots_list(row[col]))
+
+
+def calc_mmr(scrim_type: str, score_a: int, score_b: int) -> tuple[int, int]:
+    """Возвращает (дельта нападающих, дельта принявших)."""
+    if scrim_type == "friendly":
+        return (0, 0)
+    win, lose = MMR_RANDOM if scrim_type == "random" else MMR_NORMAL
+    delta_a = int(score_a) * win + int(score_b) * lose
+    delta_b = int(score_b) * win + int(score_a) * lose
+    return (delta_a, delta_b)
+
+
+def complete_scrim(scrim_id: int) -> dict | None:
+    scrim = get_scrim(scrim_id)
+    if not scrim:
+        return None
+    if scrim["challenger_score_a"] is None or scrim["opponent_score_a"] is None:
+        return None
+    if (scrim["challenger_score_a"], scrim["challenger_score_b"]) != \
+       (scrim["opponent_score_a"], scrim["opponent_score_b"]):
+        return None
+    score_a, score_b = int(scrim["challenger_score_a"]), int(scrim["challenger_score_b"])
+    delta_a, delta_b = calc_mmr(scrim["scrim_type"], score_a, score_b)
+    add_mmr(int(scrim["challenger_league_id"]), delta_a)
+    if scrim["opponent_league_id"]:
+        add_mmr(int(scrim["opponent_league_id"]), delta_b)
+    conn = get_connection()
+    conn.execute(
+        "UPDATE scrims SET mmr_challenger = ?, mmr_opponent = ?, status = 'completed', "
+        "completed_at = CURRENT_TIMESTAMP WHERE id = ?",
+        (delta_a, delta_b, scrim_id),
+    )
+    conn.commit()
+    conn.close()
+    return {"score_a": score_a, "score_b": score_b, "delta_a": delta_a, "delta_b": delta_b}
+
+
+def last_random_opponent(league_id: int):
+    """ID соперника по последнему завершённому рандомному скриму (для запрета повтора)."""
+    conn = get_connection()
+    row = conn.execute("""
+        SELECT challenger_league_id, opponent_league_id FROM scrims
+        WHERE scrim_type = 'random' AND status = 'completed'
+          AND (challenger_league_id = ? OR opponent_league_id = ?)
+        ORDER BY completed_at DESC, id DESC LIMIT 1
+    """, (league_id, league_id)).fetchone()
+    conn.close()
+    if not row:
+        return None
+    if int(row["challenger_league_id"]) == int(league_id):
+        return int(row["opponent_league_id"]) if row["opponent_league_id"] else None
+    return int(row["challenger_league_id"])
+
+
+def get_active_scrims_for_leader(user_id: int):
+    conn = get_connection()
+    rows = conn.execute("""
+        SELECT * FROM scrims
+        WHERE (challenger_leader_id = ? OR opponent_leader_id = ?)
+          AND status IN ('searching','invited','scheduled','awaiting_scores')
+        ORDER BY id DESC
+    """, (user_id, user_id)).fetchall()
+    conn.close()
+    return rows
+
+
+def get_league_history(league_id: int, limit: int = 10):
+    conn = get_connection()
+    rows = conn.execute("""
+        SELECT * FROM scrims
+        WHERE status = 'completed' AND (challenger_league_id = ? OR opponent_league_id = ?)
+        ORDER BY completed_at DESC, id DESC LIMIT ?
+    """, (league_id, league_id, int(limit))).fetchall()
+    conn.close()
+    return rows
+
+
+def get_recent_completed(limit: int = 10):
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT * FROM scrims WHERE status = 'completed' ORDER BY completed_at DESC, id DESC LIMIT ?",
+        (int(limit),),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def get_expired_scrims():
+    conn = get_connection()
+    rows = conn.execute("""
+        SELECT * FROM scrims
+        WHERE status IN ('invited','searching') AND invite_expires_at IS NOT NULL
+          AND datetime(invite_expires_at) <= datetime('now')
+    """).fetchall()
+    conn.close()
+    return rows
 
 
 init_league_db()
