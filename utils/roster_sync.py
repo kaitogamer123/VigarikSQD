@@ -71,7 +71,7 @@ async def sync_roster_msg(bot: Bot, clan_key: str, force: bool = False) -> bool:
             "player_tag": twink.get("player_tag"),
             "trophies": twink.get("trophies", 0),
             "clan": clan_key,
-            "role": "member",
+            "role": twink.get("role") or "member",
             "registered": 1,
         })
     base_text = format_roster(clan_key, members)

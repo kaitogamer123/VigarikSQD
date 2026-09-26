@@ -1,6 +1,7 @@
 """Твинки и конфликты входа пользователя в чат другого клана."""
 import aiosqlite
 
+from config import ROLES
 from database import DB_PATH
 
 
@@ -15,6 +16,7 @@ async def init_clan_account_tables() -> None:
                 game_nick TEXT NOT NULL,
                 trophies INTEGER DEFAULT 0,
                 clan TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'member',
                 created_at TEXT DEFAULT (datetime('now')),
                 updated_at TEXT DEFAULT (datetime('now'))
             );
@@ -37,6 +39,13 @@ async def init_clan_account_tables() -> None:
             CREATE INDEX IF NOT EXISTS idx_clan_entry_conflicts_pending
                 ON clan_entry_conflicts (user_id, new_clan, status);
         """)
+        # CREATE TABLE IF NOT EXISTS does not change an existing server DB.
+        async with db.execute("PRAGMA table_info(member_twinks)") as cursor:
+            columns = {row[1] for row in await cursor.fetchall()}
+        if "role" not in columns:
+            await db.execute(
+                "ALTER TABLE member_twinks ADD COLUMN role TEXT NOT NULL DEFAULT 'member'"
+            )
         await db.commit()
 
 
@@ -160,6 +169,27 @@ async def get_twink_by_tag(player_tag: str):
                 if _norm(item.get("player_tag")) == wanted:
                     return item
     return None
+
+
+async def set_twink_role(player_tag: str, clan: str, role: str) -> bool:
+    """Changes the displayed clan role of one twink, not its owner's Telegram rights."""
+    if role not in ROLES:
+        raise ValueError("Неизвестная роль твинка")
+    wanted = str(player_tag or "").strip().upper().replace("#", "")
+    if not wanted or not clan:
+        return False
+
+    await init_clan_account_tables()
+    async with aiosqlite.connect(DB_PATH, timeout=20.0) as db:
+        cursor = await db.execute(
+            """
+            UPDATE member_twinks SET role = ?, updated_at = datetime('now')
+            WHERE REPLACE(UPPER(player_tag), '#', '') = ? AND clan = ?
+            """,
+            (role, wanted, clan),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
 
 
 async def delete_twink(player_tag: str) -> bool:
