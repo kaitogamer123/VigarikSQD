@@ -30,6 +30,7 @@ def admin_panel_keyboard(role: str, user_id=0) -> ReplyKeyboardMarkup:
     if _lvl(role) <= _lvl("vice"):
         builder.button(text="👥 Управление участниками")
         builder.button(text="📢 Сделать объявление")
+        builder.button(text="📜 История игр")
     if role in ("president", "grand_vice_president", "grand_vice"):
         builder.button(text="🎯 Управление пуш-сезоном")
     if role == "president":
