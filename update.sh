@@ -1,57 +1,81 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 
 cd "$(dirname "$0")"
 
 PY="venv/bin/python"
 PIP="venv/bin/pip"
 SCREEN_NAME="vigarik_bot"
-BACKUP_DIR="/tmp/vigarik_preserve_$$"
+BACKUP_DIR="$(mktemp -d /tmp/vigarik-config.XXXXXX)"
+PRESERVE_FILES=("config.py" "admins.txt" "server_secrets.env" "config_local.py")
+
+restore_server_files() {
+    for file in "${PRESERVE_FILES[@]}"; do
+        if [ -f "$BACKUP_DIR/$file" ]; then
+            cp -a "$BACKUP_DIR/$file" "$file"
+            case "$file" in
+                server_secrets.env|config_local.py) chmod 600 "$file" ;;
+            esac
+        fi
+    done
+    rm -rf "$BACKUP_DIR"
+}
+trap restore_server_files EXIT
 
 echo "=============================================="
-echo "ОБНОВЛЕНИЕ БОТА VIGARIK SQUAD"
+echo "ОБНОВЛЕНИЕ VIGARIK SQUAD"
 echo "=============================================="
 
-# Файлы, которые живут на сервере и НЕ должны затираться GitHub-ом
-PRESERVE_FILES=(
-    "config.py"
-    "admins.txt"
-)
-
-echo "[0/3] Сохраняю локальные секреты сервера..."
-mkdir -p "$BACKUP_DIR"
-for f in "${PRESERVE_FILES[@]}"; do
-    if [ -f "$f" ]; then
-        cp -a "$f" "$BACKUP_DIR/$f"
-        echo "  saved $f"
-    fi
-done
-
-echo "[1/3] Загрузка изменений с Git..."
-git fetch origin
-git reset --hard origin/master
-
-echo "[1.5/3] Возвращаю серверные секреты..."
-for f in "${PRESERVE_FILES[@]}"; do
-    if [ -f "$BACKUP_DIR/$f" ]; then
-        cp -a "$BACKUP_DIR/$f" "$f"
-        echo "  restored $f"
-    fi
-done
-rm -rf "$BACKUP_DIR"
-
-if [ -f "requirements.txt" ]; then
-    echo "[2/3] Проверка и установка зависимостей..."
-    $PIP install -q -r requirements.txt
+if [ ! -f "server_secrets.env" ]; then
+    echo "ОШИБКА: отсутствует $(pwd)/server_secrets.env"
+    echo "Создай его с TELEGRAM_BOT_TOKEN и BRAWL_API_TOKEN перед деплоем."
+    exit 1
 fi
 
-echo "[3/3] Перезапуск процесса бота..."
+# Явно сохраняем серверные файлы вокруг reset. Так секреты останутся на месте,
+# даже если их случайно добавили в Git. Обычный перезапуск бота их не удаляет.
+for file in "${PRESERVE_FILES[@]}"; do
+    if [ -f "$file" ]; then
+        cp -a "$file" "$BACKUP_DIR/$file"
+    fi
+done
+
+echo "[1/4] Загрузка кода..."
+git fetch origin
+git reset --hard origin/master
+restore_server_files
+trap - EXIT
+
+if [ ! -x "$PY" ]; then
+    echo "ОШИБКА: не найден $PY"
+    exit 1
+fi
+
+echo "[2/4] Проверка серверных токенов..."
+"$PY" - <<'PY'
+from utils.secrets import require_brawl_token, require_telegram_token
+require_telegram_token()
+require_brawl_token()
+print("Telegram token: OK")
+print("Brawl API token: OK")
+PY
+
+echo "[3/4] Установка зависимостей..."
+if [ -f "requirements.txt" ]; then
+    "$PIP" install -q -r requirements.txt
+fi
+
+echo "[4/4] Перезапуск бота..."
 screen -S "$SCREEN_NAME" -X quit 2>/dev/null || true
 sleep 1
-screen -dmS "$SCREEN_NAME" $PY main.py
+screen -dmS "$SCREEN_NAME" "$PY" main.py
+sleep 3
 
-echo "=============================================="
-echo "Бот обновлен и перезапущен."
-echo "config.py и admins.txt на сервере сохранены."
+if ! screen -list | grep -q "$SCREEN_NAME"; then
+    echo "ОШИБКА: screen-сессия бота не запустилась."
+    "$PY" main.py
+    exit 1
+fi
+
+echo "Бот обновлён; server_secrets.env и серверные конфиги сохранены."
 screen -ls || true
-echo "=============================================="

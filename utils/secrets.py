@@ -1,45 +1,61 @@
-"""Единая загрузка секретов, которые запрещено хранить в Git."""
+"""Загружает токены из неотслеживаемого Git серверного файла."""
 import os
+from pathlib import Path
 
 
-try:
-    import config_local
-except ImportError:
-    config_local = None
-
-
-def _local_value(name: str) -> str:
-    if config_local is None:
-        return ""
-    return str(getattr(config_local, name, "") or "").strip()
-
-
-# Переменные окружения имеют первый приоритет, config_local.py — второй.
-TELEGRAM_TOKEN = (
-    os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-    or _local_value("TOKEN")
+SECRETS_PATH = Path(
+    os.getenv("VIGARIK_SECRETS_FILE", "")
+    or Path(__file__).resolve().parent.parent / "server_secrets.env"
 )
 
+
+def _read_secrets_file() -> dict[str, str]:
+    """Reads KEY=VALUE lines without requiring python-dotenv."""
+    values: dict[str, str] = {}
+    try:
+        with SECRETS_PATH.open("r", encoding="utf-8") as file:
+            for raw_line in file:
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip()
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+                    value = value[1:-1]
+                values[key] = value.strip()
+    except FileNotFoundError:
+        return {}
+    return values
+
+
+_FILE_SECRETS = _read_secrets_file()
+
+# The server file wins over environment variables to avoid stale-token overrides.
+TELEGRAM_TOKEN = (
+    _FILE_SECRETS.get("TELEGRAM_BOT_TOKEN", "")
+    or os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+)
 BRAWL_API_TOKEN = (
-    os.getenv("BRAWL_API_TOKEN", "").strip()
-    or _local_value("BRAWL_API_TOKEN")
+    _FILE_SECRETS.get("BRAWL_API_TOKEN", "")
+    or os.getenv("BRAWL_API_TOKEN", "").strip()
 )
 
 
 def require_telegram_token() -> str:
     if not TELEGRAM_TOKEN:
         raise RuntimeError(
-            "Telegram-токен не найден. Создай /root/VigarikSQD/config_local.py "
-            "со строкой TOKEN = 'токен от BotFather'. Этот файл не должен попадать в Git."
+            f"Telegram-токен не найден. Создай {SECRETS_PATH} с двумя строками: "
+            "TELEGRAM_BOT_TOKEN=... и BRAWL_API_TOKEN=..."
         )
     if ":" not in TELEGRAM_TOKEN:
-        raise RuntimeError("TOKEN в config_local.py имеет неверный формат")
+        raise RuntimeError(f"TELEGRAM_BOT_TOKEN в {SECRETS_PATH} имеет неверный формат")
     return TELEGRAM_TOKEN
 
 
 def require_brawl_token() -> str:
     if not BRAWL_API_TOKEN:
         raise RuntimeError(
-            "Brawl API токен не найден. Добавь BRAWL_API_TOKEN в config_local.py."
+            f"Brawl API токен не найден. Добавь BRAWL_API_TOKEN в {SECRETS_PATH}."
         )
     return BRAWL_API_TOKEN
