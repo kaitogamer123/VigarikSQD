@@ -14,7 +14,8 @@ from aiogram.utils.markdown import html_decoration as hd
 
 from database import get_member
 from league.league_db import (
-    DEPUTY_PERMISSIONS, dissolve_league, get_connection as get_db,
+    DEPUTY_PERMISSIONS, dissolve_league, enforce_verification_requirement,
+    get_connection as get_db,
     get_league_members, get_user_league, has_management_permission,
     init_league_db, leave_league, remove_deputy, set_deputy,
     toggle_deputy_permission, transfer_leadership,
@@ -725,7 +726,7 @@ async def _show_kick_choices(message: Message, user_id: int, edit: bool = False)
                for m in get_league_members(composition["id"], True)
                if int(m["user_id"]) not in {int(composition["leader_id"]), user_id}]
     buttons.append(_back_row("comp:back:settings", "◀️ В настройки"))
-    text = "Кого исключить из состава?" if len(buttons) > 1 else "�� Некого исключать."
+    text = "Кого исключить из состава?" if len(buttons) > 1 else "📭 Некого исключать."
     markup = InlineKeyboardMarkup(inline_keyboard=buttons)
     if edit:
         await message.edit_text(text, reply_markup=markup)
@@ -767,8 +768,26 @@ async def kick_yes(call: CallbackQuery, bot: Bot):
     conn.close()
     if not row or not leave_league(target):
         await call.answer("Участник уже вышел", show_alert=True); return
+    check = enforce_verification_requirement(int(composition["id"]))
+    notice = ""
+    if check["revoked"]:
+        notice = (
+            f"\n\n⚠️ Состав потерял верификацию: осталось {check['count']}/4 участников "
+            f"(нужно минимум 3). Добейте состав и подайте заявку заново."
+        )
+        leader_id = int(composition["leader_id"])
+        if leader_id != call.from_user.id:
+            try:
+                await bot.send_message(
+                    leader_id,
+                    f"⚠️ Состав «{composition['name']}» [{composition['tag']}] потерял верификацию: "
+                    f"осталось {check['count']}/4 участников (нужно минимум 3). "
+                    f"Добейте состав и подайте заявку заново.",
+                )
+            except Exception:
+                pass
     await call.message.edit_text(
-        f"✅ {hd.quote(row['game_nick'] or str(target))} исключён из состава.",
+        f"✅ {hd.quote(row['game_nick'] or str(target))} исключён из состава.{notice}",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[_back_row("comp:back:settings", "◀️ В настройки")]),
     ); await call.answer()
@@ -906,9 +925,25 @@ async def leave_start_callback(call: CallbackQuery):
 
 
 @router.callback_query(F.data == "comp:leave:yes")
-async def leave_yes(call: CallbackQuery):
+async def leave_yes(call: CallbackQuery, bot: Bot):
+    composition = get_user_league(call.from_user.id)
+    if not composition:
+        await call.answer("Не удалось выйти", show_alert=True); return
+    league_id, leader_id = int(composition["id"]), int(composition["leader_id"])
+    league_name, league_tag = composition["name"], composition["tag"]
     if not leave_league(call.from_user.id):
         await call.answer("Не удалось выйти", show_alert=True); return
+    check = enforce_verification_requirement(league_id)
+    if check["revoked"]:
+        try:
+            await bot.send_message(
+                leader_id,
+                f"⚠️ Состав «{league_name}» [{league_tag}] потерял верификацию: "
+                f"осталось {check['count']}/4 участников (нужно минимум 3). "
+                f"Добейте состав и подайте заявку заново.",
+            )
+        except Exception:
+            pass
     await call.message.edit_text(
         "✅ Ты успешно вышел из состава.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[_back_row("league:back_root", "◀️ В составы")]),
@@ -931,11 +966,18 @@ async def leader_leave_yes(call: CallbackQuery, bot: Bot):
         await call.answer("Нет права", show_alert=True); return
     if not transfer_leadership(composition["id"], call.from_user.id, target, remove_old=True):
         await call.answer("Не удалось передать состав", show_alert=True); return
+    check = enforce_verification_requirement(int(composition["id"]))
+    notice = ""
+    if check["revoked"]:
+        notice = (
+            f"\n\n⚠️ Состав потерял верификацию: осталось {check['count']}/4 участников "
+            f"(нужно минимум 3). Добейте состав и подайте заявку заново."
+        )
     await call.message.edit_text(
-        "✅ Состав передан, ты успешно вышел.",
+        f"✅ Состав передан, ты успешно вышел.{notice}",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[_back_row("league:back_root", "◀️ В составы")]),
     ); await call.answer()
-    try: await bot.send_message(target, f"👑 Тебе передан состав {composition['name']} после выхода лидера.")
+    try: await bot.send_message(target, f"👑 Тебе передан состав {composition['name']} после выхода лидера.{notice}")
     except Exception: pass
 
 

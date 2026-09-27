@@ -239,6 +239,21 @@ async def auto_update_trophies_task(bot: Bot) -> None:
                                 f"{composition_result.get('check_after')}"
                             )
                             continue
+                        if (composition_result.get("action") == "member_removed"
+                                and composition_result.get("revoked")):
+                            try:
+                                await bot.send_message(
+                                    composition_result["leader_id"],
+                                    f"⚠️ Состав «{composition_result['league_name']}» потерял верификацию: "
+                                    f"осталось {composition_result['remaining']}/4 участников (нужно минимум 3). "
+                                    f"Добейте состав и подайте заявку заново.",
+                                )
+                            except Exception:
+                                pass
+                            logger.info(
+                                f"Состав {composition_result['league_name']} потерял верификацию "
+                                f"после выхода ID {user_id} из игры"
+                            )
                         await db.remove_member(user_id)
                         chat_info = (CLAN_CHATS or {}).get(clan_key) or {}
                         chat_id = chat_info.get("chat_id") if isinstance(chat_info, dict) else None

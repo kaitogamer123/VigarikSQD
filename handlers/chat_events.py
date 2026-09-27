@@ -186,6 +186,21 @@ async def on_chat_member_update(event: ChatMemberUpdated, bot: Bot):
                 f"Передача лидерства {composition_result['league_name']} отложена до "
                 f"{composition_result.get('check_after')}"
             )
+        elif (composition_result.get("action") == "member_removed"
+                and composition_result.get("revoked")):
+            try:
+                await bot.send_message(
+                    composition_result["leader_id"],
+                    f"⚠️ Состав «{composition_result['league_name']}» потерял верификацию: "
+                    f"осталось {composition_result['remaining']}/4 участников (нужно минимум 3). "
+                    f"Добейте состав и подайте заявку заново.",
+                )
+            except Exception:
+                pass
+            logger.info(
+                f"Состав {composition_result['league_name']} потерял верификацию "
+                f"после выхода ID {user_id}: осталось {composition_result['remaining']}"
+            )
 
         if member:
             # Для лидера во время 24-часового окна сохраняем регистрацию: это

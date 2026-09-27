@@ -99,6 +99,20 @@ async def process_due_composition_departures(bot: Bot) -> None:
                     f"После 24 часов состав {result['league_name']} передан "
                     f"ID {result['new_leader_id']}"
                 )
+                if result.get("revoked"):
+                    try:
+                        await bot.send_message(
+                            result["new_leader_id"],
+                            f"⚠️ Состав «{result['league_name']}» потерял верификацию: "
+                            f"осталось {result['remaining']}/4 участников (нужно минимум 3). "
+                            f"Добейте состав и подайте заявку заново.",
+                        )
+                    except Exception:
+                        pass
+                    logger.info(
+                        f"Состав {result['league_name']} потерял верификацию "
+                        f"после передачи лидерства: осталось {result['remaining']}"
+                    )
             elif result.get("action") == "dissolved":
                 logger.info(
                     f"После 24 часов состав {result['league_name']} распущен: преемников нет"
