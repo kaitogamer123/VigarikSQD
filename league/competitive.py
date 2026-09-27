@@ -1,6 +1,7 @@
 """Верификация составов, скримы (обычные/рандомные/дружеские), MMR и истории матчей."""
 import asyncio
 import logging
+import re
 from datetime import datetime
 
 from aiogram import Bot, F, Router
@@ -49,6 +50,50 @@ router = Router()
 
 SCRIM_TYPE_LABEL = {"normal": "⚔️ Обычный", "random": "🎲 Рандомный", "friendly": "🤝 Дружеский"}
 LEAGUES_MENU_BUTTONS = {"⚔️ Лиги", "🏆 Лиги", "Лиги"}
+
+# ─── Охрана ввода: команды и кнопки меню никогда не считаются датой/счётом ───
+DATETIME_RE = re.compile(r"^\s*\d{1,2}\.\d{1,2}(\.\d{2,4})?\s+\d{1,2}:\d{2}\s*$")
+SCORE_RE = re.compile(r"^\s*\d{1,2}\s*[/:\-]\s*\d{1,2}\s*$")
+
+SCRIM_MENU_TEXTS = frozenset({
+    "◀️ Назад", "❌ Отмена", "◀️ Назад в составы",
+    "◀️ Назад в главное меню", "Назад в главное меню",
+    "⚔️ Лиги", "🏆 Лиги", "Лиги",
+    "⚔️ Обычный скрим", "🎲 Рандомный скрим", "🤝 Дружеский скрим",
+    "🏁 Мои скримы", "📜 История матчей", "📜 История игр",
+    "✅ Верифицировать состав", "🛡 Верифицировать состав",
+    "🌍 Все составы", "🌍 Все лиги",
+    "📝 Подать заявку в состав", "📝 Подать заявку в лигу",
+    "📩 Мои заявки", "📥 Приглашения в состав", "📥 Приглашения в лигу",
+    "➕ Создать состав", "➕ Создать лигу",
+    "⚙️ Настройка состава", "📋 Заявки в состав", "📋 Просмотреть заявки",
+    "👥 Участники состава", "👥 Состав лиги",
+    "🚪 Выйти из состава", "🚪 Выйти из лиги",
+    "🔒 Закрыть набор / Открыть набор",
+    "👑 Передать лидерство", "👑 Передать лидерку",
+    "🛡 Управление заместителями",
+    "🚪 Выгнать участника", "➕ Пригласить игрока", "💥 Распустить состав",
+    "Составы 🏆 (BetaTest)", "Составы🏆 (BetaTest)", "Лиги 💀 (BetaTest)",
+    "💡 Отправить предложение", "🎯 Выбрать цель пуша", "👔 Для админов",
+    "👥 Управление участниками", "📢 Сделать объявление",
+    "🎯 Управление пуш-сезоном", "⚙️ Назначить модерацию",
+    "🔄 Проверить юзернеймы", "⚙️ Системные команды",
+    "◀️ Выйти из админки", "🔙 Назад в админку",
+    "📋 Редактировать список клана", "👤 Участники без ников", "➕ Добавить твинк",
+})
+
+
+def _scrim_input_allowed(message: Message) -> bool:
+    """True, если текст реально похож на дату или счёт, а не на команду/кнопку."""
+    text = (message.text or "").strip()
+    if not text or text.startswith("/") or text in SCRIM_MENU_TEXTS:
+        return False
+    return bool(DATETIME_RE.match(text) or SCORE_RE.match(text))
+
+
+def _is_cancel_text(message: Message) -> bool:
+    text = (message.text or "").strip()
+    return bool(text) and text.startswith("/cancel")
 
 
 class ScrimStates(StatesGroup):
@@ -206,7 +251,6 @@ async def verify_start(message: Message, bot: Bot):
     if not req_id:
         await message.answer("❌ Не удалось создать заявку. Попробуй позже.")
         return
-    # Заявка в админ-чат
     lines = [
         "📋 <b>Заявка на верификацию состава</b>",
         "",
@@ -381,6 +425,20 @@ def _need_verified_leader(composition, user_id: int) -> str | None:
     return None
 
 
+def _eligible_random_rivals(composition):
+    """Верифицированные составы, с которыми нельзя играть 2 раза подряд."""
+    my_id = int(composition["id"])
+    prev = last_random_opponent(my_id)
+    rivals = []
+    for league in get_verified_leagues(exclude_id=my_id):
+        if prev is not None and int(league["id"]) == int(prev):
+            continue
+        if last_random_opponent(int(league["id"])) == my_id:
+            continue
+        rivals.append(league)
+    return rivals
+
+
 @router.message(F.text == "⚔️ Обычный скрим")
 async def scrim_normal_start(message: Message, state: FSMContext):
     composition = get_user_league(message.from_user.id)
@@ -428,11 +486,20 @@ async def scrim_random_start(message: Message, state: FSMContext):
     if err:
         await message.answer(err)
         return
-    await state.update_data(scrim_type="random")
+    rivals = _eligible_random_rivals(composition)
+    if not rivals:
+        await message.answer(
+            "📭 Сейчас нет подходящих соперников для рандомного скрима: "
+            "либо нет других верифицированных составов, либо все уже играли с тобой "
+            "в прошлом рандомном скриме."
+        )
+        return
+    await state.update_data(scrim_type="random", random_pool=[r["id"] for r in rivals])
     await state.set_state(ScrimStates.waiting_datetime)
     await message.answer(
         "🎲 <b>Рандомный скрим.</b> Соперник подберётся сам из верифицированных составов "
         "(кто первый согласится). Твоё название никому не покажем до начала игры.\n\n"
+        f"Доступно соперников: <b>{len(rivals)}</b>.\n\n"
         "Напиши дату и время, когда хочешь сыграть (например: <code>25.12 19:00</code>):",
         parse_mode="HTML",
     )
@@ -455,60 +522,127 @@ async def scrim_choose_opp(call: CallbackQuery, state: FSMContext):
     await state.update_data(opponent_league_id=opp_id)
     await state.set_state(ScrimStates.waiting_datetime)
     await call.message.answer(
-        f"Соперник: <b>{hd.quote(opp['name'])} [{hd.quote(opp['tag'])}]</b>.\n"
-        f"Напиши дату и время игры (например: <code>25.12 19:00</code>):",
+        f"Соперник: {hd.quote(opp['name'])} [{hd.quote(opp['tag'])}] .\n"
+        f"Напиши дату и время игры (например: 25.12 19:00 ):",
         parse_mode="HTML",
     )
     await call.answer()
 
 
-@router.message(ScrimStates.waiting_datetime)
+@router.message(
+    ScrimStates.waiting_datetime,
+    F.text.in_(SCRIM_MENU_TEXTS) | F.text.startswith("/"),
+)
+async def scrim_datetime_exit(message: Message, state: FSMContext):
+    """Кнопки меню и команды во время ввода даты: выходим, а не показываем формат."""
+    await state.clear()
+    if (message.text or "").strip() == "◀️ Назад в составы":
+        await _show_root(message, state)
+        return
+    await message.answer(
+        "❌ Создание скрима отменено.",
+        reply_markup=_leagues_menu(),
+    )
+
+
+@router.message(ScrimStates.waiting_datetime, _scrim_input_allowed)
 async def scrim_datetime(message: Message, state: FSMContext):
     text = (message.text or "").strip()
-    if not (3 <= len(text) <= 60):
-        await message.answer("❌ Напиши дату и время текстом от 3 до 60 символов (например: 25.12 19:00).")
+    scheduled = _normalise_scheduled(text)
+    if not scheduled:
+        await message.answer(
+            "❌ Неверный формат даты. Введи так: <code>25.12 19:00</code> или <code>25.12.2026 19:00</code>.\n"
+            "Для выхода нажми «◀️ Назад в составы» или отправь /cancel.",
+            parse_mode="HTML",
+        )
         return
-    await state.update_data(scheduled_text=text)
+    await state.update_data(scheduled_text=scheduled)
     kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="BO3 (до 2 побед)", callback_data="scrim:format:BO3"),
-        InlineKeyboardButton(text="BO5 (до 3 побед)", callback_data="scrim:format:BO5"),
+        InlineKeyboardButton(text="BO3 (до 2 побед)", callback_data="scrim:fmt:BO3"),
+        InlineKeyboardButton(text="BO5 (до 3 побед)", callback_data="scrim:fmt:BO5"),
     ]])
+    await state.set_state(ScrimFormatState)
     await message.answer("Выбери формат игры:", reply_markup=kb)
 
 
-@router.callback_query(F.data.startswith("scrim:format:"))
-async def scrim_format(call: CallbackQuery, state: FSMContext, bot: Bot):
-    composition = get_user_league(call.from_user.id)
-    err = _need_verified_leader(composition, call.from_user.id)
-    if err:
-        await call.answer(err, show_alert=True)
+def _normalise_scheduled(text: str):
+    """'25.12 19:00' -> '25.12.2026 19:00'; '25.12.2026 19:00' -> как есть."""
+    try:
+        raw = text.strip()
+        for fmt in ("%d.%m.%Y %H:%M", "%d.%m %H:%M"):
+            try:
+                dt = datetime.strptime(raw, fmt)
+                if fmt == "%d.%m %H:%M":
+                    dt = dt.replace(year=datetime.now().year)
+                return dt.strftime("%d.%m.%Y %H:%M")
+            except ValueError:
+                continue
+    except Exception:
+        pass
+    return None
+
+
+class _FormatExtraStates(StatesGroup):
+    """Отдельный класс, чтобы не мутировать ScrimStates после регистрации."""
+    waiting_format = State()
+
+
+ScrimFormatState = _FormatExtraStates.waiting_format
+
+
+@router.message(
+    ScrimFormatState,
+    F.text.in_(SCRIM_MENU_TEXTS) | F.text.startswith("/"),
+)
+async def scrim_format_exit(message: Message, state: FSMContext):
+    await state.clear()
+    if (message.text or "").strip() == "◀️ Назад в составы":
+        await _show_root(message, state)
         return
-    data = await state.get_data()
-    scrim_type = data.get("scrim_type") or "normal"
-    scheduled = data.get("scheduled_text") or ""
+    await message.answer("❌ Создание скрима отменено.", reply_markup=_leagues_menu())
+
+
+@router.callback_query(ScrimFormatState, F.data.startswith("scrim:fmt:"))
+async def scrim_format_chosen(call: CallbackQuery, state: FSMContext, bot: Bot):
     fmt = call.data.rsplit(":", 1)[-1]
     if fmt not in ("BO3", "BO5"):
         await call.answer("Неизвестный формат", show_alert=True)
         return
+    data = await state.get_data()
+    composition = get_user_league(call.from_user.id)
+    err = _need_verified_leader(composition, call.from_user.id)
+    if err:
+        await state.clear()
+        await call.answer(err, show_alert=True)
+        return
+    scrim_type = data.get("scrim_type") or "normal"
+    scheduled = data.get("scheduled_text") or ""
 
     if scrim_type == "random":
-        rivals = get_verified_leagues(exclude_id=int(composition["id"]))
-        if not rivals:
-            await call.answer("Нет других верифицированных составов", show_alert=True)
+        pool_ids = data.get("random_pool") or []
+        pool = [get_league(int(league_id)) for league_id in pool_ids]
+        pool = [league for league in pool if league and int(league["is_verified"] or 0) == 1]
+        if not pool:
+            await state.clear()
+            await call.message.edit_text(
+                "❌ Сейчас нет подходящих соперников для рандомного скрима: "
+                "нет других верифицированных составов либо все уже играли с тобой "
+                "в прошлом рандомном скриме."
+            )
+            await call.answer()
             return
         scrim_id = create_scrim(
             "random", fmt, int(composition["id"]), call.from_user.id,
             scheduled_text=scheduled, status="searching", expire_hours=24,
         )
         await state.clear()
-        # Рассылка всем верифицированным лидерам, кроме создателя (анонимно).
         sent = 0
-        for rival in rivals:
+        for league in pool:
             try:
                 await bot.send_message(
-                    int(rival["leader_id"]),
-                    f"🎲 <b>Кто-то хочет сыграть рандомный скрим!</b>\n\n"
-                    f"Формат: <b>{fmt}</b>\nДата/время: {hd.quote(scheduled)}\n\n"
+                    int(league["leader_id"]),
+                    f"🎲 Кто-то хочет сыграть рандомный скрим!\n\n"
+                    f"Формат: {fmt}\nДата/время: {hd.quote(scheduled)}\n\n"
                     f"Кто первый согласится — тот и играет. Организатор не раскрывается.",
                     parse_mode="HTML",
                     reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
@@ -519,9 +653,10 @@ async def scrim_format(call: CallbackQuery, state: FSMContext, bot: Bot):
                 sent += 1
             except Exception:
                 continue
-        await call.message.answer(
-            f"🎲 Поиск соперника запущен (скрим #{scrim_id}, {fmt}). "
-            f"Приглашение отправлено {sent} лидерам. Кто первый согласится — тот и соперник."
+        await call.message.edit_text(
+            f"🎲 Поиск соперника запущен (скрим #{scrim_id}, {fmt}).\n"
+            f"Приглашение отправлено {sent} лидерам. Кто первый согласится — тот и соперник.",
+            reply_markup=None,
         )
         await call.answer()
         return
@@ -529,6 +664,7 @@ async def scrim_format(call: CallbackQuery, state: FSMContext, bot: Bot):
     opp_id = data.get("opponent_league_id")
     opp = get_league(int(opp_id)) if opp_id else None
     if not opp or int(opp["is_verified"] or 0) != 1:
+        await state.clear()
         await call.answer("Соперник недоступен, начни заново", show_alert=True)
         return
     scrim_id = create_scrim(
@@ -541,10 +677,10 @@ async def scrim_format(call: CallbackQuery, state: FSMContext, bot: Bot):
     try:
         await bot.send_message(
             int(opp["leader_id"]),
-            f"⚔️ <b>Вам бросили вызов: {label} скрим!</b>\n\n"
-            f"Соперник: <b>{hd.quote(composition['name'])} [{hd.quote(composition['tag'])}]</b> "
+            f"⚔️ Вам бросили вызов: {label} скрим!\n\n"
+            f"Соперник: {hd.quote(composition['name'])} [{hd.quote(composition['tag'])}] "
             f"({int(composition['mmr'] or 0)} MMR🌟)\n"
-            f"Формат: <b>{fmt}</b>\nДата/время: {hd.quote(scheduled)}\n\n"
+            f"Формат: {fmt}\nДата/время: {hd.quote(scheduled)}\n\n"
             f"Ответь в течение суток — иначе приглашение сгорит.",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
@@ -553,11 +689,13 @@ async def scrim_format(call: CallbackQuery, state: FSMContext, bot: Bot):
             ]]),
         )
     except Exception:
-        await call.message.answer("❌ Не смог написать лидеру соперника (он заблокировал бота?).")
+        await call.message.edit_text("❌ Не смог написать лидеру соперника (он заблокировал бота?).")
+        await call.answer()
         return
-    await call.message.answer(
+    await call.message.edit_text(
         f"✅ Заявка отправлена лидеру «{opp['name']}» в ЛС. "
-        f"Если он примет в течение суток — договоритесь о точном времени и играйте."
+        f"Если он примет в течение суток — договоритесь о точном времени и играйте.",
+        reply_markup=None,
     )
     await call.answer()
 
@@ -590,24 +728,24 @@ async def scrim_invite_accept(call: CallbackQuery, bot: Bot):
         exp = datetime.strptime(str(scrim["invite_expires_at"])[:19], "%Y-%m-%d %H:%M:%S")
         if exp < datetime.now():
             db.set_scrim_status(scrim_id, "expired")
-            await call.answer("Приглашение просрочено", show_alert=True)
+            await call.answer("Приглашение сгорело", show_alert=True)
             return
     except Exception:
         pass
-    db.set_scrim_status(scrim_id, "scheduled")
-    label = SCRIM_TYPE_LABEL.get(scrim["scrim_type"], scrim["scrim_type"])
+    if not db.set_scrim_status(scrim_id, "scheduled"):
+        await call.answer("Приглашение уже неактивно", show_alert=True)
+        return
     await call.message.edit_text(
-        f"✅ Ты принял {label} скрим #{scrim_id} против "
-        f"«{scrim['challenger_name']}» ({scrim['format']}, {scrim['scheduled_text']}). "
-        f"Договоритесь в ЛС и играйте. После игры каждый лидер жмёт «🏁 Скрим завершён».",
+        f"✅ Ты принял скрим #{scrim_id} ({scrim['format']}, {scrim['scheduled_text']}). "
+        f"Договоритесь с соперником в ЛС и играйте. После игры жми «🏁 Скрим завершён».",
         reply_markup=None,
     )
-    await call.answer()
+    await call.answer("Скрим принят")
+    label = SCRIM_TYPE_LABEL.get(scrim["scrim_type"], scrim["scrim_type"])
     try:
-        challenger = get_league(int(scrim["challenger_league_id"]))
         await bot.send_message(
             int(scrim["challenger_leader_id"]),
-            f"✅ «{scrim['opponent_name']}» <b>принял</b> твой {label} скрим #{scrim_id} "
+            f"✅ «{scrim['opponent_name']}» принял твой {label} скрим #{scrim_id} "
             f"({scrim['format']}, {scrim['scheduled_text']}). Договоритесь в ЛС и играйте!",
             parse_mode="HTML",
         )
@@ -652,7 +790,6 @@ async def scrim_random_accept(call: CallbackQuery, bot: Bot):
     if my_league == int(scrim["challenger_league_id"]):
         await call.answer("Это твой же скрим", show_alert=True)
         return
-    # Запрет двух подряд рандомных игр одной пары.
     if last_random_opponent(int(scrim["challenger_league_id"])) == my_league or \
        last_random_opponent(my_league) == int(scrim["challenger_league_id"]):
         await call.answer(
@@ -692,7 +829,6 @@ async def my_scrims(message: Message):
         await message.answer("❌ Ты не состоишь в составе.")
         return
     rows = db.get_active_scrims_for_leader(message.from_user.id)
-    # Обычным участникам показываем активные скримы их состава (без кнопок завершения).
     if not rows and not _is_leader(composition, message.from_user.id):
         league_id = int(composition["id"])
         conn_rows = []
@@ -765,7 +901,19 @@ async def scrim_finish_start(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 
-@router.message(ScrimStates.waiting_score)
+@router.message(
+    ScrimStates.waiting_score,
+    F.text.in_(SCRIM_MENU_TEXTS) | F.text.startswith("/"),
+)
+async def scrim_score_exit(message: Message, state: FSMContext):
+    await state.clear()
+    if (message.text or "").strip() == "◀️ Назад в составы":
+        await _show_root(message, state)
+        return
+    await message.answer("❌ Ввод счёта отменён.", reply_markup=_leagues_menu())
+
+
+@router.message(ScrimStates.waiting_score, _scrim_input_allowed)
 async def scrim_score(message: Message, state: FSMContext):
     data = await state.get_data()
     scrim_id, side = data.get("finish_scrim_id"), data.get("finish_side")
@@ -818,7 +966,6 @@ async def scrim_shots_done(call: CallbackQuery, state: FSMContext, bot: Bot):
         await state.clear()
         await call.answer("Скрим не найден", show_alert=True)
         return
-    # Определяем сторону по лидеру, если FSM слетел.
     if call.from_user.id == int(scrim["challenger_leader_id"] or 0):
         side = "challenger"
     elif call.from_user.id == int(scrim["opponent_leader_id"] or 0):
@@ -849,7 +996,6 @@ async def scrim_shots_done(call: CallbackQuery, state: FSMContext, bot: Bot):
         except Exception:
             pass
         return
-    # Оба отчитались — сверяем.
     a1 = (int(scrim["challenger_score_a"]), int(scrim["challenger_score_b"]))
     a2 = (int(scrim["opponent_score_a"]), int(scrim["opponent_score_b"]))
     if a1 != a2:
@@ -932,7 +1078,6 @@ async def admin_history(message: Message):
     lines = ["📜 <b>Последние игры клуба:</b>", ""]
     for r in rows:
         lines.append("• " + _history_line(r))
-    # Выбор состава для детальной истории.
     leagues = get_verified_leagues()
     kb_rows = []
     for lg in leagues[:20]:
