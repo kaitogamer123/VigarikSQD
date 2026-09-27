@@ -22,8 +22,6 @@ from config import ADMIN_CHAT_ID
 from database import get_member
 from league import league_db as db
 from league.league_db import (
-    add_mmr,
-    calc_mmr,
     claim_random_scrim,
     complete_scrim,
     count_clan_members,
