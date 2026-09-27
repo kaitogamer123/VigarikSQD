@@ -47,6 +47,24 @@ def _back_row(destination: str, label: str = "◀️ Назад"):
     return [InlineKeyboardButton(text=label, callback_data=destination)]
 
 
+def _row_verified(row) -> bool:
+    """Совместимость: колонка может называться is_verified или verified."""
+    for key in ("is_verified", "verified"):
+        try:
+            if int(row[key] or 0) == 1:
+                return True
+        except (IndexError, KeyError, TypeError, ValueError):
+            continue
+    return False
+
+
+def _row_mmr(row) -> int:
+    try:
+        return int(row["mmr"] or 0)
+    except (IndexError, KeyError, TypeError, ValueError):
+        return 0
+
+
 def _reply(rows):
     return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text=text) for text in row] for row in rows],
@@ -65,21 +83,16 @@ def _root_keyboard(composition, user_id: int):
         ])
     is_leader = int(composition["leader_id"]) == int(user_id)
     is_deputy = bool(composition["is_deputy"])
-    try:
-        verified = int(composition["is_verified"] or 0) == 1
-    except Exception:
-        verified = False
     if is_leader:
-        leagues_btn = "⚔️ Лиги" if verified else "✅ Верифицировать состав"
-        return _reply([
-            ["🌍 Все составы", leagues_btn],
-            ["⚙️ Настройка состава", "📋 Заявки в состав"],
-            ["📜 История матчей"],
-            ["◀️ Назад в главное меню"],
-        ])
+        second = "🏆 Лиги" if _row_verified(composition) else "🛡 Верифицировать состав"
+        rows = [["🌍 Все составы", second], ["⚙️ Настройка состава"]]
+        rows.append(["📋 Заявки в состав"])
+        rows.append(["📜 История матчей"])
+        rows.append(["◀️ Назад в главное меню"])
+        return _reply(rows)
     if is_deputy:
         rows = [["🌍 Все составы"], ["⚙️ Настройка состава"]]
-        if composition["can_review_apps"]:
+        if is_leader or composition["can_review_apps"]:
             rows.append(["📋 Заявки в состав"])
         rows.append(["📜 История матчей"])
         rows.append(["◀️ Назад в главное меню"])
@@ -123,20 +136,10 @@ async def show_root(message: Message, state: FSMContext, user_id: int = None):
         role = "👑 Лидер" if int(composition["leader_id"]) == user_id else (
             "🛡 Заместитель" if composition["is_deputy"] else "👤 Участник"
         )
-        try:
-            verified = int(composition["is_verified"] or 0) == 1
-        except Exception:
-            verified = False
-        try:
-            mmr = int(composition["mmr"] or 0)
-        except Exception:
-            mmr = 0
-        verify_line = "🟠 Верифицирован ✅" if verified else "⚪️ Не верифицирован"
         text = (
             f"🏆 <b>Ваш состав: {hd.quote(composition['name'])} "
             f"[{hd.quote(composition['tag'])}]</b>\n"
-            f"Статус набора: {status}\nРоль: {role}\n"
-            f"{verify_line} | 🌟 MMR: {mmr}"
+            f"Статус набора: {status}\nРоль: {role}"
         )
     await message.answer(text, parse_mode="HTML", reply_markup=_root_keyboard(composition, user_id))
 
@@ -322,7 +325,9 @@ async def _send_all(message: Message, edit: bool = False):
         rows = conn.execute("""
             SELECT l.*, (SELECT COUNT(*) FROM league_members m
             WHERE m.league_id = l.id AND m.user_id IS NOT NULL) AS count_members
-            FROM leagues l ORDER BY COALESCE(l.is_verified, 0) DESC, COALESCE(l.mmr, 0) DESC, l.id DESC
+            FROM leagues l
+            ORDER BY COALESCE(l.is_verified, l.verified, 0) DESC,
+                     COALESCE(l.mmr, 0) DESC, l.id DESC
         """).fetchall()
     except Exception:
         rows = conn.execute("""
@@ -333,24 +338,15 @@ async def _send_all(message: Message, edit: bool = False):
     conn.close()
     builder = InlineKeyboardBuilder()
     for row in rows:
-        try:
-            verified = int(row["is_verified"] or 0) == 1
-        except Exception:
-            verified = False
-        try:
-            mmr = int(row["mmr"] or 0)
-        except Exception:
-            mmr = 0
-        mark = "🟠 " if verified else ""
-        name = str(row['name'])
-        if len(name) > 18:
-            name = name[:17] + "…"
-        builder.button(text=f"{mark}{name} [{row['tag']}] | {mmr}MMR🌟",
-                       callback_data=f"league:info:{row['id']}")
+        verified = _row_verified(row)
+        mmr = _row_mmr(row)
+        marker = "🟠" if verified else "⚪"
+        base = f"{marker} {row['name']} [{row['tag']}] ({row['count_members']}/4)"
+        mmr_part = f" · {mmr}MMR🌟" if verified else ""
+        builder.button(text=base + mmr_part, callback_data=f"league:info:{row['id']}")
     builder.button(text="◀️ В составы", callback_data="league:back_root")
     builder.adjust(1)
-    text = ("🌍 <b>Все составы</b>\n🟠 — верифицирован (может играть скримы)"
-            if rows else "📭 Составов пока нет.")
+    text = "🌍 <b>Все составы</b>" if rows else "📭 Составов пока нет."
     if edit:
         await message.edit_text(text, parse_mode="HTML", reply_markup=builder.as_markup())
     else:
@@ -376,16 +372,11 @@ async def composition_info(call: CallbackQuery):
     conn.close()
     if not composition:
         await call.answer("Состав не найден", show_alert=True); return
-    try:
-        verified = int(composition["is_verified"] or 0) == 1
-    except Exception:
-        verified = False
-    try:
-        mmr = int(composition["mmr"] or 0)
-    except Exception:
-        mmr = 0
+    verified = _row_verified(composition)
+    mmr = _row_mmr(composition)
+    status_line = f"🟠 Верифицирован · {mmr}MMR🌟" if verified else "⚪ Не верифицирован"
     lines = [f"🏆 <b>{hd.quote(composition['name'])} [{hd.quote(composition['tag'])}]</b>",
-             f"{'🟠 Верифицирован ✅' if verified else '⚪️ Не верифицирован'} | 🌟 MMR: {mmr}"]
+             status_line]
     for member in members:
         if not member["user_id"]:
             lines.append(f"{member['slot_index']}. — Свободное место —")
@@ -734,7 +725,7 @@ async def _show_kick_choices(message: Message, user_id: int, edit: bool = False)
                for m in get_league_members(composition["id"], True)
                if int(m["user_id"]) not in {int(composition["leader_id"]), user_id}]
     buttons.append(_back_row("comp:back:settings", "◀️ В настройки"))
-    text = "Кого исключить из состава?" if len(buttons) > 1 else "📭 Некого исключать."
+    text = "Кого исключить из состава?" if len(buttons) > 1 else "�� Некого исключать."
     markup = InlineKeyboardMarkup(inline_keyboard=buttons)
     if edit:
         await message.edit_text(text, reply_markup=markup)
