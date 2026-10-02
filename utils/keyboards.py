@@ -13,7 +13,7 @@ def main_menu(member: dict) -> ReplyKeyboardMarkup:
     builder = ReplyKeyboardBuilder()
     builder.button(text="Составы🏆 (BetaTest)")
     builder.button(text="💡 Отправить предложение")
-    if member and member.get("clan") == "squad":
+    if member and member.get("clan") == "squad" and member.get("registered") == 1:
         builder.button(text="🎯 Выбрать цель пуша")
     if role and role != "member":
         builder.button(text="👔 Для админов")
@@ -54,7 +54,8 @@ def admin_members_keyboard() -> ReplyKeyboardMarkup:
 def admin_push_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="🎯 Запустить определение цели"), KeyboardButton(text="❓ Кто не определился с пушем")],
-        [KeyboardButton(text="📊 Список кто что пушит"), KeyboardButton(text="📬 Прочитать предложки")],
+        [KeyboardButton(text="📊 Список кто что пушит"), KeyboardButton(text="⚙️ Настройка игроков")],
+        [KeyboardButton(text="📬 Прочитать предложки")],
         [KeyboardButton(text="🔙 Назад в админку")],
     ], resize_keyboard=True)
 
@@ -68,7 +69,7 @@ def choose_clan_keyboard(clans: list[str]) -> InlineKeyboardMarkup:
 
 
 def push_goal_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[ 
+    return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="🏆 Трофеи", callback_data="push_goal:trophies"),
         InlineKeyboardButton(text="🏅 Лига", callback_data="push_goal:league"),
     ]])
@@ -76,7 +77,7 @@ def push_goal_keyboard() -> InlineKeyboardMarkup:
 
 def confirm_push_goal_keyboard(goal: str) -> InlineKeyboardMarkup:
     label = "🏆 Трофеи" if goal == "trophies" else "🏅 Лига"
-    return InlineKeyboardMarkup(inline_keyboard=[[ 
+    return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text=f"✅ Подтвердить ({label})", callback_data=f"push_confirm:{goal}"),
         InlineKeyboardButton(text="◀️ Изменить", callback_data="push_goal:back"),
     ]])
@@ -89,7 +90,7 @@ def change_push_goal_keyboard() -> InlineKeyboardMarkup:
 
 
 def launch_push_confirm_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[ 
+    return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="✅ Да, запустить", callback_data="launch_push:yes"),
         InlineKeyboardButton(text="❌ Отмена", callback_data="launch_push:no"),
     ]])
@@ -141,7 +142,35 @@ def notify_undecided_keyboard() -> InlineKeyboardMarkup:
 
 
 def confirm_notify_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[ 
+    return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="✅ Подтвердить", callback_data="notify:confirm"),
         InlineKeyboardButton(text="❌ Отмена", callback_data="notify:cancel"),
     ]])
+
+
+# ─── Настройка игроков (пуш-сезон) ───────────────────────────────────────────
+
+def push_players_keyboard(players: list[dict]) -> InlineKeyboardMarkup:
+    """Список игроков основы для админской смены цели пуша.
+
+    players: [{'user_id': int, 'nick': str, 'goal': 'trophies'|'league'|None}]
+    """
+    builder = InlineKeyboardBuilder()
+    for player in players:
+        goal = player.get("goal")
+        mark = "🏆" if goal == "trophies" else ("🏅" if goal == "league" else "❓")
+        builder.button(
+            text=f"{mark} {player.get('nick')}",
+            callback_data=f"pushset:open:{int(player['user_id'])}",
+        )
+    builder.button(text="◀️ Закрыть", callback_data="pushset:close")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def push_player_goal_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🏆 Перевести на трофеи", callback_data=f"pushset:set:{user_id}:trophies")],
+        [InlineKeyboardButton(text="🏅 Перевести на лигу", callback_data=f"pushset:set:{user_id}:league")],
+        [InlineKeyboardButton(text="◀️ К списку игроков", callback_data="pushset:list")],
+    ])
