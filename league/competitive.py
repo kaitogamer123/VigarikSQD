@@ -49,6 +49,9 @@ router = Router()
 SCRIM_TYPE_LABEL = {"normal": "⚔️ Обычный", "random": "🎲 Рандомный", "friendly": "🤝 Дружеский"}
 LEAGUES_MENU_BUTTONS = {"⚔️ Лиги", "🏆 Лиги", "Лиги"}
 
+# ─── Кнопка верификации: поддерживаем текущий и устаревший вариант текста ───
+VERIFY_BUTTON_TEXTS = {"✅ Верифицировать состав", "🛡 Верифицировать состав"}
+
 # ─── Охрана ввода: команды и кнопки меню никогда не считаются датой/счётом ───
 DATETIME_RE = re.compile(r"^\s*\d{1,2}\.\d{1,2}(\.\d{2,4})?\s+\d{1,2}:\d{2}\s*$")
 SCORE_RE = re.compile(r"^\s*\d{1,2}\s*[/:\-]\s*\d{1,2}\s*$")
@@ -218,7 +221,7 @@ def _history_line(row, perspective_league_id: int | None = None) -> str:
 
 # ─── Верификация: заявка лидера ────────────────────────────────────────────
 
-@router.message(F.text == "✅ Верифицировать состав")
+@router.message(F.text.in_(VERIFY_BUTTON_TEXTS))
 async def verify_start(message: Message, bot: Bot):
     composition = get_user_league(message.from_user.id)
     if not composition or not _is_leader(composition, message.from_user.id):
@@ -495,7 +498,7 @@ async def scrim_random_start(message: Message, state: FSMContext):
     await state.update_data(scrim_type="random", random_pool=[r["id"] for r in rivals])
     await state.set_state(ScrimStates.waiting_datetime)
     await message.answer(
-        "🎲 <b>Рандомный скрим.</b> Соперник подберётся сам из верифицированных составов "
+        "🎲 Рандомный скрим. Соперник подберётся сам из верифицированных составов "
         "(кто первый согласится). Твоё название никому не покажем до начала игры.\n\n"
         f"Доступно соперников: <b>{len(rivals)}</b>.\n\n"
         "Напиши дату и время, когда хочешь сыграть (например: <code>25.12 19:00</code>):",
@@ -520,8 +523,8 @@ async def scrim_choose_opp(call: CallbackQuery, state: FSMContext):
     await state.update_data(opponent_league_id=opp_id)
     await state.set_state(ScrimStates.waiting_datetime)
     await call.message.answer(
-        f"Соперник: {hd.quote(opp['name'])} [{hd.quote(opp['tag'])}] .\n"
-        f"Напиши дату и время игры (например: 25.12 19:00 ):",
+        f"Соперник: <b>{hd.quote(opp['name'])} [{hd.quote(opp['tag'])}]</b>.\n"
+        f"Напиши дату и время игры (например: <code>25.12 19:00</code>):",
         parse_mode="HTML",
     )
     await call.answer()
@@ -532,21 +535,17 @@ async def scrim_choose_opp(call: CallbackQuery, state: FSMContext):
     F.text.in_(SCRIM_MENU_TEXTS) | F.text.startswith("/"),
 )
 async def scrim_datetime_exit(message: Message, state: FSMContext):
-    """Кнопки меню и команды во время ввода даты: выходим, а не показываем формат."""
+    """Кнопки меню и команды никогда не считаются датой."""
     await state.clear()
     if (message.text or "").strip() == "◀️ Назад в составы":
         await _show_root(message, state)
         return
-    await message.answer(
-        "❌ Создание скрима отменено.",
-        reply_markup=_leagues_menu(),
-    )
+    await message.answer("❌ Создание скрима отменено.", reply_markup=_leagues_menu())
 
 
 @router.message(ScrimStates.waiting_datetime, _scrim_input_allowed)
-async def scrim_datetime(message: Message, state: FSMContext):
-    text = (message.text or "").strip()
-    scheduled = _normalise_scheduled(text)
+async def scrim_datetime_entered(message: Message, state: FSMContext):
+    scheduled = _normalise_scheduled(message.text or "")
     if not scheduled:
         await message.answer(
             "❌ Неверный формат даты. Введи так: <code>25.12 19:00</code> или <code>25.12.2026 19:00</code>.\n"
@@ -710,7 +709,7 @@ async def scrim_input_back(message: Message, state: FSMContext):
     await message.answer("❌ Создание/завершение скрима отменено.", reply_markup=_leagues_menu())
 
 
-# ─── Ответы на приглашения ───────────────────────────────────────────────
+# ─── Ответы на приглашения ─────────────────────────────────────────────────
 
 @router.callback_query(F.data.startswith("scrim:inv_accept:"))
 async def scrim_invite_accept(call: CallbackQuery, bot: Bot):
