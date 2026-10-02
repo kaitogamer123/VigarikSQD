@@ -12,12 +12,17 @@ import config
 from database import get_all_members, get_push_goals, clear_old_push_data
 from utils.formatting import PUSH_GOAL_TEXT
 from utils.keyboards import push_goal_keyboard
+from .control import record_season_start_trophies
 
 logger = logging.getLogger(__name__)
 
 
 async def launch_push_vote(bot: Bot) -> int:
-    """Запускает опрос целей сезона СТРОГО для игроков основы (squad)."""
+    """Запускает опрос целей сезона СТРОГО для игроков основы (squad).
+
+    После рассылки фиксирует стартовые трофеи сезона КАЖДОМУ игроку основы
+    (включая тех, кто ещё не выбрал цель) — от них считается прогресс.
+    """
     await clear_old_push_data()
     logger.info("Старые данные пуш-целей очищены перед новым сезоном.")
 
@@ -51,6 +56,12 @@ async def launch_push_vote(bot: Bot) -> int:
             logger.warning(f"Игрок ID {user_id} заблокировал бота.")
         except Exception as e:
             logger.error(f"Не удалось отправить пуш-голосование {user_id}: {e}")
+
+    # Трекер старта сезона: стартовые трофеи всем игрокам основы.
+    try:
+        await record_season_start_trophies()
+    except Exception:
+        logger.exception("Не удалось зафиксировать стартовые трофеи сезона")
 
     return sent_count
 
@@ -118,7 +129,7 @@ async def notify_clan_news(bot: Bot):
     news_text = "🚨 <b>СПИСОК ИГРОКОВ ОСНОВЫ, НЕ ВЫБРАВШИХ ЦЕЛЬ ПУША:</b>\n\n"
     for idx, u in enumerate(undecided, 1):
         uname = u.get("username")
-        mention = f"@{uname}" if uname else f"<b>{hd.quote(u['game_nick'])}</b>"
+        mention = f"@{uname}" if uname else f"<b>{hd.quote(str(u.get('game_nick') or u['user_id']))}</b>"
         news_text += f"  {idx}. {mention}\n"
 
     news_text += "\n⏱ <i>Срочно выберите цель в боте, иначе администрация примет меры!</i>"
