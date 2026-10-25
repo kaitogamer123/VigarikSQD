@@ -1469,9 +1469,10 @@ def render_bracket_image(columns, title: str, subtitle: str = "",
         box_w, box_h, v_gap, gap_x, pad = 264, 58, 20, 66, 42
         row_h = box_h + v_gap
         placements = [(int(p), str(n)) for p, n in (placements or [])]
-        # белая таблица призёров над сеткой (как в макете)
-        panel_row_h = 42
-        panel_h = (34 + panel_row_h * len(placements) + 18) if placements else 0
+        # таблица призёров над сеткой: тёмный фон + 4 плитки в ряд
+        tile_gap = 16
+        tile_h = 92
+        panel_h = (40 + tile_h + 22) if placements else 0
         header_h = 136 + panel_h
         base_h = header_h + len(columns[0]) * row_h + pad
         third_h = 132 if (third and (third.get("side_a") or third.get("side_b"))) else 0
@@ -1496,21 +1497,41 @@ def render_bracket_image(columns, title: str, subtitle: str = "",
         draw.text((pad, 24), _fit_text(draw, title, f_title, width - pad * 2),
                   font=f_title, fill=(255, 214, 102))
 
-        # ── таблица победителей над сеткой ────────────────────────────────────
+        # ── таблица победителей над сеткой (тёмная, плитки по местам) ─────────
         if placements:
             py0 = 94
-            draw.rectangle([0, py0, width, py0 + panel_h], fill=(244, 246, 250))
-            draw.rectangle([0, py0 + panel_h - 3, width, py0 + panel_h], fill=(255, 209, 102))
-            draw.text((pad, py0 + 16), "Победители", font=f_third, fill=(28, 34, 48))
-            place_word = {1: "1 место", 2: "2 место", 3: "3 место", 4: "4 место"}
-            place_color = {1: (196, 132, 10), 2: (90, 104, 128), 3: (150, 96, 40), 4: (150, 96, 40)}
-            for i, (place, name) in enumerate(placements[:8]):
-                ry = py0 + 54 + i * panel_row_h
-                label = place_word.get(place, f"{place} место")
-                draw.text((pad, ry), _fit_text(draw, label, f_slot, 140),
-                          font=f_slot, fill=place_color.get(place, (28, 34, 48)))
-                draw.text((pad + 150, ry), _fit_text(draw, name, f_slot, width - pad * 2 - 150),
-                          font=f_slot, fill=(20, 24, 34))
+            draw.rectangle([0, py0, width, py0 + panel_h], fill=(19, 25, 38))
+            draw.line([(0, py0 + panel_h - 2), (width, py0 + panel_h - 2)],
+                      fill=(255, 209, 102), width=2)
+
+            # 1 — золото, 2 — серебро, 3 — бронза, 4 — тёмная бронза
+            medal = {
+                1: {"accent": (255, 209, 102), "fill": (45, 39, 21), "label": "1 МЕСТО"},
+                2: {"accent": (203, 213, 225), "fill": (35, 41, 54), "label": "2 МЕСТО"},
+                3: {"accent": (251, 146, 60), "fill": (46, 33, 21), "label": "3 МЕСТО"},
+                4: {"accent": (180, 144, 110), "fill": (35, 31, 28), "label": "4 МЕСТО"},
+            }
+            tiles = placements[:4]
+            tile_w = (width - pad * 2 - tile_gap * (len(tiles) - 1)) / max(1, len(tiles))
+            for i, (place, name) in enumerate(tiles):
+                tx = pad + i * (tile_w + tile_gap)
+                ty = py0 + 26
+                style = medal.get(place, {"accent": (150, 165, 195), "fill": (28, 35, 49),
+                                          "label": f"{place} МЕСТО"})
+                draw.rounded_rectangle(
+                    [tx, ty, tx + tile_w, ty + tile_h], radius=14,
+                    fill=style["fill"], outline=style["accent"], width=2,
+                )
+                # цветной маркер места
+                draw.rounded_rectangle(
+                    [tx + 12, ty + 12, tx + 96, ty + 32], radius=6,
+                    fill=style["accent"],
+                )
+                marker_text = _fit_text(draw, style["label"], f_small, 76)
+                draw.text((tx + 17, ty + 16), marker_text, font=f_small, fill=(24, 24, 24))
+                draw.text((tx + 12, ty + 50),
+                          _fit_text(draw, name, f_slot, tile_w - 24),
+                          font=f_slot, fill=(238, 242, 250))
 
         top = header_h
         col_positions: list[list[float]] = []
