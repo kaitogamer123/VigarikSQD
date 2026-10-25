@@ -1,26 +1,54 @@
 """ Главный модуль админ-панели управления. Включает распределение по папкам меню (Участники, Скримы, пуш-система). Полная синхронизация для двух создателей. """
 import asyncio
+import io
+import json
 import logging
+import math
 from datetime import datetime
 from aiogram import Router, F, Bot
-from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.types import (
+    BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
+    InputMediaPhoto, Message,
+)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.utils.markdown import html_decoration as hd
 from aiogram.filters import StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from utils.username_monitor import check_and_update_usernames
-from database import get_member
+from database import get_member, get_all_members, get_setting, set_setting
 from utils.permissions import is_any_admin, has_role
 # ИСПРАВЛЕНО: Добавили импорт клавиатур папок участников и скримов (Этап 1 ТЗ)
 from utils.keyboards import (
     main_menu, admin_panel_keyboard, admin_push_keyboard, admin_members_keyboard,
     admin_participants_keyboard, admin_scrims_keyboard,
+    tournament_type_keyboard, tournament_format_keyboard, tournament_limit_keyboard,
+    tournament_cancel_keyboard, tournament_confirm_keyboard, tournament_publish_keyboard,
+    tournament_admin_keyboard, tournaments_list_keyboard, tournament_back_keyboard,
+    tournament_register_keyboard, tournament_topics_keyboard,
+    tournament_current_list_keyboard, tournament_current_admin_keyboard,
+    tournament_current_back_keyboard,
+    simple_list_keyboard, result_cancel_keyboard, result_winner_keyboard,
+    admin_result_keyboard, tournament_test_keyboard,
+    TOURNAMENT_TYPE_LABELS, TOURNAMENT_FORMAT_LABELS, TOURNAMENT_TEST_BUTTON,
+    TOURNAMENT_TEST_PREFIX,
 )
 from utils.admin_logger import log_admin_action
 from league import league_db as db
-# Переиспользуем готовые наработки скримов: подписи типов и парсер даты/времени
+from league.league_db import get_league, get_user_league
+# ПЕРЕИСПОЛЬЗОВАНИЕ: нормализация даты/времени из готового модуля старых скримов
 from league.competitive import SCRIM_TYPE_LABEL, _normalise_scheduled
+
+# Pillow нужен для картинки с сеткой. Если библиотеки нет — бот работает,
+# но сетку присылает текстом (ничего не падает).
+try:
+    from PIL import Image, ImageDraw, ImageFont
+    PIL_AVAILABLE = True
+except Exception:  # pragma: no cover
+    Image = ImageDraw = ImageFont = None
+    PIL_AVAILABLE = False
+import config
 from config import ROLE_LABELS
 
 logger = logging.getLogger(__name__)
@@ -35,6 +63,2967 @@ class AdminStates(StatesGroup):
     waiting_proposal_answer = State()  # Ответ на заявку
     waiting_twink_user = State()  # Ожидание ID или тега основы
     waiting_twink_nick = State()  # Ожидание игрового ника твинка
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ─── МАСТЕР СОЗДАНИЯ ТУРНИРА (Этап 2 ТЗ: пошаговый FSM) ──────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# ВАЖНО: секция объявлена ВЫШЕ остальных хендлеров роутера, чтобы охранник
+# FSM-ввода перехватывал кнопки меню раньше их обычных обработчиков
+# (иначе состояние «зависало» бы при нажатии «👥 Участники» посреди мастера).
+
+class TournamentStates(StatesGroup):
+    waiting_type = State()          # Шаг 1: тип турнира (1V1 / 2V2 / 3V3 / ShowDown)
+    waiting_format = State()        # Шаг 2: формат (Бо3 / Бо5)
+    waiting_limit_choice = State()  # Шаг 3: безлимит или своё число
+    waiting_limit_value = State()   # Шаг 3а: ввод числа участников
+    waiting_datetime = State()      # Шаг 4: дата и время начала
+    waiting_confirm = State()       # Шаг 5: подтверждение черновика
+    # Этап 4: правка активного турнира
+    waiting_new_limit = State()     # новый лимит команд
+    waiting_new_time = State()      # новое время старта
+
+# Тип турнира → количество игроков в одной команде.
+# ShowDown особый: лимит участников жёстко фиксируется на 10.
+TOURNAMENT_TEAM_SIZE = {"1V1": 1, "2V2": 2, "3V3": 3}
+TOURNAMENT_SHOWDOWN = "ShowDown"
+# Все кнопки шага 1 (включая ShowDown, у которого нет размера команды)
+TOURNAMENT_TYPE_BUTTONS = frozenset({"1V1", "2V2", "3V3", TOURNAMENT_SHOWDOWN})
+TOURNAMENT_SHOWDOWN_LIMIT = 10          # ShowDown: соло-участники, лимит фиксируется на 10
+# Лимит турнира считается в КОМАНДАХ, а не в игроках:
+# в ростере клана 4 человека, но на игру выходят 3 (1V1/2V2/3V3).
+TOURNAMENT_MIN_TEAMS = 2                # меньше 2 команд сетка не собрать
+TOURNAMENT_MAX_TEAMS = 32               # разумный потолок сетки (32 команды)
+
+# Кнопки меню/мастера, которые никогда не считаются ответом на вопрос мастера.
+TOURNAMENT_MENU_TEXTS = frozenset({
+    "❌ Отмена", "◀️ Назад", "◀️ Назад в админку", "◀️ Выйти из админки", "🔙 Назад в админку",
+    "👔 Для админов", "👥 Участники", "🤺 Скримы", "📢 Сделать объявление", "⚙️ Системные команды",
+    "👥 Управление участниками", "🎯 Управление пуш-сезоном", "⚙️ Назначить модерацию",
+    "🔄 Проверить юзернеймы", "📜 История игр", "👀 Незакрытые скримы", "🏆 Создание турнира",
+    "📋 Редактировать список клана", "👤 Участники без ников", "➕ Добавить твинк",
+    "🎯 Запустить определение цели", "❓ Кто не определился с пушем", "📊 Список кто что пушит",
+    "⚙️ Настройка игроков", "📬 Прочитать предложки", "◀️ Назад в составы",
+    "🏆 Турниры", "⚙️ Топики турниров", "⚔️ Текущие турниры",
+    "🏁 Мои матчи", "📬 Заявки на результаты",
+})
+
+# ИСПРАВЛЕНО: валидные ответы мастера. Охранник FSM не должен перехватывать их
+# как «кнопку меню», иначе мастер отменяется на полуслове. Раньше из-за этого
+# «🧪 Тестовый турнир» попадал в TOURNAMENT_MENU_TEXTS и отменял создание турнира.
+TOURNAMENT_WIZARD_ANSWERS = (
+    TOURNAMENT_TYPE_BUTTONS
+    | {TOURNAMENT_TEST_BUTTON}
+    | set(TOURNAMENT_FORMAT_LABELS.values())
+    | {"♾ Без лимита команд", "🔢 Ввести число команд"}
+)
+
+# Кнопки, которые после отмены мастера можно сразу открыть повторно (они в этом же модуле)
+TOURNAMENT_REDIRECT_HANDLERS = {
+    "👥 Участники": "open_admin_participants_folder",
+    "👥 Управление участниками": "open_admin_members_folder",
+    "🎯 Управление пуш-сезоном": "open_admin_push_folder",
+    "👀 Незакрытые скримы": "admin_open_scrims_monitor",
+    "🤺 Скримы": "open_admin_scrims_folder",
+    "🏆 Турниры": "admin_open_tournaments_list",
+    "⚔️ Текущие турниры": "admin_open_current_tournaments",
+}
+
+
+def _fmt_num(value) -> str:
+    """Числа с пробелами-разделителями (1000 → 1 000)."""
+    try:
+        return f"{int(value):,}".replace(",", " ")
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _tournament_summary(data: dict) -> str:
+    """Карточка черновика турнира для подтверждения."""
+    t_type = data.get("t_type") or "—"
+    test_mark = "🧪 <b>ТЕСТОВЫЙ ТУРНИР</b> (без массовой рассылки)\n" if data.get("t_is_test") else ""
+    lines = [
+        f"{test_mark}🏆 <b>Черновик турнира</b>",
+        "",
+        f"1️⃣ Тип скрима: <b>{hd.quote(str(t_type))}</b> — {hd.quote(TOURNAMENT_TYPE_LABELS.get(t_type, ''))}",
+    ]
+    if t_type == TOURNAMENT_SHOWDOWN:
+        lines.append("2️⃣ Формат матча: <b>—</b> (в ShowDown карты не считаются по Бо3/Бо5)")
+        lines.append(f"3️⃣ Лимит участников: <b>{_fmt_num(TOURNAMENT_SHOWDOWN_LIMIT)}</b> соло (зафиксирован автоматически)")
+    else:
+        fmt = data.get("t_format")
+        team_size = TOURNAMENT_TEAM_SIZE.get(t_type, 1)
+        lines.append(f"2️⃣ Формат матча: <b>{hd.quote(TOURNAMENT_FORMAT_LABELS.get(fmt, '—'))}</b>")
+        limit = data.get("t_limit")
+        if limit:
+            lines.append(
+                f"3️⃣ Лимит команд: <b>{_fmt_num(limit)}</b> "
+                f"(≈ {_fmt_num(int(limit) * team_size)} игроков на игру)"
+            )
+        else:
+            lines.append("3️⃣ Лимит команд: <b>♾ без лимита</b>")
+    lines.append(f"4️⃣ Начало турнира: <b>{hd.quote(str(data.get('t_datetime') or '—'))}</b>")
+    lines.append("")
+    lines.append("Всё верно? Подтверди создание или отмени мастер.")
+    return "\n".join(lines)
+
+
+async def _ask_datetime(message: Message, state: FSMContext) -> None:
+    """Шаг 4: дата и время начала турнира."""
+    await state.set_state(TournamentStates.waiting_datetime)
+    await message.answer(
+        "🕐 <b>Шаг 4/4</b> — Когда будет турнир?\n\n"
+        "Напиши дату и время начала в формате:\n"
+        "• <code>25.12 19:00</code>\n"
+        "• <code>25.12.2026 19:00</code>",
+        parse_mode="HTML",
+        reply_markup=tournament_cancel_keyboard(),
+    )
+
+
+@router.message(F.text == "🏆 Создание турнира")
+async def tournament_create_start(message: Message, state: FSMContext):
+    """Шаг 1: запуск мастера создания турнира."""
+    member = await get_member(message.from_user.id)
+    if not member or not has_role(member, "vice"):
+        await message.answer("⛔ Создавать турниры могут Вице Президент и выше.")
+        return
+    await state.clear()
+    await state.set_state(TournamentStates.waiting_type)
+    await message.answer(
+        "🏆 <b>Создание турнира</b> — шаг 1/4\n\n"
+        "Какой тип скрима вы хотите выбрать?\n\n"
+        "• 1V1 / 2V2 / 3V3 — играют составы команд (в ростере до 4 человек, на игру выходят по типу);\n"
+        "• ShowDown — соло-режим, лимит участников автоматически фиксируется на 10;\n"
+        f"• <b>{TOURNAMENT_TEST_BUTTON}</b> — тот же мастер, но посты только в админ-чат "
+        "и без массовой рассылки в ЛС игрокам (для проверки механики).",
+        parse_mode="HTML",
+        reply_markup=tournament_type_keyboard(),
+    )
+
+
+@router.message(
+    StateFilter(TournamentStates),
+    ~F.text.in_(TOURNAMENT_WIZARD_ANSWERS),
+    F.text.in_(TOURNAMENT_MENU_TEXTS) | F.text.startswith("/"),
+)
+async def tournament_state_guard(message: Message, state: FSMContext):
+    """Охранник мастера: команды (/start, /cancel) и кнопки меню не глотаются как ввод.
+
+    Мастер аккуратно отменяется, а нажатая кнопка меню (если она из этого модуля)
+    сразу открывается заново — пользователь не теряет своё место в админке.
+    """
+    await state.clear()
+    text = (message.text or "").strip()
+
+    if text == "◀️ Выйти из админки" or text.startswith("/cancel"):
+        member = await get_member(message.from_user.id)
+        await message.answer("❌ Создание турнира отменено.", reply_markup=main_menu(member))
+        return
+    if text == "🔙 Назад в админку":
+        member = await get_member(message.from_user.id)
+        role = (member or {}).get("role", "member")
+        await message.answer(
+            "❌ Создание турнира отменено.\n🔙 Возврат в главное меню админ-панели.",
+            reply_markup=admin_panel_keyboard(role, user_id=message.from_user.id),
+        )
+        return
+
+    handler_name = TOURNAMENT_REDIRECT_HANDLERS.get(text)
+    if handler_name:
+        await message.answer("❌ Создание турнира отменено.")
+        await globals()[handler_name](message)
+        return
+
+    if text == "🏆 Создание турнира":
+        await tournament_create_start(message, state)
+        return
+
+    await message.answer(
+        "❌ Создание турнира отменено.",
+        reply_markup=admin_scrims_keyboard(),
+    )
+
+
+@router.message(TournamentStates.waiting_type, F.text.in_(TOURNAMENT_TYPE_BUTTONS | {TOURNAMENT_TEST_BUTTON}))
+async def tournament_type_chosen(message: Message, state: FSMContext):
+    """Шаг 1 принят. ShowDown фиксирует лимит 10 и пропускает шаги 2-3."""
+    raw = (message.text or "").strip()
+    is_test = raw == TOURNAMENT_TEST_BUTTON
+    t_type = "3V3" if is_test else raw
+    await state.update_data(t_type=t_type, t_is_test=1 if is_test else 0)
+    if is_test:
+        await message.answer(
+            "🧪 <b>Тестовый режим включён.</b>\n"
+            "Посты с сеткой будут публиковаться только в админ-чат, массовая рассылка "
+            "в ЛС всем игрокам выполняться не будет. Уведомления о матчах получат только "
+            "лидеры записанных составов (в тестовых составах лидер — ты).",
+            parse_mode="HTML",
+        )
+
+    if t_type == TOURNAMENT_SHOWDOWN:
+        await state.update_data(t_format=None, t_limit=TOURNAMENT_SHOWDOWN_LIMIT)
+        await message.answer(
+            f"📌 Лимит участников автоматически зафиксирован: <b>{_fmt_num(TOURNAMENT_SHOWDOWN_LIMIT)}</b>.",
+            parse_mode="HTML",
+        )
+        await _ask_datetime(message, state)
+        return
+
+    await state.set_state(TournamentStates.waiting_format)
+    await message.answer(
+        "⚔️ <b>Шаг 2/4</b> — Какой тип скрима будет между командами?",
+        parse_mode="HTML",
+        reply_markup=tournament_format_keyboard(),
+    )
+
+
+@router.message(TournamentStates.waiting_type)
+async def tournament_type_wrong(message: Message):
+    await message.answer(
+        "❌ Выбери тип кнопкой: 1V1, 2V2, 3V3 или ShowDown.\n"
+        "Для отмены нажми «❌ Отмена» или отправь /cancel.",
+    )
+
+
+@router.message(TournamentStates.waiting_format, F.text.in_(set(TOURNAMENT_FORMAT_LABELS.values())))
+async def tournament_format_chosen(message: Message, state: FSMContext):
+    """Шаг 2 принят (переиспользуем форматы Бо3/Бо5 из старых скримов)."""
+    raw = (message.text or "").strip()
+    fmt = next((key for key, label in TOURNAMENT_FORMAT_LABELS.items() if label == raw), "BO3")
+    await state.update_data(t_format=fmt)
+    await state.set_state(TournamentStates.waiting_limit_choice)
+    await message.answer(
+        "👥 <b>Шаг 3/4</b> — Хотите ли вы оставить/изменить лимит <b>команд</b> на турнир?\n\n"
+        "Лимит считается в командах: в ростере клана 4 человека, но на игру выходят по типу скрима "
+        "(3V3 → 3 игрока, запасной 4-й в лимит не входит).\n\n"
+        "• «♾ Без лимита команд» — заявки принимаются без ограничения;\n"
+        "• «🔢 Ввести число команд» — жёсткий лимит команд (сетка соберётся под любое число).",
+        parse_mode="HTML",
+        reply_markup=tournament_limit_keyboard(),
+    )
+
+
+@router.message(TournamentStates.waiting_format)
+async def tournament_format_wrong(message: Message):
+    await message.answer(
+        "❌ Выбери формат кнопкой: Бо3 или Бо5.\n"
+        "Для отмены нажми «❌ Отмена» или отправь /cancel.",
+    )
+
+
+@router.message(
+    TournamentStates.waiting_limit_choice,
+    F.text.in_({"♾ Без лимита команд", "🔢 Ввести число команд"}),
+)
+async def tournament_limit_choice(message: Message, state: FSMContext):
+    """Шаг 3: лимит задаётся в КОМАНДАХ (в ростере 4 человека, играют 3)."""
+    data = await state.get_data()
+    team_size = TOURNAMENT_TEAM_SIZE.get(data.get("t_type"), 1)
+    if (message.text or "").strip() == "♾ Без лимита команд":
+        await state.update_data(t_limit=None)
+        await _ask_datetime(message, state)
+        return
+    await state.set_state(TournamentStates.waiting_limit_value)
+    await message.answer(
+        "🔢 Введи лимит <b>команд</b> одним числом.\n\n"
+        f"Тип {hd.quote(str(data.get('t_type')))}: на игру от команды выходят {team_size} игрок(а), "
+        f"в ростере команды может быть до 4 человек (запасной не считается в лимит).\n"
+        f"Допустимый диапазон: {TOURNAMENT_MIN_TEAMS}–{_fmt_num(TOURNAMENT_MAX_TEAMS)} команд.\n"
+        "Для отмены нажми «❌ Отмена» или отправь /cancel.",
+        parse_mode="HTML",
+        reply_markup=tournament_cancel_keyboard(),
+    )
+
+
+@router.message(TournamentStates.waiting_limit_value)
+async def tournament_limit_value(message: Message, state: FSMContext):
+    """Ввод числа КОМАНД (не игроков). Кратность не требуется — сетка собирается под любое число."""
+    data = await state.get_data()
+    team_size = TOURNAMENT_TEAM_SIZE.get(data.get("t_type"), 1)
+    raw = (message.text or "").strip().replace(" ", "")
+    if not raw.isdigit():
+        await message.answer("❌ Нужно целое число команд. Попробуй ещё раз (например: 8).")
+        return
+    teams = int(raw)
+    if teams < TOURNAMENT_MIN_TEAMS or teams > TOURNAMENT_MAX_TEAMS:
+        await message.answer(
+            f"❌ Лимит должен быть от {TOURNAMENT_MIN_TEAMS} до {_fmt_num(TOURNAMENT_MAX_TEAMS)} команд. "
+            "Попробуй ещё раз."
+        )
+        return
+    await state.update_data(t_limit=teams)
+    await message.answer(
+        f"✅ Лимит: <b>{_fmt_num(teams)}</b> команд "
+        f"(≈ {_fmt_num(teams * team_size)} игроков на игру).",
+        parse_mode="HTML",
+    )
+    await _ask_datetime(message, state)
+
+
+@router.message(TournamentStates.waiting_datetime)
+async def tournament_datetime_received(message: Message, state: FSMContext):
+    """Шаг 4: нормализуем время готовой функцией из старых скримов и показываем итог."""
+    scheduled = _normalise_scheduled(message.text or "")
+    if not scheduled:
+        await message.answer(
+            "❌ Неверный формат даты. Введи так: 25.12 19:00 или 25.12.2026 19:00.\n"
+            "Для отмены нажми «❌ Отмена» или отправь /cancel.",
+        )
+        return
+    await state.update_data(t_datetime=scheduled)
+    data = await state.get_data()
+    await state.set_state(TournamentStates.waiting_confirm)
+    await message.answer(
+        _tournament_summary(data),
+        parse_mode="HTML",
+        reply_markup=tournament_confirm_keyboard(),
+    )
+
+
+@router.callback_query(F.data == "tour:confirm")
+async def tournament_confirm(call: CallbackQuery, state: FSMContext, bot: Bot):
+    """Этап 3, п.1: сохраняем турнир в БД и предлагаем анонс."""
+    data = await state.get_data()
+    if not data.get("t_type"):
+        await state.clear()
+        await call.answer("Сессия создания турнира истекла", show_alert=True)
+        return
+    await state.clear()
+    t_type = data.get("t_type")
+    fmt = data.get("t_format")
+    limit = data.get("t_limit")
+    when = data.get("t_datetime")
+    admin_name = call.from_user.username or call.from_user.full_name or str(call.from_user.id)
+
+    ensure_tournament_tables()
+    is_test = bool(data.get("t_is_test"))
+    tournament_id = create_tournament(
+        created_by=call.from_user.id,
+        created_by_name=str(admin_name),
+        t_type=str(t_type),
+        t_format=fmt,
+        team_limit=limit,
+        scheduled_text=str(when or ""),
+        bracket_slots=_bracket_slots_for(t_type, limit),
+        is_test=is_test,
+    )
+    summary = _tournament_summary(data)
+    await log_admin_action(
+        bot=bot,
+        admin_id=call.from_user.id,
+        admin_name=str(admin_name),
+        action_text=(
+            f"🏆 Создал {'ТЕСТОВЫЙ ' if is_test else ''}турнир #{tournament_id}: тип {t_type}, "
+            f"формат {fmt or '—'}, лимит {f'{limit} команд' if limit else 'без лимита команд'}, "
+            f"начало {when}."
+        ),
+    )
+    after_kb = tournament_test_keyboard(tournament_id) if is_test \
+        else tournament_publish_keyboard(tournament_id)
+    hint = ("Дальше можно добавить тестовые составы и запустить турнир, чтобы проверить сетку."
+            if is_test else
+            "Дальше можно опубликовать анонс: посты в клановых топиках «Турниры» "
+            "и рассылка зарегистрированным игрокам в ЛС.")
+    try:
+        await call.message.edit_text(
+            f"{summary}\n\n"
+            f"✅ <b>Турнир #{tournament_id} сохранён в базе.</b>\n{hint}",
+            parse_mode="HTML",
+            reply_markup=after_kb,
+        )
+    except Exception:
+        await call.message.answer(
+            f"✅ Турнир #{tournament_id} сохранён в базе.\n{hint}",
+            parse_mode="HTML",
+            reply_markup=after_kb,
+        )
+    await call.message.answer(
+        f"👤 Турнир создал: {hd.quote(str(admin_name))}.",
+        parse_mode="HTML",
+        reply_markup=admin_scrims_keyboard(),
+    )
+    await call.answer("Турнир сохранён")
+
+
+@router.callback_query(F.data == "tour:cancel")
+async def tournament_cancel_cb(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    try:
+        await call.message.edit_text("❌ Создание турнира отменено.", reply_markup=None)
+    except Exception:
+        pass
+    await call.message.answer("📂 Скримы и турниры", reply_markup=admin_scrims_keyboard())
+    await call.answer("Отменено")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ─── ТУРНИРЫ (Этап 3 ТЗ): БД, сетка с автопроходами/BYE, анонсы, рассылки ────
+# ══════════════════════════════════════════════════════════════════════════════
+# Таблицы живут в league/league.db, как и остальная игровая механика.
+# Миграция идемпотентная (CREATE TABLE IF NOT EXISTS + PRAGMA table_info),
+# сами файлы баз на сервере не трогаем и в гит не добавляем.
+
+TOURNAMENT_SETTINGS_PREFIX = "tournament_topic_"   # + clan_key (academy / squad / events)
+TOURNAMENT_CLANS = ("academy", "squad", "events")
+TOURNAMENT_DEFAULT_BRACKET_SIZE = 8                # превью-сетка, если лимит не задан
+TOURNAMENT_DM_PAUSE = 0.05                         # антиспам-пауза между ЛС
+
+TOURNAMENT_STATUS_LABEL = {
+    "registration": "🟢 Регистрация открыта",
+    "announced": "📣 Анонсирован",
+    "running": "⚔️ Идёт",
+    "finished": "🏁 Завершён",
+    "cancelled": "🚫 Отменён",
+}
+
+
+class TournamentSettingsStates(StatesGroup):
+    """Отдельная группа, чтобы не пересекаться с охранником мастера турниров."""
+    waiting_topics = State()
+
+
+class ResultStates(StatesGroup):
+    """Этап 5: сдача результата лидером (фото + текст → выбор победителя)."""
+    waiting_photo = State()   # фото с подписью (текстом)
+    waiting_winner = State()  # кто победил (кнопки)
+
+
+_TOURNAMENT_TABLES_READY = False
+
+
+def ensure_tournament_tables() -> None:
+    """Идемпотентная миграция таблиц турниров в league.db (один раз за процесс)."""
+    global _TOURNAMENT_TABLES_READY
+    if _TOURNAMENT_TABLES_READY:
+        return
+    conn = db.get_connection()
+    cur = conn.cursor()
+    cur.executescript("""
+        CREATE TABLE IF NOT EXISTS tournaments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_by INTEGER NOT NULL,
+            created_by_name TEXT DEFAULT '',
+            t_type TEXT NOT NULL,
+            t_format TEXT,
+            team_limit INTEGER,
+            scheduled_text TEXT DEFAULT '',
+            status TEXT DEFAULT 'registration',
+            bracket_slots TEXT DEFAULT '[]',
+            published_at DATETIME,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS tournament_participants (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tournament_id INTEGER NOT NULL,
+            league_id INTEGER NOT NULL,
+            team_name TEXT DEFAULT '',
+            team_tag TEXT DEFAULT '',
+            leader_id INTEGER,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (tournament_id, league_id),
+            FOREIGN KEY (tournament_id) REFERENCES tournaments(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_tournament_participants
+            ON tournament_participants (tournament_id);
+        CREATE TABLE IF NOT EXISTS tournament_matches (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tournament_id INTEGER NOT NULL,
+            round INTEGER NOT NULL DEFAULT 1,
+            pair_index INTEGER NOT NULL DEFAULT 0,
+            side_a TEXT,
+            side_b TEXT,
+            winner TEXT,
+            status TEXT DEFAULT 'scheduled',
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (tournament_id, round, pair_index),
+            FOREIGN KEY (tournament_id) REFERENCES tournaments(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_tournament_matches
+            ON tournament_matches (tournament_id, round);
+        CREATE TABLE IF NOT EXISTS match_reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tournament_id INTEGER NOT NULL,
+            match_id INTEGER NOT NULL,
+            reporter_id INTEGER NOT NULL,
+            team_name TEXT DEFAULT '',
+            opponent_name TEXT DEFAULT '',
+            claimed_winner TEXT DEFAULT '',
+            photo_file_id TEXT DEFAULT '',
+            comment TEXT DEFAULT '',
+            status TEXT DEFAULT 'pending',
+            decided_by INTEGER,
+            decided_at DATETIME,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (tournament_id) REFERENCES tournaments(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_match_reports ON match_reports (status, tournament_id);
+        CREATE TABLE IF NOT EXISTS tournament_posts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tournament_id INTEGER NOT NULL,
+            chat_id INTEGER NOT NULL,
+            message_id INTEGER NOT NULL,
+            kind TEXT DEFAULT 'bracket',
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (tournament_id, chat_id, kind),
+            FOREIGN KEY (tournament_id) REFERENCES tournaments(id) ON DELETE CASCADE
+        );
+    """)
+    cols = {row["name"] for row in cur.execute("PRAGMA table_info(tournaments)").fetchall()}
+    if "bracket_slots" not in cols:
+        cur.execute("ALTER TABLE tournaments ADD COLUMN bracket_slots TEXT DEFAULT '[]'")
+    if "published_at" not in cols:
+        cur.execute("ALTER TABLE tournaments ADD COLUMN published_at DATETIME")
+    # scheduled_at — машинное время старта для автозапуска (Этап 4, п.2)
+    if "scheduled_at" not in cols:
+        cur.execute("ALTER TABLE tournaments ADD COLUMN scheduled_at DATETIME")
+    # Тестовый режим: фейковые составы, посты только в админ-чат, без массовой рассылки
+    if "is_test" not in cols:
+        cur.execute("ALTER TABLE tournaments ADD COLUMN is_test INTEGER DEFAULT 0")
+    # Этап 5: фиксация обработки матча
+    mcols = {row["name"] for row in cur.execute("PRAGMA table_info(tournament_matches)").fetchall()}
+    if "resolved_by" not in mcols:
+        cur.execute("ALTER TABLE tournament_matches ADD COLUMN resolved_by INTEGER")
+    if "resolved_at" not in mcols:
+        cur.execute("ALTER TABLE tournament_matches ADD COLUMN resolved_at DATETIME")
+    cur.execute("""
+        UPDATE tournaments SET scheduled_at = (
+            SELECT substr(scheduled_text, 7, 4) || '-' || substr(scheduled_text, 4, 2) || '-'
+                   || substr(scheduled_text, 1, 2) || ' ' || substr(scheduled_text, 12, 5)
+        )
+        WHERE (scheduled_at IS NULL OR scheduled_at = '')
+          AND length(COALESCE(scheduled_text, '')) >= 16
+    """)
+    conn.commit()
+    conn.close()
+    _TOURNAMENT_TABLES_READY = True
+
+
+def _iso_from_scheduled_text(text: str):
+    """'25.12.2026 19:00' -> '2026-12-25 19:00' (для сортировки и сравнения в SQL)."""
+    raw = (text or "").strip()
+    for fmt in ("%d.%m.%Y %H:%M", "%Y-%m-%d %H:%M"):
+        try:
+            return datetime.strptime(raw, fmt).strftime("%Y-%m-%d %H:%M")
+        except ValueError:
+            continue
+    return None
+
+
+def is_test_tournament(row) -> bool:
+    """Тестовый турнир: та же механика, но посты в админ-чат и без массовой рассылки в ЛС."""
+    if row is None:
+        return False
+    try:
+        # sqlite3.Row не имеет .get(), обращаемся по ключу напрямую
+        return int(row["is_test"] or 0) == 1
+    except (KeyError, IndexError, TypeError, ValueError):
+        return False
+
+
+def create_tournament(created_by, created_by_name, t_type, t_format, team_limit,
+                      scheduled_text, bracket_slots, is_test: bool = False) -> int:
+    """Создаёт запись турнира и возвращает его id."""
+    ensure_tournament_tables()
+    conn = db.get_connection()
+    cur = conn.execute(
+        "INSERT INTO tournaments (created_by, created_by_name, t_type, t_format, team_limit, "
+        "scheduled_text, scheduled_at, status, bracket_slots, is_test) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, 'registration', ?, ?)",
+        (int(created_by), created_by_name or "", t_type, t_format, team_limit,
+         scheduled_text or "", _iso_from_scheduled_text(scheduled_text),
+         json.dumps(bracket_slots or [], ensure_ascii=False), 1 if is_test else 0),
+    )
+    conn.commit()
+    new_id = int(cur.lastrowid)
+    conn.close()
+    return new_id
+
+
+def get_tournament(tournament_id: int):
+    ensure_tournament_tables()
+    conn = db.get_connection()
+    row = conn.execute("SELECT * FROM tournaments WHERE id = ?", (int(tournament_id),)).fetchone()
+    conn.close()
+    return row
+
+
+def get_tournaments(limit: int = 10):
+    ensure_tournament_tables()
+    conn = db.get_connection()
+    rows = conn.execute(
+        "SELECT * FROM tournaments ORDER BY id DESC LIMIT ?", (int(limit),)
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+# ─── Этап 4: активные турниры, правка лимитов, матчи, автостарт ─────────────
+
+TOURNAMENT_ACTIVE_STATUSES = ("registration", "announced", "running")
+
+
+def get_active_tournaments():
+    """Все текущие (не завершённые и не отменённые) турниры."""
+    ensure_tournament_tables()
+    conn = db.get_connection()
+    rows = conn.execute(
+        "SELECT * FROM tournaments WHERE status IN (?, ?, ?) ORDER BY scheduled_at IS NULL, "
+        "scheduled_at, id DESC",
+        TOURNAMENT_ACTIVE_STATUSES,
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def get_due_tournaments(now_iso: str):
+    """Турниры, время старта которых уже наступило (для автозапуска)."""
+    ensure_tournament_tables()
+    conn = db.get_connection()
+    rows = conn.execute(
+        "SELECT * FROM tournaments WHERE status IN (?, ?) AND scheduled_at IS NOT NULL "
+        "AND scheduled_at <= ? ORDER BY scheduled_at",
+        ("registration", "announced", now_iso),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def update_tournament_limit(tournament_id: int, team_limit) -> None:
+    ensure_tournament_tables()
+    conn = db.get_connection()
+    conn.execute(
+        "UPDATE tournaments SET team_limit = ? WHERE id = ?",
+        (int(team_limit) if team_limit else None, int(tournament_id)),
+    )
+    conn.commit()
+    conn.close()
+
+
+def update_tournament_time(tournament_id: int, scheduled_text: str) -> None:
+    ensure_tournament_tables()
+    conn = db.get_connection()
+    conn.execute(
+        "UPDATE tournaments SET scheduled_text = ?, scheduled_at = ? WHERE id = ?",
+        (scheduled_text, _iso_from_scheduled_text(scheduled_text), int(tournament_id)),
+    )
+    conn.commit()
+    conn.close()
+
+
+def update_tournament_bracket(tournament_id: int, slots: list) -> None:
+    ensure_tournament_tables()
+    conn = db.get_connection()
+    conn.execute(
+        "UPDATE tournaments SET bracket_slots = ? WHERE id = ?",
+        (json.dumps(slots or [], ensure_ascii=False), int(tournament_id)),
+    )
+    conn.commit()
+    conn.close()
+
+
+def replace_tournament_matches(tournament_id: int, matches: list[dict]) -> None:
+    """Пересоздаёт пары 1-го круга (round=1)."""
+    ensure_tournament_tables()
+    conn = db.get_connection()
+    conn.execute("DELETE FROM tournament_matches WHERE tournament_id = ? AND round = 1",
+                 (int(tournament_id),))
+    for idx, m in enumerate(matches):
+        conn.execute(
+            "INSERT OR IGNORE INTO tournament_matches (tournament_id, round, pair_index, side_a, "
+            "side_b, winner, status) VALUES (?, 1, ?, ?, ?, ?, ?)",
+            (int(tournament_id), idx, m.get("side_a"), m.get("side_b"),
+             m.get("winner"), m.get("status", "scheduled")),
+        )
+    conn.commit()
+    conn.close()
+
+
+def get_tournament_matches(tournament_id: int, round_no: int = 1):
+    ensure_tournament_tables()
+    conn = db.get_connection()
+    rows = conn.execute(
+        "SELECT * FROM tournament_matches WHERE tournament_id = ? AND round = ? ORDER BY pair_index",
+        (int(tournament_id), int(round_no)),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def tournament_matches_exist(tournament_id: int) -> bool:
+    ensure_tournament_tables()
+    conn = db.get_connection()
+    row = conn.execute(
+        "SELECT 1 FROM tournament_matches WHERE tournament_id = ? LIMIT 1", (int(tournament_id),)
+    ).fetchone()
+    conn.close()
+    return row is not None
+
+
+def get_match(match_id: int):
+    ensure_tournament_tables()
+    conn = db.get_connection()
+    row = conn.execute("SELECT * FROM tournament_matches WHERE id = ?", (int(match_id),)).fetchone()
+    conn.close()
+    return row
+
+
+def set_match_winner(match_id: int, winner: str, status: str, admin_id: int) -> None:
+    ensure_tournament_tables()
+    conn = db.get_connection()
+    conn.execute(
+        "UPDATE tournament_matches SET winner = ?, status = ?, resolved_by = ?, "
+        "resolved_at = CURRENT_TIMESTAMP WHERE id = ?",
+        (winner, status, int(admin_id), int(match_id)),
+    )
+    conn.commit()
+    conn.close()
+
+
+def upsert_match_side(tournament_id: int, round_no: int, pair_index: int, side: str, team: str) -> int:
+    """Создаёт/дополняет матч в следующем круге, возвращает его id."""
+    ensure_tournament_tables()
+    conn = db.get_connection()
+    row = conn.execute(
+        "SELECT * FROM tournament_matches WHERE tournament_id = ? AND round = ? AND pair_index = ?",
+        (int(tournament_id), int(round_no), int(pair_index)),
+    ).fetchone()
+    if row:
+        match_id = int(row["id"])
+        col = "side_a" if side == "a" else "side_b"
+        conn.execute(f"UPDATE tournament_matches SET {col} = ? WHERE id = ?", (team, match_id))
+    else:
+        cur = conn.execute(
+            "INSERT INTO tournament_matches (tournament_id, round, pair_index, side_a, side_b, "
+            "status) VALUES (?, ?, ?, ?, ?, 'scheduled')",
+            (int(tournament_id), int(round_no), int(pair_index),
+             team if side == "a" else None, team if side == "b" else None),
+        )
+        match_id = int(cur.lastrowid)
+    conn.commit()
+    conn.close()
+    return match_id
+
+
+def create_match_report(tournament_id, match_id, reporter_id, team_name, opponent_name,
+                        claimed_winner, photo_file_id, comment) -> int:
+    ensure_tournament_tables()
+    conn = db.get_connection()
+    cur = conn.execute(
+        "INSERT INTO match_reports (tournament_id, match_id, reporter_id, team_name, "
+        "opponent_name, claimed_winner, photo_file_id, comment) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (int(tournament_id), int(match_id), int(reporter_id), team_name or "", opponent_name or "",
+         claimed_winner or "", photo_file_id or "", comment or ""),
+    )
+    conn.commit()
+    report_id = int(cur.lastrowid)
+    conn.close()
+    return report_id
+
+
+def get_match_report(report_id: int):
+    ensure_tournament_tables()
+    conn = db.get_connection()
+    row = conn.execute("SELECT * FROM match_reports WHERE id = ?", (int(report_id),)).fetchone()
+    conn.close()
+    return row
+
+
+def get_pending_reports(limit: int = 15):
+    ensure_tournament_tables()
+    conn = db.get_connection()
+    rows = conn.execute(
+        "SELECT * FROM match_reports WHERE status = 'pending' ORDER BY id DESC LIMIT ?", (int(limit),)
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def set_match_report_status(report_id: int, status: str, admin_id: int) -> None:
+    ensure_tournament_tables()
+    conn = db.get_connection()
+    conn.execute(
+        "UPDATE match_reports SET status = ?, decided_by = ?, decided_at = CURRENT_TIMESTAMP "
+        "WHERE id = ?", (status, int(admin_id), int(report_id)),
+    )
+    conn.commit()
+    conn.close()
+
+
+def has_pending_report(match_id: int) -> bool:
+    ensure_tournament_tables()
+    conn = db.get_connection()
+    row = conn.execute(
+        "SELECT 1 FROM match_reports WHERE match_id = ? AND status = 'pending' LIMIT 1",
+        (int(match_id),),
+    ).fetchone()
+    conn.close()
+    return row is not None
+
+
+# ─── Посты с сеткой (Этап 5, п.3: обновление с учётом лимита 2 дня) ─────────
+
+def save_bracket_post(tournament_id: int, chat_id: int, message_id: int, kind: str = "bracket") -> None:
+    ensure_tournament_tables()
+    conn = db.get_connection()
+    conn.execute(
+        "INSERT INTO tournament_posts (tournament_id, chat_id, message_id, kind) VALUES (?, ?, ?, ?) "
+        "ON CONFLICT (tournament_id, chat_id, kind) DO UPDATE SET message_id = excluded.message_id, "
+        "created_at = CURRENT_TIMESTAMP",
+        (int(tournament_id), int(chat_id), int(message_id), kind),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_bracket_posts(tournament_id: int, kind: str = "bracket"):
+    ensure_tournament_tables()
+    conn = db.get_connection()
+    rows = conn.execute(
+        "SELECT * FROM tournament_posts WHERE tournament_id = ? AND kind = ?",
+        (int(tournament_id), kind),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def delete_bracket_post(post_id: int) -> None:
+    ensure_tournament_tables()
+    conn = db.get_connection()
+    conn.execute("DELETE FROM tournament_posts WHERE id = ?", (int(post_id),))
+    conn.commit()
+    conn.close()
+
+
+# ─── Продвижение по сетке + матч за 3-е место (Этап 5, п.3-4) ───────────────
+
+def _bracket_size(row) -> int:
+    """Размер сетки: ближайшая степень двойки от числа зарегистрированных команд."""
+    count = len(get_tournament_participants(row["id"]))
+    size = 1
+    while size < max(2, count):
+        size *= 2
+    return size
+
+
+def _total_rounds(size: int) -> int:
+    return max(1, int(math.log2(max(2, size))))
+
+
+def _third_place_needed(size: int) -> bool:
+    """Матч за 3-е место имеет смысл, когда есть полуфиналы (4+ команды)."""
+    return _total_rounds(size) >= 2
+
+
+def _propagate_auto_advances(tournament_id: int) -> int:
+    """Продвигает победителей матчей с BYE (resolved_at ещё пустой) в следующий круг."""
+    row = get_tournament(tournament_id)
+    total = _total_rounds(_bracket_size(row))
+    moved = 0
+    for round_no in range(1, total + 1):
+        for m in get_tournament_matches(tournament_id, round_no):
+            if m["status"] != "bye" or not m["winner"] or m["resolved_at"] is not None:
+                continue
+            advance_winner(tournament_id, round_no, m["pair_index"], m["winner"])
+            conn = db.get_connection()
+            conn.execute(
+                "UPDATE tournament_matches SET resolved_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (int(m["id"]),),
+            )
+            conn.commit()
+            conn.close()
+            moved += 1
+    return moved
+
+
+def advance_winner(tournament_id: int, round_no: int, pair_index: int, winner: str) -> dict:
+    """Продвигает победителя в следующий круг (или фиксирует конец турнира)."""
+    row = get_tournament(tournament_id)
+    total = _total_rounds(_bracket_size(row))
+    info = {"next_match_id": None, "tournament_finished": False, "next_opponent": None}
+
+    if round_no >= total:
+        info["tournament_finished"] = True
+        return info
+
+    next_round = round_no + 1
+    next_pair = int(pair_index) // 2
+    side = "a" if int(pair_index) % 2 == 0 else "b"
+    match_id = upsert_match_side(tournament_id, next_round, next_pair, side, winner)
+    info["next_match_id"] = match_id
+    nxt = get_match(match_id)
+    if nxt and nxt["side_a"] and nxt["side_b"]:
+        info["next_opponent"] = nxt["side_b"] if side == "a" else nxt["side_a"]
+    return info
+
+
+def register_semifinal_loser(tournament_id: int, round_no: int, loser: str) -> bool:
+    """Этап 5, п.4: проигравший в полуфинале уходит в матч за 3-4 места (round = 0).
+
+    Возвращает True, когда обе команды матча за 3-е место уже известны.
+    """
+    row = get_tournament(tournament_id)
+    size = _bracket_size(row)
+    if not _third_place_needed(size):
+        return False
+    if round_no != _total_rounds(size) - 1:   # не полуфинал
+        return False
+    side = "b" if _third_has_side(tournament_id, "a") else "a"
+    match_id = upsert_match_side(tournament_id, 0, 0, side, loser)
+    m = get_match(match_id)
+    return bool(m and m["side_a"] and m["side_b"])
+
+
+def _third_has_side(tournament_id: int, side: str) -> bool:
+    col = "side_a" if side == "a" else "side_b"
+    conn = db.get_connection()
+    row = conn.execute(
+        f"SELECT {col} AS v FROM tournament_matches WHERE tournament_id = ? AND round = 0 "
+        "AND pair_index = 0", (int(tournament_id),),
+    ).fetchone()
+    conn.close()
+    return bool(row and row["v"])
+
+
+def get_third_place_match(tournament_id: int):
+    conn = db.get_connection()
+    row = conn.execute(
+        "SELECT * FROM tournament_matches WHERE tournament_id = ? AND round = 0 AND pair_index = 0",
+        (int(tournament_id),),
+    ).fetchone()
+    conn.close()
+    return row
+
+
+def set_tournament_status(tournament_id: int, status: str) -> None:
+    ensure_tournament_tables()
+    conn = db.get_connection()
+    conn.execute("UPDATE tournaments SET status = ? WHERE id = ?", (status, int(tournament_id)))
+    conn.commit()
+    conn.close()
+
+
+def mark_tournament_published(tournament_id: int) -> None:
+    ensure_tournament_tables()
+    conn = db.get_connection()
+    conn.execute(
+        "UPDATE tournaments SET status = CASE WHEN status = 'registration' THEN 'announced' "
+        "ELSE status END, published_at = CURRENT_TIMESTAMP WHERE id = ?",
+        (int(tournament_id),),
+    )
+    conn.commit()
+    conn.close()
+
+
+def add_tournament_participant(tournament_id: int, league_id: int, team_name, team_tag, leader_id) -> bool:
+    """Регистрирует состав. False — если состав уже в списке."""
+    ensure_tournament_tables()
+    conn = db.get_connection()
+    try:
+        conn.execute(
+            "INSERT INTO tournament_participants (tournament_id, league_id, team_name, team_tag, leader_id) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (int(tournament_id), int(league_id), team_name or "", team_tag or "", int(leader_id or 0)),
+        )
+        conn.commit()
+        return True
+    except Exception:
+        return False
+    finally:
+        conn.close()
+
+
+def get_tournament_participants(tournament_id: int):
+    ensure_tournament_tables()
+    conn = db.get_connection()
+    rows = conn.execute(
+        "SELECT * FROM tournament_participants WHERE tournament_id = ? ORDER BY id",
+        (int(tournament_id),),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def count_test_participants(tournament_id: int) -> int:
+    """Сколько в турнире фейковых тестовых составов (TEST-*)."""
+    ensure_tournament_tables()
+    conn = db.get_connection()
+    row = conn.execute(
+        "SELECT COUNT(*) AS c FROM tournament_participants WHERE tournament_id = ? "
+        "AND team_name LIKE ?",
+        (int(tournament_id), f"{TOURNAMENT_TEST_PREFIX}%"),
+    ).fetchone()
+    conn.close()
+    return int(row["c"] or 0) if row else 0
+
+
+def add_test_participants(tournament_id: int, amount: int, admin_id: int) -> int:
+    """Тестовые составы с leader_id = админ: все уведомления приходят ему в ЛС.
+
+    Так проверяется весь поток (приглашения, пары, сдача результата) без спама игрокам.
+    """
+    ensure_tournament_tables()
+    added = 0
+    conn = db.get_connection()
+    existing = conn.execute(
+        "SELECT COUNT(*) AS c FROM tournament_participants WHERE tournament_id = ?",
+        (int(tournament_id),),
+    ).fetchone()
+    start = int(existing["c"] or 0)
+    conn.close()
+    for i in range(1, int(amount) + 1):
+        name = f"{TOURNAMENT_TEST_PREFIX}{start + i:02d}"
+        if add_tournament_participant(tournament_id, 900000 + start + i, name, "TST", int(admin_id)):
+            added += 1
+    return added
+
+
+def clear_test_participants(tournament_id: int) -> int:
+    """Убирает тестовые составы и пересобирает слоты заново."""
+    ensure_tournament_tables()
+    conn = db.get_connection()
+    cur = conn.execute(
+        "DELETE FROM tournament_participants WHERE tournament_id = ? AND team_name LIKE ?",
+        (int(tournament_id), f"{TOURNAMENT_TEST_PREFIX}%"),
+    )
+    conn.commit()
+    removed = cur.rowcount or 0
+    conn.close()
+    return removed
+
+
+def get_participant_leaders(tournament_id: int):
+    """Лидеры зарегистрированных составов (для тестовой рассылки вместо массовой)."""
+    ensure_tournament_tables()
+    conn = db.get_connection()
+    rows = conn.execute(
+        "SELECT DISTINCT leader_id FROM tournament_participants "
+        "WHERE tournament_id = ? AND leader_id IS NOT NULL AND leader_id > 0",
+        (int(tournament_id),),
+    ).fetchall()
+    conn.close()
+    return [int(r["leader_id"]) for r in rows]
+
+
+async def get_tournament_topics() -> dict:
+    """Читает ID топиков «Турниры» из настроек vigarik.db (config.py не трогаем)."""
+    topics = {}
+    for clan in TOURNAMENT_CLANS:
+        try:
+            raw = await get_setting(f"{TOURNAMENT_SETTINGS_PREFIX}{clan}")
+        except Exception:
+            raw = None
+        if raw and str(raw).strip().lstrip("-").isdigit():
+            topics[clan] = int(str(raw).strip())
+    return topics
+
+
+async def save_tournament_topic(clan_key: str, topic_id: int) -> None:
+    await set_setting(f"{TOURNAMENT_SETTINGS_PREFIX}{clan_key}", str(int(topic_id)))
+
+
+# ─── Сетка: слоты и автопроходы/BYE ─────────────────────────────────────────
+
+def _bracket_slots_for(t_type: str, team_limit) -> list[str]:
+    """Список слотов превью-сетки под лимит (или под дефолт), с учётом BYE.
+
+    ShowDown — соло, слотов ровно лимит (10). Для командных типов слотов всегда
+    степень двойки: недостающие позиции заполняются BYE (автопроход).
+    """
+    if t_type == TOURNAMENT_SHOWDOWN:
+        return [f"Слот {i}" for i in range(1, TOURNAMENT_SHOWDOWN_LIMIT + 1)]
+    target = int(team_limit) if team_limit else TOURNAMENT_DEFAULT_BRACKET_SIZE
+    size = 1
+    while size < target:
+        size *= 2
+    slots = []
+    byes = size - target
+    real = [f"Команда {i}" for i in range(1, target + 1)]
+    # BYE распределяем в конец пар, чтобы «живые» команды встречались между собой
+    ordered: list[str] = []
+    insert_positions = set()
+    idx = size - 1
+    while byes > 0 and idx >= 0:
+        insert_positions.add(idx)
+        byes -= 1
+        idx -= 2
+    pos = 0
+    for i in range(size):
+        if i in insert_positions:
+            ordered.append("BYE")
+        else:
+            ordered.append(real[pos] if pos < len(real) else "BYE")
+            pos += 1
+    slots = ordered
+    return slots
+
+
+def _bracket_pairs_text(slots: list[str]) -> list[str]:
+    """Текстовое представление первого круга: A vs B, с пометкой автопрохода."""
+    lines = []
+    for i in range(0, len(slots), 2):
+        a = slots[i]
+        b = slots[i + 1] if i + 1 < len(slots) else "BYE"
+        if a == "BYE" and b == "BYE":
+            continue
+        if a == "BYE":
+            lines.append(f"{b} → автопроход (BYE)")
+        elif b == "BYE":
+            lines.append(f"{a} → автопроход (BYE)")
+        else:
+            lines.append(f"{a} 🆚 {b}")
+    return lines
+
+
+def _load_font(size: int):
+    """Шрифт с поддержкой кириллицы; при отсутствии — встроенный PIL-шрифт."""
+    for path in (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",
+    ):
+        try:
+            return ImageFont.truetype(path, size)
+        except Exception:
+            continue
+    try:
+        return ImageFont.load_default(size=size)
+    except Exception:
+        return ImageFont.load_default()
+
+
+def render_bracket_image(slots: list[str], title: str) -> bytes | None:
+    """Рисует PNG с сеткой. Возвращает None, если Pillow недоступен."""
+    if not PIL_AVAILABLE:
+        return None
+    try:
+        # сетка работает корректно только со степенью двойки — дополняем BYE
+        slots = list(slots or [])
+        size = 1
+        while size < max(2, len(slots)):
+            size *= 2
+        slots = slots + ["BYE"] * (size - len(slots))
+        total = max(2, len(slots))
+        rounds = max(1, int(math.log2(total)))
+        slot_h, slot_w, gap_x, pad = 92, 300, 78, 60
+        width = pad * 2 + rounds * slot_w + (rounds - 1) * gap_x
+        height = total * slot_h + pad * 2 + 110
+
+        img = Image.new("RGB", (width, height), (17, 21, 33))
+        draw = ImageDraw.Draw(img)
+        f_title = _load_font(46)
+        f_slot = _load_font(28)
+        f_small = _load_font(22)
+
+        draw.text((pad, 26), title, font=f_title, fill=(255, 214, 102))
+        draw.text((pad, 86), f"Сетка на {total} позиций · автопроходы (BYE) учтены",
+                  font=f_small, fill=(150, 165, 195))
+
+        def slot_box(x, y, text, muted=False):
+            draw.rounded_rectangle(
+                [x, y, x + slot_w, y + slot_h - 22], radius=10,
+                fill=(29, 36, 54) if not muted else (24, 30, 44),
+                outline=(86, 104, 148), width=2,
+            )
+            label = (text or "")[:22]
+            draw.text((x + 14, y + 12), label, font=f_slot,
+                      fill=(232, 238, 250) if not muted else (120, 135, 165))
+
+        # первый круг
+        y = pad + 110
+        positions = []
+        for slot in slots:
+            slot_box(pad, y, slot, muted=(slot == "BYE"))
+            positions.append((pad, y))
+            y += slot_h
+
+        # остальные круги
+        cur = positions
+        x = pad
+        for r in range(rounds - 1):
+            x += slot_w + gap_x
+            nxt = []
+            step = (cur[1][1] - cur[0][1]) * 2 if len(cur) > 1 else slot_h
+            for i in range(0, len(cur), 2):
+                y1, y2 = cur[i][1], cur[i + 1][1] if i + 1 < len(cur) else cur[i][1]
+                mid = (y1 + y2) // 2
+                draw.line([(x - gap_x + slot_w, y1 + (slot_h - 22) // 2), (x, mid)],
+                          fill=(86, 104, 148), width=2)
+                if i + 1 < len(cur):
+                    draw.line([(x - gap_x + slot_w, y2 + (slot_h - 22) // 2), (x, mid)],
+                              fill=(86, 104, 148), width=2)
+                draw.line([(x, mid), (x + slot_w, mid)], fill=(86, 104, 148), width=2)
+                slot_box(x, mid - (slot_h - 22) // 2, f"Победитель {r + 2}")
+                nxt.append((x, mid - (slot_h - 22) // 2))
+            cur = nxt
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+    except Exception as e:  # noqa: BLE001
+        logger.error(f"render_bracket_image error: {e}")
+        return None
+
+
+# ─── Тексты анонса ───────────────────────────────────────────────────────────
+
+def _limit_text(row) -> str:
+    if row["t_type"] == TOURNAMENT_SHOWDOWN:
+        return f"{_fmt_num(TOURNAMENT_SHOWDOWN_LIMIT)} соло-участников"
+    if row["team_limit"]:
+        team_size = TOURNAMENT_TEAM_SIZE.get(row["t_type"], 1)
+        return (f"{_fmt_num(row['team_limit'])} команд "
+                f"(≈ {_fmt_num(int(row['team_limit']) * team_size)} игроков на игру)")
+    return "♾ без лимита команд"
+
+
+def _participants_block(participants, limit_rows: int = 20) -> str:
+    if not participants:
+        return "Пока никто не зарегистрирован — стань первым!"
+    lines = []
+    for i, p in enumerate(participants[:limit_rows], start=1):
+        lines.append(f"{i}. {hd.quote(p['team_name'] or '—')} [{hd.quote(p['team_tag'] or '—')}]")
+    if len(participants) > limit_rows:
+        lines.append(f"... и ещё {len(participants) - limit_rows}")
+    return "\n".join(lines)
+
+
+def _announcement_text(row, participants, for_clan_post: bool = True) -> str:
+    typ = TOURNAMENT_TYPE_LABELS.get(row["t_type"], row["t_type"])
+    fmt = TOURNAMENT_FORMAT_LABELS.get(row["t_format"], "—") if row["t_format"] else "—"
+    status = TOURNAMENT_STATUS_LABEL.get(row["status"], row["status"])
+    lines = [
+        "🏆 <b>ТУРНИР VI GARIK SQUAD</b>",
+        "",
+        f"• Тип скрима: <b>{hd.quote(str(typ))}</b>",
+        f"• Формат: <b>{hd.quote(str(fmt))}</b>" if row["t_format"] else "• Формат: <b>—</b>",
+        f"• Лимит: <b>{_limit_text(row)}</b>",
+        f"• Начало: <b>{hd.quote(str(row['scheduled_text'] or '—'))}</b>",
+        f"• Статус: {hd.quote(str(status))}",
+        "",
+        "👥 <b>Участники</b>",
+        _participants_block(participants),
+    ]
+    if for_clan_post:
+        slots = json.loads(row["bracket_slots"] or "[]")
+        pairs = _bracket_pairs_text(slots)
+        if pairs:
+            lines += ["", "🗺 <b>Предварительная сетка (1-й круг)</b>"]
+            lines += [f"• {hd.quote(p)}" for p in pairs[:16]]
+            if len(pairs) > 16:
+                lines.append(f"... и ещё {len(pairs) - 16}")
+    lines += [
+        "",
+        "📌 В ростере команды может быть до 4 человек, на игру выходят по типу скрима — "
+        "запасной в лимит не входит. Участвовать могут составы из любого из трёх кланов сети "
+        "(Squad / Academy / Events).",
+        "Регистрация — по кнопке ниже (только для лидера состава).",
+    ]
+    return "\n".join(lines)
+
+
+def _announcement_caption(row) -> str:
+    """Короткая подпись к картинке (лимит Telegram — 1024 символа)."""
+    typ = TOURNAMENT_TYPE_LABELS.get(row["t_type"], row["t_type"])
+    return (
+        f"🏆 <b>Турнир #{row['id']} — {hd.quote(str(typ))}</b>\n"
+        f"🕐 {hd.quote(str(row['scheduled_text'] or '—'))}\n"
+        f"👥 Лимит: {_limit_text(row)}"
+    )
+
+
+def _no_composition_text() -> str:
+    return (
+        "⚠️ <b>У тебя нет состава</b>\n\n"
+        "Чтобы участвовать в турнире, нужно сформировать состав: он может включать "
+        "любых участников из трёх кланов сети (Squad / Academy / Events).\n\n"
+        "Открой раздел «Составы🏆 (BetaTest)» в меню и нажми «➕ Создать состав», "
+        "затем пригласи 3+ игроков. После этого регистрация на турнир станет доступна."
+    )
+
+
+# ─── Публикация анонса: топики + рассылка в ЛС ───────────────────────────────
+
+async def _post_to_clan_topics(bot: Bot, row, participants) -> tuple[list[str], list[str]]:
+    """Пост-анонс с картинкой сетки в топик «Турниры» каждого клана."""
+    sent, failed = [], []
+    png = render_bracket_image(json.loads(row["bracket_slots"] or "[]"),
+                               f"Турнир #{row['id']} · {row['t_type']}"
+                               + (" · ТЕСТ" if is_test_tournament(row) else ""))
+    # 🧪 Тестовый турнир: посты уходят только в админ-чат, клановые топики не трогаем
+    if is_test_tournament(row):
+        if not config.ADMIN_CHAT_ID:
+            return sent, ["ADMIN_CHAT_ID не задан в config.py"]
+        targets = [(int(config.ADMIN_CHAT_ID), None, "🧪 админ-чат")]
+    else:
+        topics = await get_tournament_topics()
+        if not topics:
+            return sent, ["топики не настроены (⚙️ Топики турниров)"]
+        targets = [
+            ((config.CLAN_CHATS.get(clan) or {}).get("chat_id"), topic, f"{clan} (топик {topic})")
+            for clan, topic in topics.items()
+        ]
+    for chat_id, topic_id, label in targets:
+        if not chat_id or (not topic_id and not is_test_tournament(row)):
+            failed.append(f"{label}: не задан chat_id/топик")
+            continue
+        try:
+            if png:
+                await bot.send_photo(
+                    chat_id=chat_id,
+                    message_thread_id=topic_id,
+                    photo=BufferedInputFile(png, filename=f"tournament_{row['id']}_bracket.png"),
+                    caption=_announcement_caption(row),
+                    parse_mode="HTML",
+                )
+                await bot.send_message(
+                    chat_id=chat_id,
+                    message_thread_id=topic_id,
+                    text=_announcement_text(row, participants),
+                    parse_mode="HTML",
+                )
+            else:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    message_thread_id=topic_id,
+                    text=_announcement_text(row, participants),
+                    parse_mode="HTML",
+                )
+            sent.append(label)
+        except Exception as e:
+            logger.warning(f"tournament announce to {label} failed: {e}")
+            failed.append(f"{label}: {e}")
+    return sent, failed
+
+
+async def _dm_registered_players(bot: Bot, row) -> dict:
+    """Рассылка всем зарегистрированным: приглашение + проверка наличия состава.
+
+    🧪 Тестовый турнир: массовая рассылка не выполняется вообще — приглашения
+    получают только лидеры составов, уже записанных в этот турнир.
+    """
+    stats = {"total": 0, "with_team": 0, "without_team": 0, "not_leader": 0,
+             "invited": 0, "skipped": 0, "failed": 0, "mode": "full"}
+    if is_test_tournament(row):
+        stats["mode"] = "test"
+        for leader_id in get_participant_leaders(row["id"]):
+            stats["total"] += 1
+            try:
+                await bot.send_message(
+                    int(leader_id),
+                    "🧪 <b>ТЕСТ</b> · Открыта регистрация на турнир #"
+                    f"{row['id']}\n"
+                    f"• Тип: {hd.quote(TOURNAMENT_TYPE_LABELS.get(row['t_type'], row['t_type']))}\n"
+                    f"• Лимит: {_limit_text(row)}\n"
+                    f"• Начало: {hd.quote(str(row['scheduled_text'] or '—'))}\n\n"
+                    "Массовая рассылка в тестовом режиме отключена: это сообщение получили "
+                    "только лидеры составов, записанных в турнир.",
+                    parse_mode="HTML",
+                    reply_markup=tournament_register_keyboard(row["id"]),
+                )
+                stats["with_team"] += 1
+                stats["invited"] += 1
+                await asyncio.sleep(TOURNAMENT_DM_PAUSE)
+            except Exception:
+                stats["failed"] += 1
+        return stats
+    try:
+        members = await get_all_members()
+    except Exception as e:
+        logger.error(f"tournament dm: get_all_members failed: {e}")
+        return stats
+    already_ids = {int(p["league_id"]) for p in get_tournament_participants(row["id"])}
+
+    for m in members:
+        stats["total"] += 1
+        uid = m.get("user_id")
+        if not uid or m.get("registered") != 1:
+            stats["skipped"] += 1
+            continue
+        composition = None
+        try:
+            composition = get_user_league(int(uid))
+        except Exception:
+            composition = None
+        try:
+            if not composition:
+                stats["without_team"] += 1
+                await bot.send_message(int(uid), _no_composition_text(), parse_mode="HTML")
+            elif int(composition["leader_id"]) == int(uid):
+                stats["with_team"] += 1
+                if int(composition["id"]) in already_ids:
+                    text = (
+                        f"🏆 <b>Турнир #{row['id']}</b> — твой состав "
+                        f"{hd.quote(composition['name'])} [{hd.quote(composition['tag'])}] "
+                        f"уже зарегистрирован.\n"
+                        f"🕐 {hd.quote(str(row['scheduled_text'] or '—'))}"
+                    )
+                else:
+                    text = (
+                        f"🏆 <b>Открыта регистрация на турнир #{row['id']}</b>\n\n"
+                        f"• Тип: {hd.quote(TOURNAMENT_TYPE_LABELS.get(row['t_type'], row['t_type']))}\n"
+                        f"• Формат: {hd.quote(TOURNAMENT_FORMAT_LABELS.get(row['t_format'], '—'))}\n"
+                        f"• Лимит: {_limit_text(row)}\n"
+                        f"• Начало: {hd.quote(str(row['scheduled_text'] or '—'))}\n\n"
+                        f"Твой состав: {hd.quote(composition['name'])} "
+                        f"[{hd.quote(composition['tag'])}] (MMR {int(composition['mmr'] or 0)}🌟)."
+                    )
+                await bot.send_message(
+                    int(uid), text, parse_mode="HTML",
+                    reply_markup=tournament_register_keyboard(row["id"]),
+                )
+                stats["invited"] += 1
+            else:
+                stats["not_leader"] += 1
+                await bot.send_message(
+                    int(uid),
+                    "🏆 Открыта регистрация на турнир сети! Регистрировать состав может только "
+                    "его лидер — передай ему эту информацию.",
+                    parse_mode="HTML",
+                )
+            await asyncio.sleep(TOURNAMENT_DM_PAUSE)
+        except Exception:
+            stats["failed"] += 1
+    return stats
+
+
+async def _send_preview(call: CallbackQuery, row, as_caption: bool = False):
+    """Картинка сетки (или текстовая сетка, если Pillow отсутствует)."""
+    slots = json.loads(row["bracket_slots"] or "[]")
+    png = render_bracket_image(slots, f"Турнир #{row['id']} · {row['t_type']}")
+    if png:
+        await call.message.answer_photo(
+            photo=BufferedInputFile(png, filename=f"tournament_{row['id']}_bracket.png"),
+            caption=_announcement_caption(row) if as_caption else None,
+            parse_mode="HTML",
+        )
+        return
+    pairs = _bracket_pairs_text(slots)
+    text = "\n".join([f"🗺 <b>Сетка турнира #{row['id']}</b>"] + [f"• {hd.quote(p)}" for p in pairs])
+    text += "\n\nℹ️ Библиотека Pillow не установлена — картинка сетки недоступна. Установи: pip install Pillow"
+    await call.message.answer(text, parse_mode="HTML")
+
+
+# ─── Этап 4: сборка сетки, автостарт, уведомления капитанам ─────────────────
+
+def _build_bracket_slots(participants, t_type: str) -> list:
+    """Слоты 1-го круга по факту регистрации. None = BYE (автопроход).
+
+    BYE расставляются в шахматном порядке, чтобы «живые» команды расходились
+    по сетке и не выбивали друг друга в первом же круге.
+    """
+    names = [p["team_name"] or f"#{p['league_id']}" for p in participants]
+    if t_type == TOURNAMENT_SHOWDOWN:
+        return names  # соло: слот = участник
+    size = 1
+    while size < max(2, len(names)):
+        size *= 2
+    byes = size - len(names)
+    slots: list = []
+    name_idx = 0
+    for i in range(size):
+        if byes > 0 and i % 2 == 1:
+            slots.append(None)
+            byes -= 1
+        else:
+            slots.append(names[name_idx] if name_idx < len(names) else None)
+            name_idx += 1
+    return slots
+
+
+def _bracket_matches(slots: list, t_type: str) -> list[dict]:
+    """Пары 1-го круга. Для ShowDown — один «мачт» со всеми соло-участниками."""
+    if t_type == TOURNAMENT_SHOWDOWN:
+        return [{"side_a": s, "side_b": None, "winner": None, "status": "solo"} for s in slots]
+    matches = []
+    for i in range(0, len(slots), 2):
+        a = slots[i] if i < len(slots) else None
+        b = slots[i + 1] if i + 1 < len(slots) else None
+        if a is None and b is None:
+            continue
+        if a is None:
+            matches.append({"side_a": None, "side_b": b, "winner": b, "status": "bye"})
+        elif b is None:
+            matches.append({"side_a": a, "side_b": None, "winner": a, "status": "bye"})
+        else:
+            matches.append({"side_a": a, "side_b": b, "winner": None, "status": "scheduled"})
+    return matches
+
+
+async def _leader_mention(leader_id) -> str:
+    """@username лидера для уведомления капитану (или ID, если юзернейма нет)."""
+    try:
+        m = await get_member(int(leader_id))
+    except Exception:
+        m = None
+    uname = (m or {}).get("username") if m else None
+    if uname and str(uname).lower() not in ("unknown", "none"):
+        return f"@{uname}"
+    return f"ID {leader_id}"
+
+
+def _stage_label(row, round_no: int) -> str:
+    """Человекочитаемая стадия: 1/8 финала, полуфинал, финал, матч за 3-4 места."""
+    if int(round_no) == 0:
+        return "Матч за 3-4 места"
+    total = _total_rounds(_bracket_size(row))
+    if int(round_no) >= total:
+        return "Финал"
+    if int(round_no) == total - 1:
+        return "Полуфинал"
+    return f"1/{_fmt_num(2 ** (total - int(round_no)))} финала"
+
+
+def _pairs_schedule_text(matches) -> str:
+    lines = []
+    for i, m in enumerate(matches, start=1):
+        a, b = m.get("side_a"), m.get("side_b")
+        if m.get("status") == "bye":
+            lines.append(f"{_fmt_num(i)}. {hd.quote(str(b or a))} → автопроход (BYE)")
+        elif m.get("status") == "solo":
+            lines.append(f"{_fmt_num(i)}. {hd.quote(str(a))} — соло-слот ShowDown")
+        else:
+            lines.append(f"{_fmt_num(i)}. {hd.quote(str(a))} 🆚 {hd.quote(str(b))}")
+    return "\n".join(lines) if lines else "Пар пока нет."
+
+
+def _tournament_start_text(row, participants, matches) -> str:
+    typ = TOURNAMENT_TYPE_LABELS.get(row["t_type"], row["t_type"])
+    fmt = TOURNAMENT_FORMAT_LABELS.get(row["t_format"], "—") if row["t_format"] else "—"
+    lines = [
+        "🚨 <b>ТУРНИР НАЧАЛСЯ!</b>",
+        "",
+        f"• Турнир: <b>#{row['id']} — {hd.quote(str(typ))}</b>",
+        f"• Формат: <b>{hd.quote(str(fmt))}</b>",
+        f"• Время: <b>{hd.quote(str(row['scheduled_text'] or '—'))}</b>",
+        f"• Участников: <b>{_fmt_num(len(participants))}</b>",
+        "",
+        "🗺 <b>Расписание пар (1-й круг)</b>",
+        _pairs_schedule_text(matches),
+        "",
+        "Победители пар проходят дальше — следующий круг запустит администрация.",
+    ]
+    return "\n".join(lines)
+
+
+async def _post_tournament_start(bot: Bot, row, participants, matches) -> tuple[list[str], list[str]]:
+    """Финальный пост с сеткой и парами: кланам — в топик «Турниры», тесту — в админ-чат."""
+    sent, failed = [], []
+    png = render_bracket_image(
+        [s if s else "BYE" for s in _build_bracket_slots(participants, row["t_type"])],
+        f"Турнир #{row['id']} · {row['t_type']} · СТАРТ"
+        + (" · ТЕСТ" if is_test_tournament(row) else ""),
+    )
+    text = _tournament_start_text(row, participants, matches)
+    caption = _bracket_status_caption(row)
+    # 🧪 Тестовый турнир: посты старта — только в админ-чат, клановые топики не трогаем
+    if is_test_tournament(row):
+        if not config.ADMIN_CHAT_ID:
+            return sent, ["ADMIN_CHAT_ID не задан в config.py"]
+        targets = [(int(config.ADMIN_CHAT_ID), None, "🧪 админ-чат")]
+    else:
+        topics = await get_tournament_topics()
+        if not topics:
+            return sent, ["топики не настроены (⚙️ Топики турниров)"]
+        targets = [
+            ((config.CLAN_CHATS.get(clan) or {}).get("chat_id"), topic, f"{clan} (топик {topic})")
+            for clan, topic in topics.items()
+        ]
+    for chat_id, thread_id, label in targets:
+        if not chat_id or (not thread_id and not is_test_tournament(row)):
+            failed.append(f"{label}: нет chat_id/топика")
+            continue
+        try:
+            # пост с сеткой — именно его потом обновляем по мере результатов
+            if png:
+                post = await bot.send_photo(
+                    chat_id=chat_id,
+                    message_thread_id=thread_id,
+                    photo=BufferedInputFile(png, filename=f"tournament_{row['id']}_start.png"),
+                    caption=caption[:1024],
+                    parse_mode="HTML",
+                )
+                save_bracket_post(row["id"], chat_id, post.message_id)
+            await bot.send_message(
+                chat_id=chat_id, message_thread_id=thread_id, text=text, parse_mode="HTML",
+            )
+            sent.append(label)
+        except Exception as e:
+            logger.warning(f"tournament start post to {label} failed: {e}")
+            failed.append(f"{label}: {e}")
+    return sent, failed
+
+
+async def start_tournament(bot: Bot, row) -> str:
+    """Старт турнира: сетка + пары, пост в топики, ЛС участникам и капитанам."""
+    ensure_tournament_tables()
+    tid = int(row["id"])
+    participants = get_tournament_participants(tid)
+    if not participants:
+        set_tournament_status(tid, "cancelled")
+        return f"⛔ Турнир #{tid} отменён: никто не зарегистрировался."
+
+    if row["t_type"] == TOURNAMENT_SHOWDOWN and len(participants) > TOURNAMENT_SHOWDOWN_LIMIT:
+        participants = participants[:TOURNAMENT_SHOWDOWN_LIMIT]
+
+    slots = _build_bracket_slots(participants, row["t_type"])
+    matches = _bracket_matches(slots, row["t_type"])
+    update_tournament_bracket(tid, [s if s else "BYE" for s in slots])
+    replace_tournament_matches(tid, matches)
+    # победители BYE-матчей сразу продвигаются в следующий круг
+    _propagate_auto_advances(tid)
+    set_tournament_status(tid, "running")
+
+    topics_sent, topics_failed = await _post_tournament_start(bot, row, participants, matches)
+
+    # ── ЛС капитанам (п.3 ТЗ): соперник + @username его лидера
+    by_name = {p["team_name"]: p for p in participants}
+    notified, not_leader, failed_dm = 0, 0, 0
+    fmt = TOURNAMENT_FORMAT_LABELS.get(row["t_format"], "Бо3") if row["t_format"] else "Бо3"
+    if row["t_type"] == TOURNAMENT_SHOWDOWN:
+        for i, p in enumerate(participants, start=1):
+            try:
+                await bot.send_message(
+                    int(p["leader_id"]),
+                    f"🚨 <b>ShowDown турнир #{tid} начался!</b>\n"
+                    f"• Твой слот: <b>{_fmt_num(i)}</b> из {_fmt_num(len(participants))}\n"
+                    f"• Состав: {hd.quote(p['team_name'] or '—')}\n"
+                    f"• Время: {hd.quote(str(row['scheduled_text'] or '—'))}\n\n"
+                    f"Удачи! Скриншоты результата отправляй администрации.",
+                    parse_mode="HTML",
+                )
+                notified += 1
+                await asyncio.sleep(TOURNAMENT_DM_PAUSE)
+            except Exception:
+                failed_dm += 1
+    else:
+        for m in matches:
+            if m.get("status") == "bye":
+                try:
+                    p = by_name.get(m.get("winner"))
+                    if p and p["leader_id"]:
+                        await bot.send_message(
+                            int(p["leader_id"]),
+                            f"⚔️ <b>Турнир #{tid}: у вас автопроход (BYE)</b> в 1-м круге.\n"
+                            f"Состав {hd.quote(p['team_name'] or '—')} сразу проходит дальше — "
+                            f"ждите соперника в следующем круге.",
+                            parse_mode="HTML",
+                        )
+                        notified += 1
+                        await asyncio.sleep(TOURNAMENT_DM_PAUSE)
+                except Exception:
+                    failed_dm += 1
+                continue
+            a, b = by_name.get(m.get("side_a")), by_name.get(m.get("side_b"))
+            if not a or not b:
+                continue
+            try:
+                opp_b = await _leader_mention(b["leader_id"])
+                await bot.send_message(
+                    int(a["leader_id"]),
+                    f"⚔️ У вас скрим {hd.quote(fmt)} против команды "
+                    f"{hd.quote(str(b['team_name'] or '—'))}, спишитесь с их лидером: "
+                    f"<b>{hd.quote(opp_b)}</b>.\n"
+                    f"• Турнир #{tid} · {hd.quote(str(row['scheduled_text'] or '—'))}\n"
+                    f"• Тип: {hd.quote(TOURNAMENT_TYPE_LABELS.get(row['t_type'], row['t_type']))}",
+                    parse_mode="HTML",
+                )
+                notified += 1
+            except Exception:
+                failed_dm += 1
+            await asyncio.sleep(TOURNAMENT_DM_PAUSE)
+            try:
+                opp_a = await _leader_mention(a["leader_id"])
+                await bot.send_message(
+                    int(b["leader_id"]),
+                    f"⚔️ У вас скрим {hd.quote(fmt)} против команды "
+                    f"{hd.quote(str(a['team_name'] or '—'))}, спишитесь с их лидером: "
+                    f"<b>{hd.quote(opp_a)}</b>.\n"
+                    f"• Турнир #{tid} · {hd.quote(str(row['scheduled_text'] or '—'))}\n"
+                    f"• Тип: {hd.quote(TOURNAMENT_TYPE_LABELS.get(row['t_type'], row['t_type']))}",
+                    parse_mode="HTML",
+                )
+                notified += 1
+            except Exception:
+                failed_dm += 1
+            await asyncio.sleep(TOURNAMENT_DM_PAUSE)
+
+    report = (
+        f"🚀 <b>Турнир #{tid} запущен</b>\n"
+        f"• участников: {_fmt_num(len(participants))}\n"
+        f"• пар 1-го круга: {_fmt_num(len(matches))}\n"
+        f"• посты в топиках: ✅ {len(topics_sent)} / ❌ {len(topics_failed)}\n"
+        f"• уведомлений капитанам/участникам: {notified}, ошибок: {failed_dm}"
+    )
+    if topics_failed:
+        report += "\n❌ Не отправлено: " + "; ".join(topics_failed)
+    return report
+
+
+async def tournament_scheduler_task(bot: Bot) -> None:
+    """Этап 4, п.2: автозапуск турниров в назначенное время."""
+    await asyncio.sleep(20)
+    logger.info("tournament scheduler started")
+    while True:
+        try:
+            now_iso = datetime.now().strftime("%Y-%m-%d %H:%M")
+            for row in get_due_tournaments(now_iso):
+                try:
+                    report = await start_tournament(bot, row)
+                    logger.info(f"auto-start tournament #{row['id']}: ok")
+                    await log_admin_action(
+                        bot=bot,
+                        admin_id=int(row["created_by"] or 0),
+                        admin_name=row["created_by_name"] or "auto",
+                        action_text=f"⏰ Автозапуск турнира #{row['id']} по расписанию.",
+                    )
+                    try:
+                        await bot.send_message(int(row["created_by"]), report, parse_mode="HTML")
+                    except Exception:
+                        pass
+                except Exception as e:
+                    logger.error(f"auto-start tournament #{row['id']} failed: {e}")
+        except Exception as e:
+            logger.error(f"tournament scheduler error: {e}")
+        await asyncio.sleep(30)
+
+
+@router.startup()
+async def on_tournament_scheduler_start(**kwargs):
+    """Старт фоновой задачи без правок main.py (Router.startup пробрасывается диспетчером).
+
+    Бот достаётся из kwargs (aiogram передаёт bot в startup), с фоллбеком на
+    текущий контекст — чтобы запуск не зависел от версии aiogram.
+    """
+    bot = kwargs.get("bot")
+    if bot is None:
+        try:
+            bot = Bot.get_current()
+        except Exception:
+            bot = None
+    if bot is None:
+        logger.warning("tournament scheduler: bot not available on startup")
+        return
+    try:
+        asyncio.create_task(tournament_scheduler_task(bot))
+        logger.info("tournament scheduler task created")
+    except Exception as e:
+        logger.error(f"Не удалось запустить планировщик турниров: {e}")
+
+
+# ─── Раздел «⚔️ Текущие турниры» (Этап 4, п.1) ──────────────────────────────
+
+@router.message(F.text == "⚔️ Текущие турниры")
+async def admin_open_current_tournaments(message: Message):
+    member = await get_member(message.from_user.id)
+    if not member or not has_role(member, "vice"):
+        await message.answer("⛔ Доступ только для Вице Президент и выше.")
+        return
+    rows = get_active_tournaments()
+    if not rows:
+        await message.answer(
+            "⚔️ Активных турниров нет.\nСоздай новый через «🏆 Создание турнира».",
+            reply_markup=admin_scrims_keyboard(),
+        )
+        return
+    lines = ["⚔️ <b>Текущие турниры</b>", ""]
+    for r in rows:
+        when = r["scheduled_text"] or "—"
+        soon = " ⏰" if r["scheduled_at"] and r["scheduled_at"] <= datetime.now().strftime("%Y-%m-%d %H:%M") else ""
+        lines.append(
+            f"{'🧪 ' if is_test_tournament(r) else ''}#{r['id']} · {hd.quote(str(r['t_type']))} · "
+            f"{hd.quote(str(when))}{soon} · "
+            f"{hd.quote(TOURNAMENT_STATUS_LABEL.get(r['status'], r['status']))} · "
+            f"👥 {_fmt_num(len(get_tournament_participants(r['id'])))}"
+        )
+    lines += ["", "⏰ — время старта уже наступило, турнир запустится автоматически."]
+    await message.answer("\n".join(lines), parse_mode="HTML",
+                         reply_markup=tournament_current_list_keyboard(rows))
+
+
+@router.callback_query(F.data == "tour_cur:list")
+async def admin_current_tournaments_refresh(call: CallbackQuery):
+    if not await _cb_is_admin(call.from_user.id):
+        await call.answer("⛔ Нет прав", show_alert=True)
+        return
+    rows = get_active_tournaments()
+    try:
+        await call.message.delete()
+    except Exception:
+        pass
+    if not rows:
+        await call.message.answer("⚔️ Активных турниров нет.", reply_markup=admin_scrims_keyboard())
+        await call.answer("Обновлено")
+        return
+    lines = ["⚔️ <b>Текущие турниры</b>", ""]
+    for r in rows:
+        lines.append(
+            f"#{r['id']} · {hd.quote(str(r['t_type']))} · "
+            f"{hd.quote(str(r['scheduled_text'] or '—'))} · "
+            f"{hd.quote(TOURNAMENT_STATUS_LABEL.get(r['status'], r['status']))} · "
+            f"👥 {_fmt_num(len(get_tournament_participants(r['id'])))}"
+        )
+    await call.message.answer("\n".join(lines), parse_mode="HTML",
+                              reply_markup=tournament_current_list_keyboard(rows))
+    await call.answer("Обновлено")
+
+
+@router.callback_query(F.data.startswith("tour_cur:open:"))
+async def admin_current_tournament_card(call: CallbackQuery):
+    if not await _cb_is_admin(call.from_user.id):
+        await call.answer("⛔ Нет прав", show_alert=True)
+        return
+    row = get_tournament(int(call.data.rsplit(":", 1)[-1]))
+    if not row:
+        await call.answer("Турнир не найден", show_alert=True)
+        return
+    participants = get_tournament_participants(row["id"])
+    matches = get_tournament_matches(row["id"], 1)
+    auto = ""
+    if row["scheduled_at"] and row["status"] in ("registration", "announced"):
+        auto = "\n⏰ Автозапуск по расписанию включён."
+    text = (
+        f"⚔️ <b>Текущий турнир #{row['id']}</b>\n"
+        f"• Тип: {hd.quote(TOURNAMENT_TYPE_LABELS.get(row['t_type'], row['t_type']))}\n"
+        f"• Формат: {hd.quote(TOURNAMENT_FORMAT_LABELS.get(row['t_format'], '—'))}\n"
+        f"• Лимит: {_limit_text(row)}\n"
+        f"• Начало: {hd.quote(str(row['scheduled_text'] or '—'))}\n"
+        f"• Статус: {hd.quote(TOURNAMENT_STATUS_LABEL.get(row['status'], row['status']))}\n\n"
+        f"👥 Поданных составов: <b>{_fmt_num(len(participants))}</b>\n"
+        f"{_participants_block(participants, 15)}\n\n"
+        f"🗺 Пар 1-го круга: {_fmt_num(len(matches))}{auto}"
+    )
+    try:
+        await call.message.edit_text(text, parse_mode="HTML",
+                                     reply_markup=tournament_current_admin_keyboard(row["id"]))
+    except Exception:
+        await call.message.answer(text, parse_mode="HTML",
+                                  reply_markup=tournament_current_admin_keyboard(row["id"]))
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("tour_cur:limit:"))
+async def admin_current_limit_ask(call: CallbackQuery, state: FSMContext):
+    if not await _cb_is_admin(call.from_user.id):
+        await call.answer("⛔ Нет прав", show_alert=True)
+        return
+    tid = int(call.data.rsplit(":", 1)[-1])
+    row = get_tournament(tid)
+    if not row:
+        await call.answer("Турнир не найден", show_alert=True)
+        return
+    await state.update_data(edit_tournament_id=tid)
+    await state.set_state(TournamentStates.waiting_new_limit)
+    cur = row["team_limit"]
+    await call.message.answer(
+        f"🔢 Текущий лимит турнира #{tid}: <b>{_fmt_num(cur) if cur else '♾ без лимита'}</b> команд.\n\n"
+        f"Введи новое число команд ({TOURNAMENT_MIN_TEAMS}–{_fmt_num(TOURNAMENT_MAX_TEAMS)}) "
+        f"или <code>0</code>, чтобы убрать лимит.\n"
+        "Для отмены — /cancel или «❌ Отмена».",
+        parse_mode="HTML",
+        reply_markup=tournament_cancel_keyboard(),
+    )
+    await call.answer()
+
+
+@router.message(TournamentStates.waiting_new_limit)
+async def admin_current_limit_save(message: Message, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    tid = data.get("edit_tournament_id")
+    raw = (message.text or "").strip().replace(" ", "")
+    if not raw.isdigit():
+        await message.answer("❌ Нужно целое число команд (или 0 — без лимита). Попробуй ещё раз.")
+        return
+    value = int(raw)
+    if value == 0:
+        update_tournament_limit(tid, None)
+        new_txt = "♾ без лимита команд"
+    elif TOURNAMENT_MIN_TEAMS <= value <= TOURNAMENT_MAX_TEAMS:
+        update_tournament_limit(tid, value)
+        new_txt = f"{_fmt_num(value)} команд"
+    else:
+        await message.answer(
+            f"❌ Лимит должен быть 0 (без лимита) или от {TOURNAMENT_MIN_TEAMS} "
+            f"до {_fmt_num(TOURNAMENT_MAX_TEAMS)}. Попробуй ещё раз."
+        )
+        return
+    await state.clear()
+    row = get_tournament(tid)
+    participants = get_tournament_participants(tid)
+    over = ""
+    if row["team_limit"] and len(participants) > int(row["team_limit"]):
+        over = (f"\n⚠️ Уже подано {_fmt_num(len(participants))} составов — "
+                "лишние будут отклоняться, но уже зарегистрированные не удаляются.")
+    await log_admin_action(
+        bot=bot, admin_id=message.from_user.id,
+        admin_name=message.from_user.username or message.from_user.full_name or "admin",
+        action_text=f"🔢 Изменил лимит турнира #{tid} на {new_txt}.",
+    )
+    await message.answer(
+        f"✅ Лимит турнира #{tid} обновлён: <b>{new_txt}</b>.{over}\n\n"
+        f"👥 Составов: {_fmt_num(len(participants))}",
+        parse_mode="HTML",
+        reply_markup=tournament_current_back_keyboard(),
+    )
+
+
+@router.callback_query(F.data.startswith("tour_cur:time:"))
+async def admin_current_time_ask(call: CallbackQuery, state: FSMContext):
+    if not await _cb_is_admin(call.from_user.id):
+        await call.answer("⛔ Нет прав", show_alert=True)
+        return
+    tid = int(call.data.rsplit(":", 1)[-1])
+    row = get_tournament(tid)
+    if not row:
+        await call.answer("Турнир не найден", show_alert=True)
+        return
+    await state.update_data(edit_tournament_id=tid)
+    await state.set_state(TournamentStates.waiting_new_time)
+    await call.message.answer(
+        f"🕐 Текущее время турнира #{tid}: <b>{hd.quote(str(row['scheduled_text'] or '—'))}</b>\n\n"
+        "Введи новое время (например: <code>25.12 19:00</code> или <code>25.12.2026 19:00</code>).\n"
+        "Для отмены — /cancel или «❌ Отмена».",
+        parse_mode="HTML",
+        reply_markup=tournament_cancel_keyboard(),
+    )
+    await call.answer()
+
+
+@router.message(TournamentStates.waiting_new_time)
+async def admin_current_time_save(message: Message, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    tid = data.get("edit_tournament_id")
+    scheduled = _normalise_scheduled(message.text or "")
+    if not scheduled:
+        await message.answer(
+            "❌ Неверный формат. Введи так: 25.12 19:00 или 25.12.2026 19:00."
+        )
+        return
+    update_tournament_time(tid, scheduled)
+    await state.clear()
+    await log_admin_action(
+        bot=bot, admin_id=message.from_user.id,
+        admin_name=message.from_user.username or message.from_user.full_name or "admin",
+        action_text=f"🕐 Изменил время старта турнира #{tid} на {scheduled}.",
+    )
+    await message.answer(
+        f"✅ Время старта турнира #{tid} обновлено: <b>{hd.quote(scheduled)}</b>.\n"
+        "Автозапуск сработает в это время.",
+        parse_mode="HTML",
+        reply_markup=tournament_current_back_keyboard(),
+    )
+
+
+@router.callback_query(F.data.startswith("tour_cur:start_ask:"))
+async def admin_current_start_ask(call: CallbackQuery):
+    if not await _cb_is_admin(call.from_user.id):
+        await call.answer("⛔ Нет прав", show_alert=True)
+        return
+    tid = int(call.data.rsplit(":", 1)[-1])
+    await call.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=f"✅ Да, запустить #{tid}", callback_data=f"tour_cur:start_yes:{tid}"),
+        InlineKeyboardButton(text="❌ Отмена", callback_data=f"tour_cur:open:{tid}"),
+    ]]))
+    await call.answer("Турнир стартует: сетка + ЛС капитанам")
+
+
+@router.callback_query(F.data.startswith("tour_cur:start_yes:"))
+async def admin_current_start_yes(call: CallbackQuery, bot: Bot):
+    if not await _cb_is_admin(call.from_user.id):
+        await call.answer("⛔ Нет прав", show_alert=True)
+        return
+    tid = int(call.data.rsplit(":", 1)[-1])
+    row = get_tournament(tid)
+    if not row:
+        await call.answer("Турнир не найден", show_alert=True)
+        return
+    if row["status"] in ("finished", "cancelled"):
+        await call.answer("Турнир уже закрыт", show_alert=True)
+        return
+    await call.answer("Запускаю турнир...")
+    status_msg = await call.message.answer("⏳ Собираю сетку, публикую посты и рассылаю капитанам...")
+    report = await start_tournament(bot, row)
+    await log_admin_action(
+        bot=bot, admin_id=call.from_user.id,
+        admin_name=call.from_user.username or call.from_user.full_name or "admin",
+        action_text=f"▶️ Запустил турнир #{tid} вручную.",
+    )
+    try:
+        await status_msg.edit_text(report, parse_mode="HTML")
+    except Exception:
+        await call.message.answer(report, parse_mode="HTML")
+    await call.answer()
+
+
+# ─── Обновление поста с сеткой (Этап 5, п.3) ────────────────────────────────
+
+async def _upsert_bracket_post(bot: Bot, row, caption: str) -> tuple[int, int]:
+    """Обновляет пост с сеткой в топиках. Возвращает (обновлено, создано заново).
+
+    Если Telegram не даёт редактировать сообщение (лимит 48 часов) — старый пост
+    удаляется и публикуется новый с актуальной картинкой.
+    """
+    updated, recreated = 0, 0
+    # приоритет — сохранённая сетка турнира (в ней уже учтены BYE при старте)
+    try:
+        slots = list(json.loads(row["bracket_slots"] or "[]"))
+    except Exception:
+        slots = []
+    if not slots:
+        slots = _build_bracket_slots(get_tournament_participants(row["id"]), row["t_type"])
+    png = render_bracket_image([s if s else "BYE" for s in slots],
+                               f"Турнир #{row['id']} · {row['t_type']} · актуальная сетка")
+    import config
+    for post in get_bracket_posts(row["id"]):
+        chat_id = int(post["chat_id"])
+        try:
+            if png:
+                try:
+                    await bot.edit_message_media(
+                        chat_id=chat_id,
+                        message_id=int(post["message_id"]),
+                        media=InputMediaPhoto(
+                            media=BufferedInputFile(png, filename=f"tournament_{row['id']}_bracket.png"),
+                            caption=caption[:1024],
+                            parse_mode="HTML",
+                        ),
+                    )
+                except TelegramBadRequest as e:
+                    msg = (e.message or "").lower()
+                    if any(key in msg for key in (
+                        "message can't be edited", "message is not modified",
+                        "message to edit not found", "message_id_invalid",
+                        "message can't be deleted",
+                    )):
+                        raise
+                    if "there is no photo" in msg or "no photo" in msg:
+                        await bot.edit_message_caption(
+                            chat_id=chat_id, message_id=int(post["message_id"]),
+                            caption=caption[:1024], parse_mode="HTML",
+                        )
+                    else:
+                        raise
+            else:
+                await bot.edit_message_caption(
+                    chat_id=chat_id, message_id=int(post["message_id"]),
+                    caption=caption[:1024], parse_mode="HTML",
+                )
+            updated += 1
+        except Exception as e:
+            # Лимит редактирования (48 ч) или пост удалён — создаём новый пост
+            logger.info(f"bracket post #{post['id']} needs recreation: {e}")
+            try:
+                await bot.delete_message(chat_id, int(post["message_id"]))
+            except Exception:
+                pass
+            try:
+                text = (
+                    f"{caption}\n\n"
+                    f"{_pairs_schedule_text(get_tournament_matches(row['id'], 1))}"
+                )
+                if png:
+                    sent = await bot.send_photo(
+                        chat_id=chat_id,
+                        message_thread_id=(config.CLAN_CHATS.get(
+                            _clan_key_by_chat(chat_id)) or {}).get("thread_id"),
+                        photo=BufferedInputFile(png, filename=f"tournament_{row['id']}_bracket.png"),
+                        caption=text[:1024], parse_mode="HTML",
+                    )
+                else:
+                    sent = await bot.send_message(
+                        chat_id=chat_id,
+                        message_thread_id=(config.CLAN_CHATS.get(
+                            _clan_key_by_chat(chat_id)) or {}).get("thread_id"),
+                        text=text, parse_mode="HTML",
+                    )
+                save_bracket_post(row["id"], chat_id, sent.message_id)
+                recreated += 1
+            except Exception as e2:
+                logger.warning(f"bracket post recreation failed in {chat_id}: {e2}")
+    return updated, recreated
+
+
+def _clan_key_by_chat(chat_id: int) -> str | None:
+    import config
+    for key, data in (config.CLAN_CHATS or {}).items():
+        if int(data.get("chat_id") or 0) == int(chat_id):
+            return key
+    return None
+
+
+def _bracket_status_caption(row) -> str:
+    typ = TOURNAMENT_TYPE_LABELS.get(row["t_type"], row["t_type"])
+    lines = [
+        f"🗺 <b>Актуальная сетка — турнир #{row['id']} ({hd.quote(str(typ))})</b>",
+        f"🕐 {hd.quote(str(row['scheduled_text'] or '—'))} · "
+        f"{hd.quote(TOURNAMENT_STATUS_LABEL.get(row['status'], row['status']))}",
+    ]
+    matches = get_tournament_matches(row["id"], 1)
+    third = get_third_place_match(row["id"])
+    lines += ["", "<b>Пары 1-го круга</b>", _pairs_schedule_text(matches)]
+    if third and third["side_a"]:
+        lines += ["", "<b>🥉 Матч за 3-4 места</b>"]
+        if third["winner"]:
+            lines.append(f"✅ Победитель: {hd.quote(str(third['winner']))}")
+        else:
+            lines.append(f"{hd.quote(str(third['side_a']))} 🆚 "
+                         f"{hd.quote(str(third['side_b'] or 'ждём проигравшего полуфинала'))}")
+    return "\n".join(lines)
+
+
+# ─── Кнопки и хендлеры раздела «🏆 Турниры» ─────────────────────────────────
+
+@router.message(F.text == "🏆 Турниры")
+async def admin_open_tournaments_list(message: Message):
+    member = await get_member(message.from_user.id)
+    if not member or not has_role(member, "vice"):
+        await message.answer("⛔ Доступ только для Вице Президент и выше.")
+        return
+    rows = get_tournaments(limit=15)
+    if not rows:
+        await message.answer(
+            "🏆 Турниров пока нет.\nСоздай первый через «🏆 Создание турнира».",
+            reply_markup=admin_scrims_keyboard(),
+        )
+        return
+    lines = ["🏆 <b>Последние турниры</b>", ""]
+    for r in rows:
+        mark = "🧪 " if is_test_tournament(r) else ""
+        lines.append(
+            f"{mark}#{r['id']} · {hd.quote(str(r['t_type']))} · "
+            f"{hd.quote(str(r['scheduled_text'] or '—'))} · "
+            f"{hd.quote(TOURNAMENT_STATUS_LABEL.get(r['status'], r['status']))} · "
+            f"👥 {len(get_tournament_participants(r['id']))}"
+        )
+    await message.answer("\n".join(lines), parse_mode="HTML",
+                         reply_markup=tournaments_list_keyboard(rows))
+
+
+@router.callback_query(F.data == "tour:list:refresh")
+async def admin_tournaments_refresh(call: CallbackQuery):
+    if not await _cb_is_admin(call.from_user.id):
+        await call.answer("⛔ Нет прав", show_alert=True)
+        return
+    rows = get_tournaments(limit=15)
+    try:
+        await call.message.delete()
+    except Exception:
+        pass
+    if not rows:
+        await call.message.answer("🏆 Турниров пока нет.", reply_markup=admin_scrims_keyboard())
+        await call.answer()
+        return
+    lines = ["🏆 <b>Последние турниры</b>", ""]
+    for r in rows:
+        lines.append(
+            f"#{r['id']} · {hd.quote(str(r['t_type']))} · "
+            f"{hd.quote(str(r['scheduled_text'] or '—'))} · "
+            f"{hd.quote(TOURNAMENT_STATUS_LABEL.get(r['status'], r['status']))} · "
+            f"👥 {len(get_tournament_participants(r['id']))}"
+        )
+    await call.message.answer("\n".join(lines), parse_mode="HTML",
+                              reply_markup=tournaments_list_keyboard(rows))
+    await call.answer("Обновлено")
+
+
+@router.callback_query(F.data.startswith("tour:open:"))
+async def admin_tournament_open(call: CallbackQuery):
+    if not await _cb_is_admin(call.from_user.id):
+        await call.answer("⛔ Нет прав", show_alert=True)
+        return
+    row = get_tournament(int(call.data.rsplit(":", 1)[-1]))
+    if not row:
+        await call.answer("Турнир не найден", show_alert=True)
+        return
+    participants = get_tournament_participants(row["id"])
+    text = (
+        f"{'🧪 ' if is_test_tournament(row) else ''}<b>Турнир #{row['id']}</b>\n"
+        f"• Тип: {hd.quote(TOURNAMENT_TYPE_LABELS.get(row['t_type'], row['t_type']))}\n"
+        f"• Формат: {hd.quote(TOURNAMENT_FORMAT_LABELS.get(row['t_format'], '—'))}\n"
+        f"• Лимит: {_limit_text(row)}\n"
+        f"• Начало: {hd.quote(str(row['scheduled_text'] or '—'))}\n"
+        f"• Статус: {hd.quote(TOURNAMENT_STATUS_LABEL.get(row['status'], row['status']))}\n\n"
+        f"👥 Участников: <b>{len(participants)}</b>\n"
+        f"{_participants_block(participants)}"
+    )
+    kb = tournament_test_keyboard(row["id"]) if is_test_tournament(row) \
+        else tournament_admin_keyboard(row["id"])
+    try:
+        await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    except Exception:
+        await call.message.answer(text, parse_mode="HTML", reply_markup=kb)
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("ttest:"))
+async def admin_tournament_test_tools(call: CallbackQuery, bot: Bot):
+    """Инструменты тестового турнира: фейковые составы, сброс, возврат к карточке."""
+    if not await _cb_is_admin(call.from_user.id):
+        await call.answer("⛔ Нет прав", show_alert=True)
+        return
+    parts = call.data.split(":")
+    action = parts[1]
+    tid = int(parts[2])
+    row = get_tournament(tid)
+    if not row:
+        await call.answer("Турнир не найден", show_alert=True)
+        return
+    if not is_test_tournament(row):
+        await call.answer("Это не тестовый турнир", show_alert=True)
+        return
+    if action == "fill":
+        amount = int(parts[3])
+        added = add_test_participants(tid, amount, call.from_user.id)
+        await call.answer(f"Добавлено {added} тестовых составов")
+    elif action == "clear":
+        removed = clear_test_participants(tid)
+        await call.answer(f"Удалено {removed} тестовых составов")
+    elif action == "open":
+        await call.answer()
+    participants = get_tournament_participants(tid)
+    matches = get_tournament_matches(tid, 1)
+    third = get_third_place_match(tid)
+    text = (
+        f"🧪 <b>Тестовый турнир #{tid}</b>\n"
+        f"• Тип: {hd.quote(TOURNAMENT_TYPE_LABELS.get(row['t_type'], row['t_type']))} · "
+        f"{hd.quote(TOURNAMENT_FORMAT_LABELS.get(row['t_format'], '—'))}\n"
+        f"• Лимит: {_limit_text(row)}\n"
+        f"• Начало: {hd.quote(str(row['scheduled_text'] or '—'))}\n"
+        f"• Статус: {hd.quote(TOURNAMENT_STATUS_LABEL.get(row['status'], row['status']))}\n\n"
+        f"👥 Составов: <b>{_fmt_num(len(participants))}</b> "
+        f"(из них тестовых: {_fmt_num(count_test_participants(tid))})\n"
+        f"{_participants_block(participants, 15)}\n\n"
+        f"🗺 Пар 1-го круга: {_fmt_num(len(matches))}"
+        + (f"\n🥉 Матч за 3-4 места: {hd.quote(str(third['side_a'] or '—'))} 🆚 "
+           f"{hd.quote(str(third['side_b'] or '—'))}" if third and third["side_a"] else "")
+        + "\n\nТестовые составы имеют лидера-тебя: все уведомления придут в твои ЛС."
+    )
+    try:
+        await call.message.edit_text(text, parse_mode="HTML",
+                                     reply_markup=tournament_test_keyboard(tid))
+    except Exception:
+        await call.message.answer(text, parse_mode="HTML",
+                                  reply_markup=tournament_test_keyboard(tid))
+
+
+@router.callback_query(F.data.startswith("tour:members:"))
+async def admin_tournament_members(call: CallbackQuery):
+    if not await _cb_is_admin(call.from_user.id):
+        await call.answer("⛔ Нет прав", show_alert=True)
+        return
+    row = get_tournament(int(call.data.rsplit(":", 1)[-1]))
+    if not row:
+        await call.answer("Турнир не найден", show_alert=True)
+        return
+    participants = get_tournament_participants(row["id"])
+    text = f"👥 <b>Участники турнира #{row['id']}</b> ({len(participants)}):\n\n" + _participants_block(participants, 40)
+    await call.message.answer(text, parse_mode="HTML", reply_markup=tournament_back_keyboard())
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("tour:preview:"))
+async def admin_tournament_preview(call: CallbackQuery):
+    if not await _cb_is_admin(call.from_user.id):
+        await call.answer("⛔ Нет прав", show_alert=True)
+        return
+    row = get_tournament(int(call.data.rsplit(":", 1)[-1]))
+    if not row:
+        await call.answer("Турнир не найден", show_alert=True)
+        return
+    await _send_preview(call, row)
+    await call.answer("Сетка готова")
+
+
+@router.callback_query(F.data.startswith("tour:later:"))
+async def admin_tournament_later(call: CallbackQuery):
+    if not await _cb_is_admin(call.from_user.id):
+        await call.answer("⛔ Нет прав", show_alert=True)
+        return
+    await call.message.edit_text(
+        "💾 Анонс отложен. Опубликуешь позже через раздел «🏆 Турниры».",
+        reply_markup=None,
+    )
+    await call.message.answer("📂 Скримы и турниры", reply_markup=admin_scrims_keyboard())
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("tour:announce:"))
+async def admin_tournament_announce(call: CallbackQuery, bot: Bot):
+    """Этап 3, п.2-3: рассылка в ЛС + посты в клановых топиках «Турниры»."""
+    if not await _cb_is_admin(call.from_user.id):
+        await call.answer("⛔ Нет прав", show_alert=True)
+        return
+    tournament_id = int(call.data.rsplit(":", 1)[-1])
+    row = get_tournament(tournament_id)
+    if not row:
+        await call.answer("Турнир не найден", show_alert=True)
+        return
+    if row["status"] in ("cancelled", "finished"):
+        await call.answer("Турнир уже закрыт", show_alert=True)
+        return
+    participants = get_tournament_participants(tournament_id)
+    await call.answer("Публикую анонс...", show_alert=False)
+    status_msg = await call.message.answer("⏳ Публикую анонс в топики и рассылаю приглашения в ЛС...")
+
+    topics_sent, topics_failed = await _post_to_clan_topics(bot, row, participants)
+    dm = await _dm_registered_players(bot, row)
+    mark_tournament_published(tournament_id)
+
+    report = [
+        f"📣 <b>Анонс турнира #{tournament_id} отправлен</b>",
+        "",
+        f"🗂 Топики кланов: ✅ {len(topics_sent)}",
+    ]
+    for t in topics_sent:
+        report.append(f"  • {hd.quote(t)}")
+    if topics_failed:
+        report.append(f"  ❌ не отправлено: {len(topics_failed)}")
+        for t in topics_failed:
+            report.append(f"  • {hd.quote(t)}")
+    report += [
+        "",
+        f"📨 Рассылка в ЛС: зарегистрированных {dm['total']}, пропущено {dm['skipped']}",
+        f"  • лидеров составов пригласили: {dm['with_team']} (отправлено {dm['invited']})",
+        f"  • без состава (нужно создать): {dm['without_team']}",
+        f"  • не лидеры (уведомлены): {dm['not_leader']}",
+        f"  • ошибок доставки: {dm['failed']}",
+        "",
+        "Если топики не настроены — задай их через «⚙️ Топики турниров» и повтори анонс.",
+    ]
+    try:
+        await status_msg.edit_text("\n".join(report), parse_mode="HTML")
+    except Exception:
+        await call.message.answer("\n".join(report), parse_mode="HTML")
+
+    await log_admin_action(
+        bot=bot,
+        admin_id=call.from_user.id,
+        admin_name=call.from_user.username or call.from_user.full_name or "admin",
+        action_text=(
+            f"📣 Опубликовал анонс турнира #{tournament_id}: топики {len(topics_sent)}, "
+            f"приглашений в ЛС {dm['invited']}, без состава {dm['without_team']}."
+        ),
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("tour:cancel_ask:"))
+async def admin_tournament_cancel_ask(call: CallbackQuery):
+    if not await _cb_is_admin(call.from_user.id):
+        await call.answer("⛔ Нет прав", show_alert=True)
+        return
+    tournament_id = int(call.data.rsplit(":", 1)[-1])
+    await call.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=f"✅ Да, отменить #{tournament_id}",
+                             callback_data=f"tour:cancel_yes:{tournament_id}"),
+        InlineKeyboardButton(text="❌ Нет", callback_data=f"tour:open:{tournament_id}"),
+    ]]))
+    await call.answer("Подтверди отмену турнира")
+
+
+@router.callback_query(F.data.startswith("tour:cancel_yes:"))
+async def admin_tournament_cancel_yes(call: CallbackQuery, bot: Bot):
+    if not await _cb_is_admin(call.from_user.id):
+        await call.answer("⛔ Нет прав", show_alert=True)
+        return
+    tournament_id = int(call.data.rsplit(":", 1)[-1])
+    row = get_tournament(tournament_id)
+    if not row:
+        await call.answer("Турнир не найден", show_alert=True)
+        return
+    set_tournament_status(tournament_id, "cancelled")
+    for p in get_tournament_participants(tournament_id):
+        if p["leader_id"]:
+            try:
+                await bot.send_message(
+                    int(p["leader_id"]),
+                    f"🚫 Турнир #{tournament_id} отменён администрацией. "
+                    f"Состав {hd.quote(p['team_name'] or '')} снят с участия.",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+    await log_admin_action(
+        bot=bot,
+        admin_id=call.from_user.id,
+        admin_name=call.from_user.username or call.from_user.full_name or "admin",
+        action_text=f"🚫 Отменил турнир #{tournament_id}.",
+    )
+    await call.message.edit_text(f"🚫 Турнир #{tournament_id} отменён.", reply_markup=None)
+    await call.answer("Турнир отменён")
+
+
+@router.message(F.text == "⚙️ Топики турниров")
+async def admin_tournament_topics_start(message: Message, state: FSMContext):
+    """Настройка ID топиков «Турниры» (хранятся в vigarik.db, config.py не трогаем)."""
+    member = await get_member(message.from_user.id)
+    if not member or not has_role(member, "vice"):
+        await message.answer("⛔ Доступ только для Вице Президент и выше.")
+        return
+    current = await get_tournament_topics()
+    lines = [
+        "⚙️ <b>Топики «Турниры»</b>",
+        "",
+        "В каждом клане создай топик «Турниры», напиши в нём слово <code>get_id</code> "
+        "и скопируй ID топика.",
+        "",
+        "Текущие настройки:",
+    ]
+    for clan in TOURNAMENT_CLANS:
+        label = {"academy": "🎓 Academy", "squad": "👑 Squad", "events": "🎉 Events"}[clan]
+        shown = current.get(clan) or "не задан"
+        lines.append(f"• {label}: <code>{hd.quote(str(shown))}</code>")
+    lines += [
+        "",
+        "Пришли одним сообщением в формате:",
+        "<code>academy=33272 squad=129460 events=5361</code>",
+        "(можно указать только часть кланов, разделитель — пробел, запятая или точка с запятой)",
+        "",
+        "Для выхода отправь /cancel или нажми «❌ Отмена».",
+    ]
+    await state.set_state(TournamentSettingsStates.waiting_topics)
+    await message.answer("\n".join(lines), parse_mode="HTML",
+                         reply_markup=tournament_topics_keyboard())
+
+
+@router.message(TournamentSettingsStates.waiting_topics, F.text.startswith("/"))
+@router.message(TournamentSettingsStates.waiting_topics, F.text == "❌ Отмена")
+async def admin_tournament_topics_cancel(message: Message, state: FSMContext):
+    await state.clear()
+    member = await get_member(message.from_user.id)
+    await message.answer(
+        "❌ Настройка топиков отменена.",
+        reply_markup=admin_scrims_keyboard() if member and has_role(member, "vice") else main_menu(member),
+    )
+
+
+@router.message(TournamentSettingsStates.waiting_topics)
+async def admin_tournament_topics_save(message: Message, state: FSMContext, bot: Bot):
+    """Парсим 'academy=123 squad=456 events=789' и сохраняем в настройки."""
+    import re as _re
+    raw = message.text or ""
+    found = dict(_re.findall(r"(academy|squad|events)\s*[=:]\s*(-?\d+)", raw, flags=_re.IGNORECASE))
+    if not found:
+        await message.answer(
+            "❌ Не нашёл ни одного ID. Формат: <code>academy=33272 squad=129460 events=5361</code>",
+            parse_mode="HTML",
+        )
+        return
+    saved = []
+    for clan, value in found.items():
+        await save_tournament_topic(clan.lower(), int(value))
+        saved.append(f"{clan.lower()} → {value}")
+    await state.clear()
+    await log_admin_action(
+        bot=bot,
+        admin_id=message.from_user.id,
+        admin_name=message.from_user.username or message.from_user.full_name or "admin",
+        action_text=f"⚙️ Обновил топики «Турниры»: {', '.join(saved)}.",
+    )
+    await message.answer(
+        "✅ <b>Топики турниров сохранены:</b>\n" + "\n".join(f"• {hd.quote(s)}" for s in saved),
+        parse_mode="HTML",
+        reply_markup=admin_scrims_keyboard(),
+    )
+
+
+# ─── Регистрация состава на турнир (кнопка из ЛС) ───────────────────────────
+
+@router.callback_query(F.data.startswith("tour_info:"))
+async def tournament_info_cb(call: CallbackQuery):
+    row = get_tournament(int(call.data.rsplit(":", 1)[-1]))
+    if not row:
+        await call.answer("Турнир не найден", show_alert=True)
+        return
+    participants = get_tournament_participants(row["id"])
+    await call.message.answer(
+        _announcement_text(row, participants, for_clan_post=False), parse_mode="HTML",
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("tour_reg:"))
+async def tournament_register_cb(call: CallbackQuery, bot: Bot):
+    """Регистрация состава лидером. Участвовать могут составы из всех трёх кланов."""
+    row = get_tournament(int(call.data.rsplit(":", 1)[-1]))
+    if not row:
+        await call.answer("Турнир не найден", show_alert=True)
+        return
+    if row["status"] in ("cancelled", "finished"):
+        await call.answer("Регистрация закрыта", show_alert=True)
+        return
+    composition = get_user_league(call.from_user.id)
+    if not composition:
+        await call.message.answer(_no_composition_text(), parse_mode="HTML")
+        await call.answer("Нет состава", show_alert=True)
+        return
+    if int(composition["leader_id"]) != call.from_user.id:
+        await call.answer("Регистрировать состав может только его лидер", show_alert=True)
+        return
+    participants = get_tournament_participants(row["id"])
+    if any(int(p["league_id"]) == int(composition["id"]) for p in participants):
+        await call.answer("Твой состав уже зарегистрирован", show_alert=True)
+        return
+    limit = row["team_limit"]
+    if row["t_type"] != TOURNAMENT_SHOWDOWN and limit and len(participants) >= int(limit):
+        await call.message.answer(
+            f"❌ Лимит турнира исчерпан: {_fmt_num(limit)} команд. "
+            "Напиши администрации, если нужно место.",
+            parse_mode="HTML",
+        )
+        await call.answer("Лимит исчерпан", show_alert=True)
+        return
+    if row["t_type"] == TOURNAMENT_SHOWDOWN and limit and len(participants) >= int(limit):
+        await call.message.answer(
+            f"❌ Лимит турнира исчерпан: {_fmt_num(limit)} соло-участников.",
+            parse_mode="HTML",
+        )
+        await call.answer("Лимит исчерпан", show_alert=True)
+        return
+    ok = add_tournament_participant(
+        row["id"], int(composition["id"]), composition["name"], composition["tag"], call.from_user.id,
+    )
+    if not ok:
+        await call.answer("Состав уже в списке", show_alert=True)
+        return
+    participants = get_tournament_participants(row["id"])
+    place = next((i for i, p in enumerate(participants, start=1)
+                  if int(p["league_id"]) == int(composition["id"])), len(participants))
+    await call.message.answer(
+        f"✅ <b>Состав зарегистрирован на турнир #{row['id']}!</b>\n"
+        f"• {hd.quote(composition['name'])} [{hd.quote(composition['tag'])}]\n"
+        f"• Позиция в сетке: <b>{_fmt_num(place)}</b> из "
+        f"{_fmt_num(limit) if limit else '∞'}\n"
+        f"• Начало: {hd.quote(str(row['scheduled_text'] or '—'))}\n\n"
+        "Не опаздывай: к моменту начала в составе должно быть нужное число игроков.",
+        parse_mode="HTML",
+    )
+    await call.answer("Зарегистрировано!")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ─── ЭТАП 5: сдача результата лидером и модерация админом ────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+
+RESULT_MENU_TEXTS = frozenset({
+    "❌ Отмена", "◀️ Назад", "🏁 Мои матчи", "👑 Для админов", "👔 Для админов",
+    "Составы🏆 (BetaTest)", "💡 Отправить предложение", "🎯 Выбрать цель пуша",
+})
+
+
+def _my_pending_matches(user_id: int) -> list[dict]:
+    """Матчи (включая матч за 3-е место), где играет команда этого лидера."""
+    composition = get_user_league(user_id)
+    if not composition:
+        return []
+    my_name = composition["name"]
+    out = []
+    for row in get_active_tournaments():
+        if row["status"] not in ("running", "announced"):
+            continue
+        for m in get_tournament_matches(row["id"], 1):
+            if m["winner"] or m["status"] not in ("scheduled",):
+                continue
+            if my_name not in (m["side_a"], m["side_b"]):
+                continue
+            opp = m["side_b"] if m["side_a"] == my_name else m["side_a"]
+            out.append({
+                "tournament": row, "match": m, "opponent": opp or "—",
+                "round": m["round"], "is_third": m["round"] == 0,
+            })
+        third = get_third_place_match(row["id"])
+        if third and not third["winner"] and third["status"] == "scheduled" \
+                and my_name in (third["side_a"], third["side_b"]):
+            opp = third["side_b"] if third["side_a"] == my_name else third["side_a"]
+            out.append({
+                "tournament": row, "match": third, "opponent": opp or "—",
+                "round": 0, "is_third": True,
+            })
+    return out
+
+
+@router.message(F.text == "🏁 Мои матчи")
+async def my_tournament_matches(message: Message, state: FSMContext):
+    """Вход лидера: список его матчей в идущих турнирах (для сдачи результата)."""
+    await state.clear()
+    rows = _my_pending_matches(message.from_user.id)
+    if not rows:
+        await message.answer(
+            "🏁 Сейчас у твоего состава нет активных матчей.\n\n"
+            "Матчи появляются после старта турнира. Результат сдаётся только "
+            "лидером состава: фото + кто победил."
+        )
+        return
+    keyboard_rows = []
+    for item in rows:
+        label = _stage_label(item["tournament"], item["round"])
+        keyboard_rows.append((
+            f"#{item['tournament']['id']} {hd.quote(item['tournament']['t_type'])} · "
+            f"{hd.quote(str(item['opponent']))} · {label}",
+            f"myres:{item['match']['id']}",
+        ))
+    await message.answer(
+        "🏁 <b>Твои матчи</b>\n\nВыбери матч и сдай результат (фото + кто победил).",
+        parse_mode="HTML",
+        reply_markup=simple_list_keyboard(keyboard_rows),
+    )
+
+
+@router.callback_query(F.data.startswith("myres:"))
+async def result_submit_start(call: CallbackQuery, state: FSMContext):
+    """Шаг 1 сдачи результата: просим фото с подписью."""
+    match_id = int(call.data.split(":")[1])
+    m = get_match(match_id)
+    if not m:
+        await call.answer("Матч не найден", show_alert=True)
+        return
+    composition = get_user_league(call.from_user.id)
+    if not composition or composition["name"] not in (m["side_a"], m["side_b"]):
+        await call.answer("Сдавать результат может только лидер играющей команды", show_alert=True)
+        return
+    if m["winner"]:
+        await call.answer("Результат матча уже подтверждён", show_alert=True)
+        return
+    if has_pending_report(match_id):
+        await call.answer("По этому матчу заявка уже на модерации", show_alert=True)
+        return
+    await state.update_data(res_match_id=match_id)
+    await state.set_state(ResultStates.waiting_photo)
+    await call.message.answer(
+        "📸 <b>Сдача результата</b>\n\n"
+        "Пришли <b>одно фото</b> (скриншот итога матча) и напиши к нему подпись — "
+        "короткий текст: счёт и кто победил.\n\n"
+        "Например подпись: <code>2:1, победила VSG</code>\n"
+        "Для отмены — /cancel или «❌ Отмена».",
+        parse_mode="HTML",
+        reply_markup=result_cancel_keyboard(),
+    )
+    await call.answer()
+
+
+@router.message(ResultStates.waiting_photo, F.text.startswith("/"))
+@router.message(ResultStates.waiting_photo, F.text.in_(RESULT_MENU_TEXTS))
+async def result_submit_cancel(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("❌ Сдача результата отменена.")
+
+
+@router.message(ResultStates.waiting_photo, F.photo)
+async def result_photo_received(message: Message, state: FSMContext):
+    """Фото получено: сохраняем во временное состояние, просим указать победителя."""
+    data = await state.get_data()
+    match_id = data.get("res_match_id")
+    m = get_match(int(match_id)) if match_id else None
+    if not m:
+        await state.clear()
+        await message.answer("❌ Матч не найден, начни заново через «🏁 Мои матчи».")
+        return
+    caption = (message.caption or "").strip()
+    if not caption:
+        await message.answer(
+            "❌ Нужен текст к фото (подпись): счёт и кто победил. Пришли фото ещё раз с подписью."
+        )
+        return
+    await state.update_data(res_photo=message.photo[-1].file_id, res_comment=caption)
+    await state.set_state(ResultStates.waiting_winner)
+    await message.answer(
+        "✅ Фото и текст приняты. Теперь укажи, кто победил в этом матче:",
+        reply_markup=result_winner_keyboard(int(m["id"]), str(m["side_a"]), str(m["side_b"])),
+    )
+
+
+@router.message(ResultStates.waiting_photo)
+async def result_photo_wrong(message: Message):
+    await message.answer("❌ Нужно фото (с подписью). Пришли скриншот итога матча одним сообщением.")
+
+
+@router.callback_query(ResultStates.waiting_winner, F.data == "tres:abort")
+async def result_winner_abort(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await call.message.answer("❌ Сдача результата отменена.")
+    await call.answer("Отменено")
+
+
+@router.callback_query(ResultStates.waiting_winner, F.data.startswith("tres:"))
+async def result_winner_chosen(call: CallbackQuery, state: FSMContext, bot: Bot):
+    """Заявка сохранена и ушла в админ-чат с кнопками подтверждения (п.2 ТЗ)."""
+    _, match_id_raw, side = call.data.split(":")
+    data = await state.get_data()
+    m = get_match(int(match_id_raw))
+    if not m:
+        await state.clear()
+        await call.answer("Матч не найден", show_alert=True)
+        return
+    if m["winner"]:
+        await state.clear()
+        await call.answer("Результат уже подтверждён", show_alert=True)
+        return
+    composition = get_user_league(call.from_user.id)
+    if not composition:
+        await state.clear()
+        await call.answer("Ты не в составе", show_alert=True)
+        return
+    claimed = m["side_a"] if side == "a" else m["side_b"]
+    other = m["side_b"] if side == "a" else m["side_a"]
+    row = get_tournament(int(m["tournament_id"]))
+    report_id = create_match_report(
+        tournament_id=int(m["tournament_id"]),
+        match_id=int(m["id"]),
+        reporter_id=call.from_user.id,
+        team_name=composition["name"],
+        opponent_name=other,
+        claimed_winner=claimed,
+        photo_file_id=data.get("res_photo") or "",
+        comment=data.get("res_comment") or "",
+    )
+    await state.clear()
+    is_third = int(m["round"]) == 0
+    stage = _stage_label(row, int(m["round"]))
+    admin_text = (
+        f"📥 <b>Заявка на результат #{report_id}</b>\n"
+        f"🏆 Турнир #{m['tournament_id']} · {hd.quote(TOURNAMENT_TYPE_LABELS.get(row['t_type'], row['t_type']))}\n"
+        f"⚔️ Стадия: {hd.quote(stage)}\n"
+        f"🆚 {hd.quote(str(m['side_a'] or '—'))} vs {hd.quote(str(m['side_b'] or '—'))}\n"
+        f"👤 Сдал: {hd.quote(call.from_user.full_name)} "
+        f"(@{call.from_user.username}) / {composition['name']}\n"
+        f"💬 Текст от лидера: {hd.quote(str(data.get('res_comment') or '—'))}\n"
+        f"🏁 Заявлен победитель: <b>{hd.quote(str(claimed or '—'))}</b>"
+    )
+    kb = admin_result_keyboard(report_id, str(claimed or "—"), str(other or "—"))
+    sent_ok = False
+    if data.get("res_photo"):
+        try:
+            await bot.send_photo(
+                chat_id=config.ADMIN_CHAT_ID,
+                photo=data["res_photo"],
+                caption=admin_text,
+                parse_mode="HTML",
+                reply_markup=kb,
+            )
+            sent_ok = True
+        except Exception as e:
+            logger.warning(f"report photo to admin chat failed: {e}")
+    if not sent_ok:
+        await bot.send_message(
+            config.ADMIN_CHAT_ID, admin_text, parse_mode="HTML", reply_markup=kb,
+        )
+    await call.message.edit_reply_markup(reply_markup=None)
+    await call.message.answer(
+        "📨 <b>Заявка отправлена администрации.</b>\n"
+        "После проверки админ подтвердит победителя — сетка обновится автоматически.",
+        parse_mode="HTML",
+        reply_markup=None,
+    )
+    await call.answer("Отправлено на модерацию")
+
+
+# ─── Модерация результатов (п.2 ТЗ) ─────────────────────────────────────────
+
+@router.message(F.text == "📬 Заявки на результаты")
+async def admin_pending_reports(message: Message):
+    member = await get_member(message.from_user.id)
+    if not member or not is_any_admin(member):
+        await message.answer("⛔ Доступ только для администрации.")
+        return
+    rows = get_pending_reports()
+    if not rows:
+        await message.answer("📬 Новых заявок на результаты нет.", reply_markup=admin_scrims_keyboard())
+        return
+    keyboard_rows = []
+    for r in rows:
+        keyboard_rows.append((
+            f"#{r['id']} · {hd.quote(str(r['team_name'] or '—'))} → {hd.quote(str(r['claimed_winner'] or '—'))}",
+            f"rres:view:{r['id']}",
+        ))
+    await message.answer(
+        f"📬 <b>Заявки на результаты</b> ({len(rows)}):\n\nОткрой заявку и прими решение.",
+        parse_mode="HTML",
+        reply_markup=simple_list_keyboard(keyboard_rows),
+    )
+
+
+@router.callback_query(F.data.startswith("rres:view:"))
+async def admin_report_view(call: CallbackQuery):
+    if not await _cb_is_admin(call.from_user.id):
+        await call.answer("⛔ Нет прав", show_alert=True)
+        return
+    r = get_match_report(int(call.data.rsplit(":", 1)[-1]))
+    if not r:
+        await call.answer("Заявка не найдена", show_alert=True)
+        return
+    m = get_match(int(r["match_id"]))
+    text = (
+        f"📥 <b>Заявка #{r['id']}</b> · статус {hd.quote(r['status'])}\n"
+        f"🏆 Турнир #{r['tournament_id']}\n"
+        f"🆚 {hd.quote(str(m['side_a'] or '—'))} vs {hd.quote(str(m['side_b'] or '—'))}\n"
+        f"👤 Сдал: ID {r['reporter_id']} ({hd.quote(str(r['team_name'] or '—'))})\n"
+        f"💬 Текст: {hd.quote(str(r['comment'] or '—'))}\n"
+        f"🏁 Заявлен победитель: <b>{hd.quote(str(r['claimed_winner'] or '—'))}</b>"
+    )
+    if r["photo_file_id"]:
+        try:
+            await call.message.answer_photo(
+                photo=r["photo_file_id"], caption=text, parse_mode="HTML",
+                reply_markup=admin_result_keyboard(r["id"], str(r["claimed_winner"] or "—"),
+                                                   str(m["side_b"] if m["side_a"] == r["claimed_winner"] else m["side_a"] or "—")),
+            )
+            await call.answer()
+            return
+        except Exception:
+            pass
+    await call.message.answer(text, parse_mode="HTML", reply_markup=admin_result_keyboard(
+        r["id"], str(r["claimed_winner"] or "—"),
+        str(m["side_b"] if m["side_a"] == r["claimed_winner"] else m["side_a"] or "—"),
+    ))
+    await call.answer()
+
+
+async def _apply_result(call: CallbackQuery, report_id: int, winner: str, status: str,
+                        bot: Bot) -> None:
+    """Подтверждение результата: продвижение по сетке + обновление постов + уведомления."""
+    r = get_match_report(report_id)
+    if not r:
+        await call.answer("Заявка не найдена", show_alert=True)
+        return
+    if r["status"] != "pending":
+        await call.answer("Заявка уже обработана", show_alert=True)
+        return
+    m = get_match(int(r["match_id"]))
+    if not m:
+        await call.answer("Матч не найден", show_alert=True)
+        return
+    row = get_tournament(int(m["tournament_id"]))
+    loser = m["side_b"] if m["side_a"] == winner else m["side_a"]
+    is_third = int(m["round"]) == 0
+
+    set_match_winner(int(m["id"]), winner, "confirmed", call.from_user.id)
+    set_match_report_status(report_id, status, call.from_user.id)
+
+    notes = []
+    if is_third:
+        # финал утешительной ветки: турнир завершён
+        set_tournament_status(int(m["tournament_id"]), "finished")
+        notes.append("🥉 Матч за 3-4 места закрыт, турнир завершён.")
+    else:
+        info = advance_winner(int(m["tournament_id"]), int(m["round"]), int(m["pair_index"]), winner)
+        if info["tournament_finished"]:
+            notes.append("🏁 Это был финал — турнир завершён (остался матч за 3-е место).")
+            if not get_third_place_match(int(m["tournament_id"])):
+                set_tournament_status(int(m["tournament_id"]), "finished")
+        else:
+            nxt = get_match(int(info["next_match_id"])) if info["next_match_id"] else None
+            if nxt and nxt["side_a"] and nxt["side_b"]:
+                notes.append(f"⏭ Победитель идёт в матч против {hd.quote(str(info['next_opponent']))}.")
+            else:
+                notes.append("⏭ Победитель ждёт соперника из соседней пары.")
+        # проигравший полуфинал → в матч за 3-4 места (саб-ветка)
+        if register_semifinal_loser(int(m["tournament_id"]), int(m["round"]), loser):
+            third = get_third_place_match(int(m["tournament_id"]))
+            notes.append(
+                f"🥉 Сформирован матч за 3-4 места: {hd.quote(str(third['side_a']))} 🆚 "
+                f"{hd.quote(str(third['side_b']))}."
+            )
+        _propagate_auto_advances(int(m["tournament_id"]))
+
+    # обновляем посты с сеткой (с обработкой лимита редактирования 48 ч)
+    updated, recreated = await _upsert_bracket_post(bot, row, _bracket_status_caption(row))
+    notes.append(f"🗺 Посты с сеткой: обновлено {updated}, создано заново {recreated}.")
+
+    # уведомления лидерам
+    for p in get_tournament_participants(int(m["tournament_id"])):
+        if p["team_name"] not in (winner, loser) or not p["leader_id"]:
+            continue
+        won = p["team_name"] == winner
+        try:
+            await bot.send_message(
+                int(p["leader_id"]),
+                (f"✅ <b>Результат подтверждён администрацией.</b>\n"
+                 f"Состав {hd.quote(p['team_name'])} — {'победа, проходите дальше!' if won else 'поражение, вы выбыли.'}\n"
+                 f"🏆 Турнир #{m['tournament_id']}") + ("\n" + "\n".join(notes) if won else ""),
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+    await log_admin_action(
+        bot=bot, admin_id=call.from_user.id,
+        admin_name=call.from_user.username or call.from_user.full_name or "admin",
+        action_text=(
+            f"🏁 Подтвердил результат #{report_id} (турнир #{m['tournament_id']}, "
+            f"матч {m['side_a']} vs {m['side_b']}): победил {winner}."
+        ),
+    )
+    try:
+        await call.message.edit_text(
+            f"✅ Заявка #{report_id} обработана. Победитель: <b>{hd.quote(winner)}</b>.\n"
+            + "\n".join(notes),
+            parse_mode="HTML", reply_markup=None,
+        )
+    except Exception:
+        await call.message.answer(
+            f"✅ Заявка #{report_id} обработана. Победитель: <b>{hd.quote(winner)}</b>.",
+            parse_mode="HTML",
+        )
+    await call.answer("Результат записан")
+
+
+@router.callback_query(F.data.startswith("rres:yes:"))
+async def admin_result_yes(call: CallbackQuery, bot: Bot):
+    """[Да, победил X] — подтверждаем победителя, указанного лидером."""
+    if not await _cb_is_admin(call.from_user.id):
+        await call.answer("⛔ Нет прав", show_alert=True)
+        return
+    r = get_match_report(int(call.data.rsplit(":", 1)[-1]))
+    if not r:
+        await call.answer("Заявка не найдена", show_alert=True)
+        return
+    await _apply_result(call, int(r["id"]), str(r["claimed_winner"] or ""), "confirmed", bot)
+
+
+@router.callback_query(F.data.startswith("rres:no:"))
+async def admin_result_no(call: CallbackQuery, bot: Bot):
+    """[Нет, победил Y] — победил соперник, указанный в заявке."""
+    if not await _cb_is_admin(call.from_user.id):
+        await call.answer("⛔ Нет прав", show_alert=True)
+        return
+    report_id = int(call.data.rsplit(":", 1)[-1])
+    r = get_match_report(report_id)
+    if not r:
+        await call.answer("Заявка не найдена", show_alert=True)
+        return
+    m = get_match(int(r["match_id"]))
+    other = m["side_b"] if m["side_a"] == r["claimed_winner"] else m["side_a"]
+    if not other:
+        await call.answer("Не удалось определить второго участника", show_alert=True)
+        return
+    await _apply_result(call, report_id, str(other), "confirmed_swapped", bot)
+
+
+@router.callback_query(F.data.startswith("rres:reject:"))
+async def admin_result_reject(call: CallbackQuery, bot: Bot):
+    if not await _cb_is_admin(call.from_user.id):
+        await call.answer("⛔ Нет прав", show_alert=True)
+        return
+    report_id = int(call.data.rsplit(":", 1)[-1])
+    r = get_match_report(report_id)
+    if not r or r["status"] != "pending":
+        await call.answer("Заявка уже обработана", show_alert=True)
+        return
+    set_match_report_status(report_id, "rejected", call.from_user.id)
+    await log_admin_action(
+        bot=bot, admin_id=call.from_user.id,
+        admin_name=call.from_user.username or call.from_user.full_name or "admin",
+        action_text=f"🚫 Отклонил заявку на результат #{report_id} (турнир #{r['tournament_id']}).",
+    )
+    try:
+        await bot.send_message(
+            int(r["reporter_id"]),
+            f"🚫 Твоя заявка на результат #{report_id} отклонена администрацией. "
+            "Свяжись с админами, если считаешь это ошибкой.",
+        )
+    except Exception:
+        pass
+    await call.message.edit_text(f"🚫 Заявка #{report_id} отклонена.", reply_markup=None)
+    await call.answer("Заявка отклонена")
+
 
 @router.message(F.text == "👔 Для админов")
 @router.message(F.text == "👔 Для аgминов")
@@ -90,2172 +3079,6 @@ async def open_admin_scrims_folder(message: Message):
         "• Создание турнира (в разработке)",
         parse_mode="HTML",
         reply_markup=admin_scrims_keyboard()
-    )
-
-# ─── МАСТЕР СОЗДАНИЯ ТУРНИРА (Этап 2 ТЗ: пошаговый FSM) ──────────────────────
-# ShowDown — соло-режим, там лимит считается в игроках и жёстко зафиксирован на 10.
-# Для 1V1/2V2/3V3 лимит задаётся в КОМАНДАХ (составах), а не в игроках.
-SHOWDOWN_LIMIT = 10
-
-TOURNAMENT_TYPES = {
-    "1v1": "🤺 1V1",
-    "2v2": "👥 2V2",
-    "3v3": "🛡 3V3",
-    "showdown": "💀 ShowDown",
-}
-
-# Охранники FSM-ввода: эти кнопки меню не должны попадать в число/дату турнира
-TOURNAMENT_GUARD_TEXTS = frozenset({
-    "👔 Для админов", "👥 Участники", "🤺 Скримы", "📢 Сделать объявление",
-    "⚙️ Системные команды", "◀️ Выйти из админки", "🔙 Назад в админку",
-    "📜 История игр", "🏆 Создание турнира", "👀 Незакрытые скримы", "📋 Текущие турниры",
-    "👥 Управление участниками", "🎯 Управление пуш-сезоном",
-    "⚙️ Назначить модерацию", "🔄 Проверить юзернеймы",
-    "📋 Редактировать список клана", "👤 Участники без ников", "➕ Добавить твинк",
-    "Составы🏆 (BetaTest)", "Составы 🏆 (BetaTest)", "💡 Отправить предложение",
-    "🎯 Выбрать цель пуша", "◀️ Назад", "❌ Отмена",
-})
-
-
-class TournamentStates(StatesGroup):
-    """Шаги мастера: тип → формат (Бо3/Бо5) → лимит участников → дата и время."""
-    choosing_type = State()
-    choosing_format = State()
-    choosing_limit = State()
-    waiting_limit_number = State()
-    waiting_datetime = State()
-
-
-def _tournament_cancel_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="❌ Отмена", callback_data="trn:cancel")
-    ]])
-
-
-def _tournament_type_kb() -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-    for key, label in TOURNAMENT_TYPES.items():
-        builder.button(text=label, callback_data=f"trn:type:{key}")
-    builder.button(text="❌ Отмена", callback_data="trn:cancel")
-    builder.adjust(2, 2, 1)
-    return builder.as_markup()
-
-
-def _tournament_format_kb() -> InlineKeyboardMarkup:
-    """Формат матча — переиспользуем логику BO3/BO5 из старых скримов."""
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="Бо3 (до 2 побед)", callback_data="trn:fmt:BO3"),
-            InlineKeyboardButton(text="Бо5 (до 3 побед)", callback_data="trn:fmt:BO5"),
-        ],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="trn:back:type")],
-        [InlineKeyboardButton(text="❌ Отмена", callback_data="trn:cancel")],
-    ])
-
-
-def _tournament_limit_kb(back_to: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✏️ Задать число", callback_data="trn:limit:set"),
-            InlineKeyboardButton(text="♾ Без лимита", callback_data="trn:limit:none"),
-        ],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data=f"trn:back:{back_to}")],
-        [InlineKeyboardButton(text="❌ Отмена", callback_data="trn:cancel")],
-    ])
-
-
-def _limit_unit(t_type: str, plural: bool = True) -> str:
-    """Единица лимита: в ShowDown играют соло-игроки, в остальных типах — команды."""
-    if t_type == "showdown":
-        return "игроков" if plural else "игроков"
-    return "команд" if plural else "команды"
-
-
-def _limit_label(t_type: str) -> str:
-    """Заголовок шага: «Лимит команд» или «Лимит игроков» (ShowDown)."""
-    return "Лимит игроков" if t_type == "showdown" else "Лимит команд"
-
-
-def _limit_text(limit, t_type: str = "") -> str:
-    """Человеческая запись лимита. Лимит считается в КОМАНДАХ (составах), не в игроках."""
-    if limit is None:
-        return "♾ без лимита"
-    return f"{int(limit)} {_limit_unit(t_type)}"
-
-
-def _players_per_team(t_type: str) -> int:
-    """Сколько игроков от команды реально выходит на карту."""
-    return {"1v1": 1, "2v2": 2, "3v3": 3}.get(t_type, 1)
-
-
-def _tournament_summary(data: dict) -> str:
-    t_key = data.get("t_type")
-    lines = [
-        "🏆 <b>Черновик турнира</b>",
-        "",
-        f"• Тип: {TOURNAMENT_TYPES.get(t_key, t_key)}",
-    ]
-    if t_key != "showdown":
-        lines.append(f"• Формат матча: <b>{data.get('t_format', '—')}</b>")
-    else:
-        lines.append("• Формат матча: не применяется (ShowDown)")
-    limit = data.get("t_limit")
-    lines.append(f"• {_limit_label(t_key)}: <b>{_limit_text(limit, t_key)}</b>")
-    if t_key != "showdown":
-        per_team = _players_per_team(t_key)
-        note = f"• От каждой команды на карту выходит по {per_team} игрока"
-        if limit is not None:
-            note += f" (максимум {int(limit) * per_team} игроков на турнире)"
-        lines.append(note)
-    lines.append(f"• Начало: <b>{hd.quote(str(data.get('t_datetime') or '—'))}</b>")
-    return "\n".join(lines)
-
-
-async def _ask_tournament_limit(call: CallbackQuery, state: FSMContext, back_to: str):
-    data = await state.get_data()
-    t_key = data.get("t_type") or ""
-    per_team = _players_per_team(t_key)
-    await state.set_state(TournamentStates.choosing_limit)
-    await call.message.edit_text(
-        f"👥 <b>Шаг 3. {_limit_label(t_key)}</b>\n\n"
-        f"Хотите ли вы задать лимит <b>команд</b> на турнир?\n"
-        f"Можно ввести число или оставить турнир без лимита.\n\n"
-        f"ℹ️ Лимит считается в <b>командах (составах)</b>, а не в игроках: "
-        f"в составе числится до 4 человек, а на карту от команды выходит {per_team}.",
-        parse_mode="HTML",
-        reply_markup=_tournament_limit_kb(back_to),
-    )
-
-
-async def _ask_tournament_datetime(call: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    await state.set_state(TournamentStates.waiting_datetime)
-    await call.message.edit_text(
-        f"{_tournament_summary(data)}\n\n"
-        "🗓 <b>Шаг 4. Когда будет турнир?</b>\n\n"
-        "Напиши дату и время начала сообщением, например: <code>25.12 19:00</code> "
-        "или <code>25.12.2026 19:00</code>.\n"
-        "Для отмены отправь /cancel.",
-        parse_mode="HTML",
-        reply_markup=_tournament_cancel_kb(),
-    )
-
-
-@router.message(F.text == "🏆 Создание турнира")
-async def tournament_create_start(message: Message, state: FSMContext):
-    """Шаг 1: выбор типа турнира (скрима)."""
-    member = await get_member(message.from_user.id)
-    if not member or not is_any_admin(member):
-        await message.answer("⛔ Доступ только для администрации.")
-        return
-    await state.clear()
-    await state.set_state(TournamentStates.choosing_type)
-    await message.answer(
-        "🏆 <b>Создание турнира</b>\n\n"
-        "⚔️ <b>Шаг 1. Какой тип скрима вы хотите выбрать?</b>\n\n"
-        "ℹ️ Для 1V1 / 2V2 / 3V3 лимит задаётся в <b>командах (составах)</b>, не в игроках.\n"
-        f"ℹ️ При выборе <b>ShowDown</b> лимит автоматически фиксируется "
-        f"на <b>{SHOWDOWN_LIMIT} игроках</b>.",
-        parse_mode="HTML",
-        reply_markup=_tournament_type_kb(),
-    )
-
-
-@router.callback_query(TournamentStates.choosing_type, F.data.startswith("trn:type:"))
-async def tournament_choose_type(call: CallbackQuery, state: FSMContext):
-    """Шаг 1 → Шаг 2. ShowDown: лимит = 10 и формат не спрашиваем."""
-    if not await _cb_is_admin(call.from_user.id):
-        await call.answer("⛔ Нет прав", show_alert=True)
-        return
-    t_key = call.data.rsplit(":", 1)[-1]
-    if t_key not in TOURNAMENT_TYPES:
-        await call.answer("Неизвестный тип", show_alert=True)
-        return
-    await state.update_data(t_type=t_key)
-    if t_key == "showdown":
-        # Лимит фиксируется автоматически, формат матча к ShowDown не применяется
-        await state.update_data(t_limit=SHOWDOWN_LIMIT, t_format=None)
-        await call.answer(f"ShowDown: лимит {SHOWDOWN_LIMIT} игроков")
-        await _ask_tournament_datetime(call, state)
-        return
-    await state.update_data(t_limit=None)
-    await state.set_state(TournamentStates.choosing_format)
-    await call.message.edit_text(
-        f"Тип турнира: <b>{TOURNAMENT_TYPES[t_key]}</b>\n\n"
-        "🎮 <b>Шаг 2. Какой тип скрима будет между команд?</b>\n\n"
-        "Бо3 — побеждает тот, кто первым выиграет 2 карты.\n"
-        "Бо5 — побеждает тот, кто первым выиграет 3 карты.",
-        parse_mode="HTML",
-        reply_markup=_tournament_format_kb(),
-    )
-    await call.answer()
-
-
-@router.callback_query(TournamentStates.choosing_format, F.data.startswith("trn:fmt:"))
-async def tournament_choose_format(call: CallbackQuery, state: FSMContext):
-    """Шаг 2 → Шаг 3."""
-    if not await _cb_is_admin(call.from_user.id):
-        await call.answer("⛔ Нет прав", show_alert=True)
-        return
-    fmt = call.data.rsplit(":", 1)[-1]
-    if fmt not in ("BO3", "BO5"):
-        await call.answer("Неизвестный формат", show_alert=True)
-        return
-    await state.update_data(t_format=fmt)
-    await _ask_tournament_limit(call, state, back_to="format")
-    await call.answer(fmt)
-
-
-@router.callback_query(TournamentStates.choosing_limit, F.data == "trn:limit:none")
-async def tournament_limit_none(call: CallbackQuery, state: FSMContext):
-    """Шаг 3: безлимитный турнир."""
-    if not await _cb_is_admin(call.from_user.id):
-        await call.answer("⛔ Нет прав", show_alert=True)
-        return
-    await state.update_data(t_limit=None)
-    await call.answer("Без лимита")
-    await _ask_tournament_datetime(call, state)
-
-
-@router.callback_query(TournamentStates.choosing_limit, F.data == "trn:limit:set")
-async def tournament_limit_ask_number(call: CallbackQuery, state: FSMContext):
-    """Шаг 3: запрос числа команд (для ShowDown — число игроков)."""
-    if not await _cb_is_admin(call.from_user.id):
-        await call.answer("⛔ Нет прав", show_alert=True)
-        return
-    data = await state.get_data()
-    t_key = data.get("t_type") or ""
-    unit = _limit_unit(t_key)
-    await state.set_state(TournamentStates.waiting_limit_number)
-    await call.message.edit_text(
-        f"👥 <b>Шаг 3. {_limit_label(t_key)}</b>\n\n"
-        f"Отправь число <b>{unit}</b> (от 2 до 128) сообщением, например: <code>16</code>.\n"
-        f"Для отмены отправь /cancel.",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="♾ Без лимита", callback_data="trn:limit:none_input")],
-            [InlineKeyboardButton(text="◀️ Назад", callback_data="trn:back:limit")],
-            [InlineKeyboardButton(text="❌ Отмена", callback_data="trn:cancel")],
-        ]),
-    )
-    await call.answer()
-
-
-@router.callback_query(TournamentStates.waiting_limit_number, F.data == "trn:limit:none_input")
-async def tournament_limit_none_from_input(call: CallbackQuery, state: FSMContext):
-    if not await _cb_is_admin(call.from_user.id):
-        await call.answer("⛔ Нет прав", show_alert=True)
-        return
-    await state.update_data(t_limit=None)
-    await call.answer("Без лимита")
-    await _ask_tournament_datetime(call, state)
-
-
-# Охранник: команды и кнопки меню никогда не считаются числом/датой
-@router.message(
-    StateFilter(TournamentStates.waiting_limit_number, TournamentStates.waiting_datetime),
-    F.text.startswith("/") | F.text.in_(TOURNAMENT_GUARD_TEXTS),
-)
-async def tournament_input_guard(message: Message, state: FSMContext):
-    """Выход из FSM по /cancel, /start и по нажатию любой кнопки меню."""
-    await state.clear()
-    text = (message.text or "").strip()
-    if text.startswith("/cancel"):
-        await message.answer("❌ Создание турнира отменено.", reply_markup=admin_scrims_keyboard())
-        return
-    await message.answer(
-        "❌ Создание турнира прервано (вы нажали другую кнопку/команду).",
-        reply_markup=admin_scrims_keyboard(),
-    )
-
-
-@router.message(TournamentStates.waiting_limit_number)
-async def tournament_limit_number(message: Message, state: FSMContext):
-    """Шаг 3: приём числа КОМАНД (для ShowDown — игроков)."""
-    data_state = await state.get_data()
-    unit = _limit_unit(data_state.get("t_type") or "")
-    text = (message.text or "").strip()
-    if not text.isdigit() or not (2 <= int(text) <= 128):
-        await message.answer(
-            f"❌ Нужно целое число {unit} от 2 до 128. Попробуй ещё раз или отправь /cancel.",
-            parse_mode="HTML",
-        )
-        return
-    await state.update_data(t_limit=int(text))
-    await state.set_state(TournamentStates.waiting_datetime)
-    data = await state.get_data()
-    await message.answer(
-        f"{_tournament_summary(data)}\n\n"
-        "🗓 <b>Шаг 4. Когда будет турнир?</b>\n\n"
-        "Напиши дату и время начала, например: <code>25.12 19:00</code> "
-        "или <code>25.12.2026 19:00</code>.\n"
-        "Для отмены отправь /cancel.",
-        parse_mode="HTML",
-        reply_markup=_tournament_cancel_kb(),
-    )
-
-
-@router.message(TournamentStates.waiting_datetime)
-async def tournament_datetime(message: Message, state: FSMContext):
-    """Шаг 4: дата и время начала турнира (парсер переиспользован из скримов)."""
-    scheduled = _normalise_scheduled(message.text or "")
-    if not scheduled:
-        await message.answer(
-            "❌ Неверный формат даты. Введи так: <code>25.12 19:00</code> "
-            "или <code>25.12.2026 19:00</code>.\nДля отмены отправь /cancel.",
-            parse_mode="HTML",
-        )
-        return
-    await state.update_data(t_datetime=scheduled)
-    data = await state.get_data()
-    await state.set_state(None)
-    await message.answer(
-        f"{_tournament_summary(data)}\n\n"
-        "✅ Все шаги мастера пройдены. Проверь данные и подтверди создание турнира.",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Создать турнир", callback_data="trn:confirm")],
-            [InlineKeyboardButton(text="🧪 Создать тестовый (без рассылки в ЛС)",
-                                  callback_data="trn:confirm_test")],
-            [InlineKeyboardButton(text="❌ Отмена", callback_data="trn:cancel")],
-        ]),
-    )
-
-
-@router.callback_query(F.data.startswith("trn:back:"))
-async def tournament_back(call: CallbackQuery, state: FSMContext):
-    """Кнопки «Назад» по шагам мастера."""
-    if not await _cb_is_admin(call.from_user.id):
-        await call.answer("⛔ Нет прав", show_alert=True)
-        return
-    target = call.data.rsplit(":", 1)[-1]
-    if target == "type":
-        await state.set_state(TournamentStates.choosing_type)
-        await call.message.edit_text(
-            "🏆 <b>Создание турнира</b>\n\n"
-            "⚔️ <b>Шаг 1. Какой тип скрима вы хотите выбрать?</b>\n\n"
-            "ℹ️ Для 1V1 / 2V2 / 3V3 лимит задаётся в <b>командах (составах)</b>, не в игроках.\n"
-            f"ℹ️ При выборе <b>ShowDown</b> лимит автоматически фиксируется "
-            f"на <b>{SHOWDOWN_LIMIT} игроках</b>.",
-            parse_mode="HTML",
-            reply_markup=_tournament_type_kb(),
-        )
-    elif target == "format":
-        data = await state.get_data()
-        t_key = data.get("t_type")
-        await state.set_state(TournamentStates.choosing_format)
-        await call.message.edit_text(
-            f"Тип турнира: <b>{TOURNAMENT_TYPES.get(t_key, t_key)}</b>\n\n"
-            "🎮 <b>Шаг 2. Какой тип скрима будет между команд?</b>",
-            parse_mode="HTML",
-            reply_markup=_tournament_format_kb(),
-        )
-    else:  # limit
-        data = await state.get_data()
-        back_to = "type" if data.get("t_type") == "showdown" else "format"
-        await _ask_tournament_limit(call, state, back_to=back_to)
-    await call.answer()
-
-
-@router.callback_query(F.data == "trn:cancel")
-async def tournament_cancel(call: CallbackQuery, state: FSMContext):
-    if not await _cb_is_admin(call.from_user.id):
-        await call.answer("⛔ Нет прав", show_alert=True)
-        return
-    await state.clear()
-    try:
-        await call.message.edit_text("❌ Создание турнира отменено.", reply_markup=None)
-    except Exception:
-        pass
-    await call.message.answer(
-        "📂 Скримы и турниры \n\nВыбери необходимое действие:",
-        parse_mode="HTML",
-        reply_markup=admin_scrims_keyboard(),
-    )
-    await call.answer("Отменено")
-
-
-# ─── ЭТАП 3: БАЗА ТУРНИРОВ (идемпотентные миграции в league.db) ──────────────
-
-def init_tournament_tables() -> None:
-    """Создаёт таблицы турниров. Безопасно вызывать сколько угодно раз."""
-    conn = db.get_connection()
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS tournaments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            t_type TEXT NOT NULL,
-            t_format TEXT,
-            team_limit INTEGER,
-            starts_at TEXT NOT NULL,
-            status TEXT DEFAULT 'registration',
-            created_by INTEGER,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS tournament_teams (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            tournament_id INTEGER NOT NULL,
-            league_id INTEGER,
-            leader_id INTEGER NOT NULL,
-            name TEXT DEFAULT '',
-            tag TEXT DEFAULT '',
-            registered_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (tournament_id) REFERENCES tournaments(id) ON DELETE CASCADE
-        );
-        CREATE TABLE IF NOT EXISTS tournament_posts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            tournament_id INTEGER NOT NULL,
-            clan_key TEXT,
-            chat_id INTEGER NOT NULL,
-            thread_id INTEGER,
-            message_id INTEGER NOT NULL,
-            FOREIGN KEY (tournament_id) REFERENCES tournaments(id) ON DELETE CASCADE
-        );
-        CREATE TABLE IF NOT EXISTS tournament_matches (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            tournament_id INTEGER NOT NULL,
-            round_no INTEGER NOT NULL,
-            slot_no INTEGER NOT NULL,
-            bracket TEXT DEFAULT 'main',
-            team_a_id INTEGER,
-            team_b_id INTEGER,
-            winner_team_id INTEGER,
-            loser_team_id INTEGER,
-            status TEXT DEFAULT 'pending',
-            score_text TEXT DEFAULT '',
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            finished_at DATETIME,
-            FOREIGN KEY (tournament_id) REFERENCES tournaments(id) ON DELETE CASCADE
-        );
-        CREATE TABLE IF NOT EXISTS tournament_results (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            match_id INTEGER NOT NULL,
-            tournament_id INTEGER NOT NULL,
-            reporter_id INTEGER NOT NULL,
-            reporter_team_id INTEGER,
-            text_note TEXT DEFAULT '',
-            photos TEXT DEFAULT '[]',
-            status TEXT DEFAULT 'pending',
-            decided_by INTEGER,
-            decided_at DATETIME,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (match_id) REFERENCES tournament_matches(id) ON DELETE CASCADE
-        );
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_tournament_team_unique
-            ON tournament_teams (tournament_id, leader_id);
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_tournament_match_slot
-            ON tournament_matches (tournament_id, bracket, round_no, slot_no);
-        CREATE INDEX IF NOT EXISTS idx_tournament_status ON tournaments (status);
-        CREATE INDEX IF NOT EXISTS idx_tournament_posts_t ON tournament_posts (tournament_id);
-        CREATE INDEX IF NOT EXISTS idx_tournament_matches_t ON tournament_matches (tournament_id, status);
-        CREATE INDEX IF NOT EXISTS idx_tournament_results_m ON tournament_results (match_id, status);
-    """)
-    # Миграция: флаг тестового турнира (без рассылки в ЛС всем игрокам)
-    cols = {r["name"] for r in conn.execute("PRAGMA table_info(tournaments)").fetchall()}
-    if "is_test" not in cols:
-        conn.execute("ALTER TABLE tournaments ADD COLUMN is_test INTEGER DEFAULT 0")
-    conn.commit()
-    conn.close()
-
-
-def _is_test(tournament) -> bool:
-    try:
-        return int(tournament["is_test"] or 0) == 1
-    except Exception:
-        return False
-
-
-def _test_mark(tournament) -> str:
-    """Префикс-метка тестового турнира для всех постов и карточек."""
-    return "🧪 <b>[ТЕСТ]</b> " if _is_test(tournament) else ""
-
-
-def create_tournament_row(t_type, t_format, team_limit, starts_at, created_by,
-                          is_test: int = 0) -> int:
-    init_tournament_tables()
-    conn = db.get_connection()
-    cur = conn.execute(
-        "INSERT INTO tournaments (t_type, t_format, team_limit, starts_at, created_by, is_test) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (t_type, t_format, team_limit, starts_at, created_by, int(is_test)),
-    )
-    conn.commit()
-    tid = int(cur.lastrowid)
-    conn.close()
-    return tid
-
-
-def get_tournament(tournament_id: int):
-    init_tournament_tables()
-    conn = db.get_connection()
-    row = conn.execute("SELECT * FROM tournaments WHERE id = ?", (tournament_id,)).fetchone()
-    conn.close()
-    return row
-
-
-def get_tournament_teams(tournament_id: int):
-    init_tournament_tables()
-    conn = db.get_connection()
-    rows = conn.execute(
-        "SELECT * FROM tournament_teams WHERE tournament_id = ? ORDER BY registered_at, id",
-        (tournament_id,),
-    ).fetchall()
-    conn.close()
-    return rows
-
-
-def add_tournament_team(tournament_id, league_id, leader_id, name, tag) -> bool:
-    """Регистрирует команду (или соло-игрока в ShowDown). False — если уже зарегистрирован."""
-    init_tournament_tables()
-    conn = db.get_connection()
-    try:
-        conn.execute(
-            "INSERT INTO tournament_teams (tournament_id, league_id, leader_id, name, tag) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (tournament_id, league_id, leader_id, name, tag),
-        )
-        conn.commit()
-        return True
-    except Exception:
-        return False
-    finally:
-        conn.close()
-
-
-def save_tournament_post(tournament_id, clan_key, chat_id, thread_id, message_id) -> None:
-    init_tournament_tables()
-    conn = db.get_connection()
-    conn.execute(
-        "INSERT INTO tournament_posts (tournament_id, clan_key, chat_id, thread_id, message_id) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (tournament_id, clan_key, chat_id, thread_id, message_id),
-    )
-    conn.commit()
-    conn.close()
-
-
-def get_tournament_posts(tournament_id: int):
-    init_tournament_tables()
-    conn = db.get_connection()
-    rows = conn.execute(
-        "SELECT * FROM tournament_posts WHERE tournament_id = ?", (tournament_id,)
-    ).fetchall()
-    conn.close()
-    return rows
-
-
-# ─── ЭТАП 3: СЕТКА С АВТОПРОХОДАМИ (BYE) ─────────────────────────────────────
-
-def build_bracket_pairs(names: list[str]):
-    """Пары первого раунда с автопроходами.
-
-    Доводим число участников до ближайшей степени двойки: недостающие места —
-    BYE (автопроход). BYE раздаются верхним посевам, поэтому при нечётном числе
-    команд кто-то проходит дальше без игры.
-    """
-    n = len(names)
-    if n < 2:
-        return [], 0, max(0, 2 - n)
-    size = 1
-    while size < n:
-        size *= 2
-    byes = size - n
-    slots = list(names) + [None] * byes
-    pairs = [(slots[i], slots[i + 1]) for i in range(0, size, 2)]
-    rounds = size.bit_length() - 1
-    return pairs, rounds, byes
-
-
-def _bracket_text(names: list[str]) -> str:
-    """Текстовая сетка — запасной вариант, если Pillow недоступен."""
-    pairs, rounds, byes = build_bracket_pairs(names)
-    if not pairs:
-        return "Участников пока недостаточно для сетки."
-    lines = [f"Раунд 1 ({len(pairs)} пар, автопроходов: {byes}):"]
-    for i, (a, b) in enumerate(pairs, 1):
-        if b is None:
-            lines.append(f"{i}. {a} — 🆓 автопроход (BYE)")
-        else:
-            lines.append(f"{i}. {a} 🆚 {b}")
-    return "\n".join(lines)
-
-
-def render_bracket_image(names: list[str], title: str):
-    """Рисует предварительную сетку (PNG в BytesIO). None — если Pillow не установлен."""
-    try:
-        from io import BytesIO
-        from PIL import Image, ImageDraw, ImageFont
-    except Exception as e:
-        logger.warning(f"Pillow недоступен, сетка будет текстовой: {e}")
-        return None
-
-    pairs, rounds, byes = build_bracket_pairs(names)
-    if not pairs:
-        return None
-
-    def _font(size: int):
-        for path in (
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        ):
-            try:
-                return ImageFont.truetype(path, size)
-            except Exception:
-                continue
-        return ImageFont.load_default()
-
-    font_title = _font(30)
-    font = _font(18)
-
-    box_w, box_h, gap_y = 260, 44, 22
-    col_gap = 90
-    slots_first = len(pairs) * 2
-    height = max(360, 110 + slots_first * (box_h + gap_y))
-    width = 80 + rounds * (box_w + col_gap)
-
-    bg, card, line_c = (24, 26, 34), (44, 48, 62), (90, 98, 120)
-    img = Image.new("RGB", (width, height), bg)
-    draw = ImageDraw.Draw(img)
-    draw.text((40, 28), title[:60], font=font_title, fill=(255, 214, 92))
-
-    def _fit(text: str, limit: int = 24) -> str:
-        text = str(text)
-        return text if len(text) <= limit else text[: limit - 1] + "…"
-
-    y_top = 90
-    prev_centers = []
-    for r in range(rounds):
-        x = 40 + r * (box_w + col_gap)
-        count = slots_first // (2 ** r)
-        centers = []
-        for i in range(count):
-            if r == 0:
-                step = box_h + gap_y
-                y = y_top + i * step
-                label = pairs[i // 2][i % 2]
-                label = _fit(label) if label else "🆓 BYE"
-                fill = card if pairs[i // 2][i % 2] else (58, 46, 46)
-            else:
-                y = (prev_centers[i * 2] + prev_centers[i * 2 + 1]) / 2 - box_h / 2
-                label = "—"
-                fill = (36, 39, 50)
-            draw.rounded_rectangle([x, y, x + box_w, y + box_h], radius=10, fill=fill,
-                                   outline=line_c, width=2)
-            draw.text((x + 14, y + 12), label, font=font, fill=(236, 239, 246))
-            centers.append(y + box_h / 2)
-        # соединительные линии к следующему раунду
-        if r < rounds - 1:
-            for i in range(0, count, 2):
-                y1, y2 = centers[i], centers[i + 1]
-                xm = x + box_w + col_gap / 2
-                draw.line([(x + box_w, y1), (xm, y1)], fill=line_c, width=2)
-                draw.line([(x + box_w, y2), (xm, y2)], fill=line_c, width=2)
-                draw.line([(xm, y1), (xm, y2)], fill=line_c, width=2)
-                draw.line([(xm, (y1 + y2) / 2), (x + box_w + col_gap, (y1 + y2) / 2)],
-                          fill=line_c, width=2)
-        prev_centers = centers
-
-    footer = f"Участников: {len(names)} · автопроходов (BYE): {byes}"
-    draw.text((40, height - 36), footer, font=font, fill=(160, 168, 190))
-
-    buf = BytesIO()
-    img.save(buf, format="PNG")
-    buf.seek(0)
-    return buf
-
-
-# ─── ЭТАП 3: ТЕКСТ АНОНСА И РАССЫЛКА ─────────────────────────────────────────
-
-def _tournament_card(tournament, teams) -> str:
-    """Пост-анонс турнира: параметры, лимит команд, список участников."""
-    t_key = tournament["t_type"]
-    limit = tournament["team_limit"]
-    lines = [
-        f"{_test_mark(tournament)}🏆 <b>АНОНС ТУРНИРА</b>",
-        "",
-    ]
-    if _is_test(tournament):
-        lines.append("⚠️ Это <b>тестовый турнир</b> для проверки системы.")
-        lines.append("")
-    lines.append(f"• Тип: <b>{TOURNAMENT_TYPES.get(t_key, t_key)}</b>")
-    if t_key != "showdown":
-        lines.append(f"• Формат матча: <b>{tournament['t_format'] or '—'}</b>")
-        lines.append(f"• От команды играет: <b>{_players_per_team(t_key)}</b>")
-    lines.append(f"• {_limit_label(t_key)}: <b>{_limit_text(limit, t_key)}</b>")
-    lines.append(f"• Начало: <b>{hd.quote(str(tournament['starts_at']))}</b>")
-    lines.append("")
-    unit = _limit_unit(t_key)
-    if limit is None:
-        lines.append(f"📋 <b>Зарегистрировано {unit}: {len(teams)}</b> (без лимита)")
-    else:
-        lines.append(f"📋 <b>Зарегистрировано {unit}: {len(teams)} из {int(limit)}</b>")
-    if teams:
-        for i, t in enumerate(teams, 1):
-            tag = f" [{hd.quote(str(t['tag']))}]" if t["tag"] else ""
-            lines.append(f"{i}. {hd.quote(str(t['name'] or 'Без названия'))}{tag}")
-    else:
-        lines.append("Пока никто не зарегистрировался.")
-    lines.append("")
-    if t_key == "showdown":
-        lines.append("Участвовать может любой игрок сети — жми кнопку ниже.")
-    else:
-        lines.append(
-            "Регистрирует команду <b>лидер состава</b>. В состав может входить "
-            "любой участник из трёх кланов сети."
-        )
-    return "\n".join(lines)
-
-
-def _tournament_reg_kb(tournament_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Зарегистрироваться", callback_data=f"trn:reg:{tournament_id}")
-    ]])
-
-
-def _tournament_topics() -> dict:
-    """Топики «Турниры» по кланам.
-
-    ID берутся из config.TOURNAMENT_TOPICS (пропиши их туда, когда дашь ID).
-    Пока их нет — анонс уходит в новостные топики из ADMIN_NEWS_TARGETS.
-    """
-    import config
-    topics = getattr(config, "TOURNAMENT_TOPICS", None)
-    if topics:
-        return topics
-    return getattr(config, "ADMIN_NEWS_TARGETS", {}) or {}
-
-
-async def _publish_tournament_posts(bot: Bot, tournament_id: int):
-    """Публикует анонс с картинкой сетки в клановые топики «Турниры»."""
-    tournament = get_tournament(tournament_id)
-    teams = get_tournament_teams(tournament_id)
-    text = _tournament_card(tournament, teams)
-    names = [str(t["name"] or "Команда") for t in teams]
-    image = render_bracket_image(names, f"Турнир #{tournament_id} · предварительная сетка")
-    if image is None and names:
-        text += "\n\n<b>Предварительная сетка:</b>\n" + hd.quote(_bracket_text(names))
-
-    ok, failed = [], []
-    for clan_key, target in _tournament_topics().items():
-        chat_id = target.get("chat_id")
-        thread_id = target.get("thread_id")
-        if not chat_id:
-            continue
-        try:
-            if image is not None:
-                from aiogram.types import BufferedInputFile
-                image.seek(0)
-                photo = BufferedInputFile(image.read(), filename=f"bracket_{tournament_id}.png")
-                msg = await bot.send_photo(
-                    chat_id=chat_id, message_thread_id=thread_id, photo=photo,
-                    caption=text[:1024], parse_mode="HTML",
-                    reply_markup=_tournament_reg_kb(tournament_id),
-                )
-            else:
-                msg = await bot.send_message(
-                    chat_id=chat_id, message_thread_id=thread_id, text=text,
-                    parse_mode="HTML", reply_markup=_tournament_reg_kb(tournament_id),
-                )
-            save_tournament_post(tournament_id, clan_key, chat_id, thread_id, msg.message_id)
-            ok.append(clan_key)
-        except Exception as e:
-            logger.warning(f"Не удалось опубликовать анонс турнира в {clan_key}: {e}")
-            failed.append(clan_key)
-    return ok, failed
-
-
-async def _broadcast_tournament_dm(bot: Bot, tournament_id: int):
-    """Рассылает уведомление в ЛС всем зарегистрированным игрокам сети."""
-    from database import get_all_members
-    tournament = get_tournament(tournament_id)
-    t_key = tournament["t_type"]
-    base_text = (
-        "🏆 <b>Скоро турнир!</b>\n\n"
-        f"• Тип: <b>{TOURNAMENT_TYPES.get(t_key, t_key)}</b>\n"
-        + (f"• Формат матча: <b>{tournament['t_format'] or '—'}</b>\n" if t_key != "showdown" else "")
-        + f"• {_limit_label(t_key)}: <b>{_limit_text(tournament['team_limit'], t_key)}</b>\n"
-        f"• Начало: <b>{hd.quote(str(tournament['starts_at']))}</b>\n\n"
-    )
-    no_team_text = (
-        "❗ Для участия нужно иметь <b>состав</b>. Сейчас у тебя его нет.\n"
-        "Создай состав в разделе «Составы🏆» — в него может входить "
-        "<b>любой участник из трёх кланов</b> сети (Squad, Academy, Events), "
-        "после этого лидер сможет зарегистрировать команду на турнир."
-    )
-    sent = blocked = no_team = 0
-
-    # 🧪 ТЕСТОВЫЙ ТУРНИР: массовую рассылку не делаем, пишем только создателю,
-    # чтобы можно было полностью прогнать сценарий без спама игрокам.
-    if _is_test(tournament):
-        creator = tournament["created_by"]
-        if creator:
-            try:
-                composition = db.get_user_league(int(creator))
-            except Exception:
-                composition = None
-            kb = _tournament_reg_kb(tournament_id) if (
-                t_key == "showdown" or (composition and int(composition["leader_id"]) == int(creator))
-            ) else None
-            try:
-                await bot.send_message(
-                    int(creator),
-                    "🧪 <b>ТЕСТОВЫЙ ТУРНИР</b>\n"
-                    "(массовая рассылка в ЛС отключена, это сообщение видишь только ты)\n\n"
-                    + base_text
-                    + ("Ты лидер состава — можешь зарегистрировать команду:"
-                       if kb else no_team_text if not composition else
-                       "Зарегистрировать команду может только лидер состава."),
-                    parse_mode="HTML", reply_markup=kb,
-                )
-                sent = 1
-            except Exception:
-                blocked = 1
-        return sent, blocked, no_team
-
-    try:
-        members = await get_all_members()
-    except Exception as e:
-        logger.error(f"Рассылка турнира: не удалось получить участников: {e}")
-        return 0, 0, 0
-    for m in members:
-        user_id = m.get("user_id")
-        if not user_id or int(m.get("registered") or 0) != 1:
-            continue
-        try:
-            composition = db.get_user_league(int(user_id))
-        except Exception:
-            composition = None
-        if t_key == "showdown":
-            text = base_text + "Это соло-режим: участвовать может любой игрок сети."
-            kb = _tournament_reg_kb(tournament_id)
-        elif not composition:
-            text = base_text + no_team_text
-            kb = None
-            no_team += 1
-        elif int(composition["leader_id"]) == int(user_id):
-            text = base_text + "Ты лидер состава — можешь зарегистрировать команду прямо сейчас:"
-            kb = _tournament_reg_kb(tournament_id)
-        else:
-            text = base_text + (
-                f"Твой состав: <b>{hd.quote(str(composition['name']))}</b>. "
-                "Зарегистрировать команду на турнир может только лидер состава."
-            )
-            kb = None
-        try:
-            await bot.send_message(user_id, text, parse_mode="HTML", reply_markup=kb)
-            sent += 1
-        except Exception:
-            blocked += 1
-        await asyncio.sleep(0.05)  # бережём лимиты Telegram
-    return sent, blocked, no_team
-
-
-async def _refresh_tournament_posts(bot: Bot, tournament_id: int):
-    """Обновляет анонсы (список участников + сетка) после новой регистрации."""
-    tournament = get_tournament(tournament_id)
-    teams = get_tournament_teams(tournament_id)
-    text = _tournament_card(tournament, teams)
-    names = [str(t["name"] or "Команда") for t in teams]
-    image = render_bracket_image(names, f"Турнир #{tournament_id} · предварительная сетка")
-    for post in get_tournament_posts(tournament_id):
-        try:
-            if image is not None:
-                from aiogram.types import BufferedInputFile, InputMediaPhoto
-                image.seek(0)
-                media = InputMediaPhoto(
-                    media=BufferedInputFile(image.read(), filename=f"bracket_{tournament_id}.png"),
-                    caption=text[:1024], parse_mode="HTML",
-                )
-                await bot.edit_message_media(
-                    chat_id=post["chat_id"], message_id=post["message_id"], media=media,
-                    reply_markup=_tournament_reg_kb(tournament_id),
-                )
-            else:
-                await bot.edit_message_text(
-                    chat_id=post["chat_id"], message_id=post["message_id"], text=text,
-                    parse_mode="HTML", reply_markup=_tournament_reg_kb(tournament_id),
-                )
-        except Exception as e:
-            logger.debug(f"Анонс турнира {tournament_id} не обновлён: {e}")
-
-
-@router.callback_query(F.data.startswith("trn:reg:"))
-async def tournament_register(call: CallbackQuery, bot: Bot):
-    """Регистрация команды лидером состава (в ShowDown — соло-игроком)."""
-    tournament_id = int(call.data.rsplit(":", 1)[-1])
-    tournament = get_tournament(tournament_id)
-    if not tournament or tournament["status"] != "registration":
-        await call.answer("Регистрация на турнир закрыта", show_alert=True)
-        return
-    teams = get_tournament_teams(tournament_id)
-    limit = tournament["team_limit"]
-    if limit is not None and len(teams) >= int(limit):
-        await call.answer("😔 Все места уже заняты", show_alert=True)
-        return
-    if any(int(t["leader_id"]) == call.from_user.id for t in teams):
-        await call.answer("Ты уже зарегистрирован на этот турнир", show_alert=True)
-        return
-
-    if tournament["t_type"] == "showdown":
-        member = await get_member(call.from_user.id)
-        if not member or int(member.get("registered") or 0) != 1:
-            await call.answer("Сначала пройди регистрацию в боте (/start)", show_alert=True)
-            return
-        name = member.get("game_nick") or member.get("username") or f"ID {call.from_user.id}"
-        added = add_tournament_team(tournament_id, None, call.from_user.id, name,
-                                    member.get("player_tag") or "")
-    else:
-        composition = db.get_user_league(call.from_user.id)
-        if not composition:
-            await call.answer(
-                "У тебя нет состава. Создай его в разделе «Составы🏆» — "
-                "в состав может входить любой участник из трёх кланов.",
-                show_alert=True,
-            )
-            return
-        if int(composition["leader_id"]) != call.from_user.id:
-            await call.answer("Регистрирует команду только лидер состава", show_alert=True)
-            return
-        if any(t["league_id"] and int(t["league_id"]) == int(composition["id"]) for t in teams):
-            await call.answer("Твоя команда уже в списке", show_alert=True)
-            return
-        added = add_tournament_team(tournament_id, int(composition["id"]), call.from_user.id,
-                                    composition["name"], composition["tag"])
-
-    if not added:
-        await call.answer("Не удалось зарегистрировать (возможно, уже в списке)", show_alert=True)
-        return
-    await call.answer("✅ Ты в списке участников!", show_alert=True)
-    try:
-        await bot.send_message(
-            call.from_user.id,
-            f"✅ Регистрация на турнир #{tournament_id} подтверждена.\n"
-            f"Начало: <b>{hd.quote(str(tournament['starts_at']))}</b>. "
-            f"Сетка обновлена в клановых топиках «Турниры».",
-            parse_mode="HTML",
-        )
-    except Exception:
-        pass
-    await _refresh_tournament_posts(bot, tournament_id)
-
-
-@router.callback_query(F.data.in_({"trn:confirm", "trn:confirm_test"}))
-async def tournament_confirm(call: CallbackQuery, state: FSMContext, bot: Bot):
-    """Этап 3: сохраняем турнир в БД, рассылаем ЛС и публикуем анонсы в топиках.
-
-    Режим «trn:confirm_test» — тестовый турнир: работает идентично обычному
-    (анонсы, регистрация, сетка, матчи, результаты), но массовая рассылка в ЛС
-    игрокам не выполняется — уведомление получает только создатель.
-    """
-    if not await _cb_is_admin(call.from_user.id):
-        await call.answer("⛔ Нет прав", show_alert=True)
-        return
-    is_test = 1 if call.data == "trn:confirm_test" else 0
-    data = await state.get_data()
-    if not data.get("t_type") or not data.get("t_datetime"):
-        await state.clear()
-        await call.answer("Черновик устарел, начни заново", show_alert=True)
-        return
-    await state.clear()
-    await call.answer("Создаю тестовый турнир..." if is_test else "Создаю турнир...")
-
-    tournament_id = create_tournament_row(
-        t_type=data.get("t_type"),
-        t_format=data.get("t_format"),
-        team_limit=data.get("t_limit"),
-        starts_at=data.get("t_datetime"),
-        created_by=call.from_user.id,
-        is_test=is_test,
-    )
-    await call.message.edit_text(
-        f"{'🧪 <b>ТЕСТОВЫЙ РЕЖИМ</b>' if is_test else ''}\n{_tournament_summary(data)}\n\n"
-        f"✅ Турнир <b>#{tournament_id}</b> создан. "
-        + ("Рассылка в ЛС игрокам отключена. Публикую анонсы..."
-           if is_test else "Рассылаю уведомления и публикую анонсы..."),
-        parse_mode="HTML",
-        reply_markup=None,
-    )
-
-    ok, failed = await _publish_tournament_posts(bot, tournament_id)
-    sent, blocked, no_team = await _broadcast_tournament_dm(bot, tournament_id)
-
-    report = [
-        f"{'🧪 ' if is_test else ''}🏆 <b>Турнир #{tournament_id} опубликован</b>",
-        "",
-    ]
-    if is_test:
-        report.append("⚠️ <b>Тестовый режим:</b> массовая рассылка в ЛС отключена, "
-                      "уведомление получил только ты. Все остальные функции "
-                      "(регистрация, сетка, старт, результаты, матч за 3-е место) работают штатно.")
-        report.append("")
-    report += [
-        f"📨 Рассылка в ЛС: доставлено <b>{sent}</b>, не доставлено <b>{blocked}</b>",
-        f"👥 Из них без состава (попросили создать): <b>{no_team}</b>",
-    ]
-    if ok:
-        report.append("📢 Анонс размещён: " + ", ".join(ok))
-    if failed:
-        report.append("⚠️ Не удалось разместить: " + ", ".join(failed))
-    if not getattr(__import__("config"), "TOURNAMENT_TOPICS", None):
-        report.append(
-            "\nℹ️ В config.py пока нет <code>TOURNAMENT_TOPICS</code> — анонс ушёл в новостные "
-            "топики. Пришли ID топиков «Турниры», и я переключу публикацию на них."
-        )
-    await call.message.answer("\n".join(report), parse_mode="HTML",
-                              reply_markup=admin_scrims_keyboard())
-    await log_admin_action(
-        bot=bot,
-        admin_id=call.from_user.id,
-        admin_name=call.from_user.username or call.from_user.first_name or "admin",
-        action_text=(
-            f"🏆 Создал турнир #{tournament_id}: тип {data.get('t_type')}, "
-            f"формат {data.get('t_format') or '—'}, "
-            f"лимит {_limit_text(data.get('t_limit'), data.get('t_type') or '')}, "
-            f"начало {data.get('t_datetime')}. Рассылка: {sent} доставлено."
-        ),
-    )
-
-
-# ═══ ЭТАП 4: ТЕКУЩИЕ ТУРНИРЫ, АВТОСТАРТ И УВЕДОМЛЕНИЯ ЛИДЕРАМ ════════════════
-
-TOURNAMENT_STATUS_LABEL = {
-    "registration": "📝 Идёт регистрация",
-    "running": "🔥 Турнир идёт",
-    "finished": "🏁 Завершён",
-    "cancelled": "🚫 Отменён",
-}
-
-
-def get_active_tournaments():
-    """Активные турниры: идёт регистрация или турнир уже запущен."""
-    init_tournament_tables()
-    conn = db.get_connection()
-    rows = conn.execute(
-        "SELECT * FROM tournaments WHERE status IN ('registration', 'running') "
-        "ORDER BY starts_at, id"
-    ).fetchall()
-    conn.close()
-    return rows
-
-
-def set_tournament_limit(tournament_id: int, team_limit) -> None:
-    init_tournament_tables()
-    conn = db.get_connection()
-    conn.execute("UPDATE tournaments SET team_limit = ? WHERE id = ?", (team_limit, tournament_id))
-    conn.commit()
-    conn.close()
-
-
-def set_tournament_status(tournament_id: int, status: str) -> bool:
-    """Переводит турнир в новый статус. False — если статус уже был изменён (гонка)."""
-    init_tournament_tables()
-    conn = db.get_connection()
-    cur = conn.execute(
-        "UPDATE tournaments SET status = ? WHERE id = ? AND status != ?",
-        (status, tournament_id, status),
-    )
-    conn.commit()
-    changed = cur.rowcount > 0
-    conn.close()
-    return changed
-
-
-def get_due_tournaments():
-    """Турниры со статусом registration, у которых наступило время старта."""
-    init_tournament_tables()
-    now = datetime.now()
-    due = []
-    conn = db.get_connection()
-    rows = conn.execute("SELECT * FROM tournaments WHERE status = 'registration'").fetchall()
-    conn.close()
-    for row in rows:
-        try:
-            starts = datetime.strptime(str(row["starts_at"]).strip(), "%d.%m.%Y %H:%M")
-        except Exception:
-            continue
-        if starts <= now:
-            due.append(row)
-    return due
-
-
-async def _leader_contact(leader_id: int) -> str:
-    """Контакт лидера для связи: @username, иначе ник и ID."""
-    try:
-        member = await get_member(int(leader_id))
-    except Exception:
-        member = None
-    if member:
-        uname = member.get("username")
-        if uname and str(uname).lower() != "unknown":
-            return f"@{uname}"
-        nick = member.get("game_nick") or member.get("first_name")
-        if nick:
-            return f"{hd.quote(str(nick))} (ID {leader_id})"
-    return f"ID {leader_id}"
-
-
-def _schedule_lines(pairs) -> list[str]:
-    """Расписание пар первого раунда (кто с кем играет)."""
-    lines = []
-    for i, (a, b) in enumerate(pairs, 1):
-        if b is None:
-            lines.append(f"{i}. <b>{hd.quote(str(a))}</b> — 🆓 автопроход (BYE)")
-        else:
-            lines.append(f"{i}. <b>{hd.quote(str(a))}</b> 🆚 <b>{hd.quote(str(b))}</b>")
-    return lines
-
-
-def _final_card(tournament, teams, pairs, byes) -> str:
-    """Пост с финальной сеткой и расписанием пар."""
-    t_key = tournament["t_type"]
-    lines = [
-        f"{_test_mark(tournament)}🔥 <b>ТУРНИР #{tournament['id']} НАЧАЛСЯ!</b>",
-        "",
-        f"• Тип: <b>{TOURNAMENT_TYPES.get(t_key, t_key)}</b>",
-    ]
-    if t_key != "showdown":
-        lines.append(f"• Формат матча: <b>{tournament['t_format'] or '—'}</b>")
-    lines.append(f"• Участников: <b>{len(teams)}</b>")
-    if byes:
-        lines.append(f"• Автопроходов (BYE): <b>{byes}</b>")
-    lines.append(f"• Старт: <b>{hd.quote(str(tournament['starts_at']))}</b>")
-    lines.append("")
-    lines.append("🗓 <b>Расписание первого раунда:</b>")
-    lines.extend(_schedule_lines(pairs))
-    lines.append("")
-    lines.append("Лидерам отправлены контакты соперников в ЛС. Удачи!")
-    return "\n".join(lines)
-
-
-async def start_tournament(bot: Bot, tournament_id: int, manual_by: int = 0):
-    """Запуск турнира: финальная сетка в топиках + ЛС участникам и лидерам."""
-    tournament = get_tournament(tournament_id)
-    if not tournament:
-        return None
-    teams = get_tournament_teams(tournament_id)
-    if len(teams) < 2:
-        if set_tournament_status(tournament_id, "cancelled"):
-            for t in teams:
-                try:
-                    await bot.send_message(
-                        int(t["leader_id"]),
-                        f"😔 Турнир #{tournament_id} отменён: не набралось участников "
-                        f"(зарегистрировано {len(teams)}).",
-                    )
-                except Exception:
-                    pass
-        return {"cancelled": True, "teams": len(teams), "notified": 0}
-    if not set_tournament_status(tournament_id, "running"):
-        return None  # кто-то уже запустил турнир
-
-    names = [str(t["name"] or "Команда") for t in teams]
-    pairs, rounds, byes = build_bracket_pairs(names)
-    by_name = {str(t["name"] or "Команда"): t for t in teams}
-
-    # Этап 5: создаём матчи первого раунда (BYE закрываются автоматически)
-    generate_first_round(tournament_id, teams)
-
-    # 1) Финальная сетка и расписание в топики с анонсом
-    text = _final_card(tournament, teams, pairs, byes)
-    image = render_bracket_image(names, f"Турнир #{tournament_id} · финальная сетка")
-    posts = get_tournament_posts(tournament_id)
-    for post in posts:
-        try:
-            if image is not None:
-                from aiogram.types import BufferedInputFile, InputMediaPhoto
-                image.seek(0)
-                media = InputMediaPhoto(
-                    media=BufferedInputFile(image.read(), filename=f"bracket_{tournament_id}.png"),
-                    caption=text[:1024], parse_mode="HTML",
-                )
-                await bot.edit_message_media(chat_id=post["chat_id"],
-                                             message_id=post["message_id"],
-                                             media=media, reply_markup=None)
-            else:
-                await bot.edit_message_text(chat_id=post["chat_id"],
-                                            message_id=post["message_id"],
-                                            text=text, parse_mode="HTML", reply_markup=None)
-        except Exception as e:
-            logger.debug(f"Не удалось обновить пост турнира {tournament_id}: {e}")
-            try:
-                await bot.send_message(post["chat_id"], text, parse_mode="HTML",
-                                       message_thread_id=post["thread_id"])
-            except Exception:
-                pass
-    if not posts:
-        for clan_key, target in _tournament_topics().items():
-            try:
-                await bot.send_message(target.get("chat_id"), text, parse_mode="HTML",
-                                       message_thread_id=target.get("thread_id"))
-            except Exception:
-                pass
-
-    # 2) Персональные уведомления лидерам: соперник + контакт для связи
-    fmt = tournament["t_format"] or "BO3"
-    fmt_label = "Бо3" if str(fmt).upper() == "BO3" else ("Бо5" if str(fmt).upper() == "BO5" else fmt)
-    notified = 0
-    for a, b in pairs:
-        for mine, rival in ((a, b), (b, a)):
-            if not mine:
-                continue
-            team = by_name.get(mine)
-            if not team:
-                continue
-            leader_id = int(team["leader_id"])
-            if rival is None:
-                msg = (
-                    f"🏆 <b>Турнир #{tournament_id} начался!</b>\n\n"
-                    f"🆓 В первом раунде у вас <b>автопроход (BYE)</b> — соперника нет, "
-                    f"вы проходите дальше. Ждите пару следующего раунда."
-                )
-            else:
-                rival_team = by_name.get(rival)
-                contact = await _leader_contact(int(rival_team["leader_id"])) if rival_team else "—"
-                rival_tag = f" [{hd.quote(str(rival_team['tag']))}]" if rival_team and rival_team["tag"] else ""
-                if tournament["t_type"] == "showdown":
-                    msg = (
-                        f"🏆 <b>Турнир #{tournament_id} начался!</b>\n\n"
-                        f"У вас игра против <b>{hd.quote(str(rival))}</b>{rival_tag}.\n"
-                        f"Свяжитесь с соперником: {contact}"
-                    )
-                else:
-                    msg = (
-                        f"🏆 <b>Турнир #{tournament_id} начался!</b>\n\n"
-                        f"У вас скрим <b>{fmt_label}</b> против команды "
-                        f"<b>{hd.quote(str(rival))}</b>{rival_tag}, "
-                        f"спишитесь с их лидером: {contact}\n\n"
-                        f"После игры отправьте результат командой /result "
-                        f"(фото + счёт)."
-                    )
-            try:
-                await bot.send_message(leader_id, msg, parse_mode="HTML")
-                notified += 1
-            except Exception:
-                pass
-            await asyncio.sleep(0.05)
-
-    # 3) Уведомление остальным участникам составов
-    for team in teams:
-        if not team["league_id"]:
-            continue
-        try:
-            members = db.get_league_members(int(team["league_id"]), occupied_only=True)
-        except Exception:
-            continue
-        for m in members:
-            uid = m["user_id"]
-            if not uid or int(uid) == int(team["leader_id"]):
-                continue
-            try:
-                await bot.send_message(
-                    int(uid),
-                    f"🏆 <b>Турнир #{tournament_id} начался!</b>\n\n"
-                    f"Ваша команда <b>{hd.quote(str(team['name'] or 'Команда'))}</b> участвует. "
-                    f"Детали пары уточните у лидера состава.",
-                    parse_mode="HTML",
-                )
-            except Exception:
-                pass
-            await asyncio.sleep(0.05)
-
-    logger.info(f"Турнир {tournament_id} запущен: {len(teams)} участников, {notified} уведомлений")
-    return {"cancelled": False, "teams": len(teams), "notified": notified, "byes": byes}
-
-
-# ─── ЭТАП 5: МАТЧИ, РЕЗУЛЬТАТЫ, ПРОДВИЖЕНИЕ ПО СЕТКЕ ─────────────────────────
-
-def _m_get(match_id: int):
-    init_tournament_tables()
-    conn = db.get_connection()
-    row = conn.execute("SELECT * FROM tournament_matches WHERE id = ?", (match_id,)).fetchone()
-    conn.close()
-    return row
-
-
-def get_tournament_matches(tournament_id: int, bracket: str = None):
-    init_tournament_tables()
-    conn = db.get_connection()
-    if bracket:
-        rows = conn.execute(
-            "SELECT * FROM tournament_matches WHERE tournament_id = ? AND bracket = ? "
-            "ORDER BY round_no, slot_no", (tournament_id, bracket)).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT * FROM tournament_matches WHERE tournament_id = ? "
-            "ORDER BY bracket DESC, round_no, slot_no", (tournament_id,)).fetchall()
-    conn.close()
-    return rows
-
-
-def _team_row(team_id):
-    if not team_id:
-        return None
-    init_tournament_tables()
-    conn = db.get_connection()
-    row = conn.execute("SELECT * FROM tournament_teams WHERE id = ?", (int(team_id),)).fetchone()
-    conn.close()
-    return row
-
-
-def _team_name(team_id, default: str = "—") -> str:
-    row = _team_row(team_id)
-    return str(row["name"] or "Команда") if row else default
-
-
-def create_match(tournament_id, round_no, slot_no, team_a_id, team_b_id, bracket="main") -> int:
-    """Создаёт матч. BYE (нет соперника) закрывается сразу автопроходом."""
-    init_tournament_tables()
-    conn = db.get_connection()
-    status = "pending"
-    winner = None
-    if team_a_id and not team_b_id:
-        status, winner = "bye", team_a_id
-    elif team_b_id and not team_a_id:
-        status, winner = "bye", team_b_id
-    cur = conn.execute(
-        "INSERT OR IGNORE INTO tournament_matches "
-        "(tournament_id, round_no, slot_no, bracket, team_a_id, team_b_id, winner_team_id, status) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (tournament_id, round_no, slot_no, bracket, team_a_id, team_b_id, winner, status),
-    )
-    conn.commit()
-    mid = int(cur.lastrowid or 0)
-    conn.close()
-    return mid
-
-
-def generate_first_round(tournament_id: int, teams) -> None:
-    """Создаёт матчи первого раунда по парам с автопроходами."""
-    names = [str(t["name"] or "Команда") for t in teams]
-    pairs, rounds, byes = build_bracket_pairs(names)
-    by_name = {str(t["name"] or "Команда"): t for t in teams}
-    for slot, (a, b) in enumerate(pairs, 1):
-        team_a = by_name.get(a)["id"] if a and by_name.get(a) else None
-        team_b = by_name.get(b)["id"] if b and by_name.get(b) else None
-        create_match(tournament_id, 1, slot, team_a, team_b)
-    _promote_byes(tournament_id)
-
-
-def _promote_byes(tournament_id: int) -> None:
-    """Продвигает автопроходы, пока появляются полностью укомплектованные пары."""
-    for _ in range(12):
-        byes = [m for m in get_tournament_matches(tournament_id, "main")
-                if m["status"] == "bye" and m["winner_team_id"]]
-        if not byes:
-            break
-        for m in byes:
-            _advance_winner(tournament_id, m, int(m["winner_team_id"]), None, silent=True)
-            # Автопроход всегда закрываем, чтобы не обрабатывать его повторно
-            conn = db.get_connection()
-            conn.execute("UPDATE tournament_matches SET status='done', "
-                         "finished_at=CURRENT_TIMESTAMP WHERE id=?", (int(m["id"]),))
-            conn.commit()
-            conn.close()
-
-
-def _next_slot(round_no: int, slot_no: int) -> tuple[int, int]:
-    return round_no + 1, (slot_no + 1) // 2
-
-
-def _advance_winner(tournament_id, match, winner_id, loser_id, silent=False) -> bool:
-    """Записывает победителя в матч следующего раунда. True — если что-то изменилось."""
-    init_tournament_tables()
-    conn = db.get_connection()
-    if match["status"] != "bye":
-        conn.execute(
-            "UPDATE tournament_matches SET status='done', winner_team_id=?, loser_team_id=?, "
-            "finished_at=CURRENT_TIMESTAMP WHERE id=?",
-            (winner_id, loser_id, int(match["id"])),
-        )
-    nr, ns = _next_slot(int(match["round_no"]), int(match["slot_no"]))
-    total = conn.execute(
-        "SELECT COUNT(*) c FROM tournament_matches WHERE tournament_id=? AND bracket='main' "
-        "AND round_no=?", (tournament_id, int(match["round_no"]))).fetchone()["c"]
-    changed = False
-    if total > 1:  # есть следующий раунд
-        nxt = conn.execute(
-            "SELECT * FROM tournament_matches WHERE tournament_id=? AND bracket='main' "
-            "AND round_no=? AND slot_no=?", (tournament_id, nr, ns)).fetchone()
-        side = "team_a_id" if int(match["slot_no"]) % 2 == 1 else "team_b_id"
-        if nxt is None:
-            conn.execute(
-                f"INSERT INTO tournament_matches (tournament_id, round_no, slot_no, bracket, {side}) "
-                f"VALUES (?, ?, ?, 'main', ?)", (tournament_id, nr, ns, winner_id))
-            changed = True
-        elif not nxt[side]:
-            conn.execute(f"UPDATE tournament_matches SET {side}=? WHERE id=?",
-                         (winner_id, int(nxt["id"])))
-            changed = True
-    conn.commit()
-    conn.close()
-    return changed
-
-
-def _ensure_third_place(tournament_id: int) -> int:
-    """Создаёт матч за 3-е место, когда оба полуфинала сыграны."""
-    mains = get_tournament_matches(tournament_id, "main")
-    if not mains:
-        return 0
-    last_round = max(int(m["round_no"]) for m in mains)
-    semis = [m for m in mains if int(m["round_no"]) == last_round - 1] if last_round >= 2 else []
-    if len(semis) != 2 or any(m["status"] not in ("done", "bye") or not m["loser_team_id"]
-                              for m in semis):
-        return 0
-    existing = [m for m in get_tournament_matches(tournament_id, "third")]
-    if existing:
-        return int(existing[0]["id"])
-    return create_match(tournament_id, last_round, 1,
-                        int(semis[0]["loser_team_id"]), int(semis[1]["loser_team_id"]),
-                        bracket="third")
-
-
-def _tournament_is_over(tournament_id: int) -> bool:
-    mains = get_tournament_matches(tournament_id, "main")
-    thirds = get_tournament_matches(tournament_id, "third")
-    if not mains:
-        return False
-    last_round = max(int(m["round_no"]) for m in mains)
-    final = [m for m in mains if int(m["round_no"]) == last_round]
-    if len(final) != 1 or final[0]["status"] not in ("done", "bye"):
-        return False
-    if thirds and thirds[0]["status"] not in ("done", "bye"):
-        return False
-    return True
-
-
-def _podium(tournament_id: int) -> str:
-    mains = get_tournament_matches(tournament_id, "main")
-    thirds = get_tournament_matches(tournament_id, "third")
-    last_round = max(int(m["round_no"]) for m in mains)
-    final = [m for m in mains if int(m["round_no"]) == last_round][0]
-    lines = [
-        f"🥇 1 место: <b>{hd.quote(_team_name(final['winner_team_id']))}</b>",
-        f"🥈 2 место: <b>{hd.quote(_team_name(final['loser_team_id']))}</b>",
-    ]
-    if thirds and thirds[0]["winner_team_id"]:
-        lines.append(f"🥉 3 место: <b>{hd.quote(_team_name(thirds[0]['winner_team_id']))}</b>")
-    return "\n".join(lines)
-
-
-def _bracket_board(tournament_id: int) -> str:
-    """Текущее состояние сетки: все раунды, включая матч за 3-е место."""
-    lines = []
-    mains = get_tournament_matches(tournament_id, "main")
-    if mains:
-        last_round = max(int(m["round_no"]) for m in mains)
-        for rnd in sorted({int(m["round_no"]) for m in mains}):
-            in_round = [m for m in mains if int(m["round_no"]) == rnd]
-            if rnd == last_round and len(in_round) == 1:
-                title = "🏁 Финал"
-            elif len(in_round) == 2:
-                title = "🥊 Полуфиналы"
-            else:
-                title = f"Раунд {rnd}"
-            lines.append(f"\n<b>{title}:</b>")
-            for m in in_round:
-                a = _team_name(m["team_a_id"], "ожидается")
-                b = _team_name(m["team_b_id"], "ожидается")
-                if m["status"] in ("done", "bye") and m["winner_team_id"]:
-                    win = _team_name(m["winner_team_id"])
-                    score = f" ({hd.quote(str(m['score_text']))})" if m["score_text"] else ""
-                    lines.append(f"• {hd.quote(a)} 🆚 {hd.quote(b)} → ✅ <b>{hd.quote(win)}</b>{score}")
-                else:
-                    lines.append(f"• {hd.quote(a)} 🆚 {hd.quote(b)}")
-    thirds = get_tournament_matches(tournament_id, "third")
-    if thirds:
-        m = thirds[0]
-        a, b = _team_name(m["team_a_id"], "ожидается"), _team_name(m["team_b_id"], "ожидается")
-        lines.append("\n<b>🥉 Матч за 3-е место:</b>")
-        if m["winner_team_id"]:
-            lines.append(f"• {hd.quote(a)} 🆚 {hd.quote(b)} → ✅ <b>{hd.quote(_team_name(m['winner_team_id']))}</b>")
-        else:
-            lines.append(f"• {hd.quote(a)} 🆚 {hd.quote(b)}")
-    return "\n".join(lines)
-
-
-async def _repost_bracket(bot: Bot, tournament_id: int):
-    """Обновляет пост сетки. Если редактирование невозможно (лимит 2 суток) —
-    удаляет старый пост и публикует новый."""
-    tournament = get_tournament(tournament_id)
-    teams = get_tournament_teams(tournament_id)
-    names = [str(t["name"] or "Команда") for t in teams]
-    finished = _tournament_is_over(tournament_id)
-    mark = _test_mark(tournament)
-    head = (f"{mark}🏁 <b>ТУРНИР #{tournament_id} ЗАВЕРШЁН</b>\n\n{_podium(tournament_id)}"
-            if finished else f"{mark}🔥 <b>ТУРНИР #{tournament_id}</b> — текущая сетка")
-    text = f"{head}\n{_bracket_board(tournament_id)}"
-    image = render_bracket_image(names, f"Турнир #{tournament_id} · сетка")
-
-    for post in get_tournament_posts(tournament_id):
-        edited = False
-        try:
-            if image is not None:
-                from aiogram.types import BufferedInputFile, InputMediaPhoto
-                image.seek(0)
-                media = InputMediaPhoto(
-                    media=BufferedInputFile(image.read(), filename=f"bracket_{tournament_id}.png"),
-                    caption=text[:1024], parse_mode="HTML")
-                await bot.edit_message_media(chat_id=post["chat_id"],
-                                             message_id=post["message_id"], media=media)
-            else:
-                await bot.edit_message_text(chat_id=post["chat_id"], message_id=post["message_id"],
-                                            text=text, parse_mode="HTML")
-            edited = True
-        except Exception as e:
-            logger.info(f"Пост турнира {tournament_id} не отредактирован ({e}), пересоздаю")
-
-        if edited:
-            continue
-        # Лимит редактирования истёк (2 суток) — удаляем старый пост и шлём новый
-        try:
-            await bot.delete_message(chat_id=post["chat_id"], message_id=post["message_id"])
-        except Exception:
-            pass
-        try:
-            if image is not None:
-                from aiogram.types import BufferedInputFile
-                image.seek(0)
-                photo = BufferedInputFile(image.read(), filename=f"bracket_{tournament_id}.png")
-                msg = await bot.send_photo(chat_id=post["chat_id"],
-                                           message_thread_id=post["thread_id"],
-                                           photo=photo, caption=text[:1024], parse_mode="HTML")
-            else:
-                msg = await bot.send_message(chat_id=post["chat_id"],
-                                             message_thread_id=post["thread_id"],
-                                             text=text, parse_mode="HTML")
-            conn = db.get_connection()
-            conn.execute("UPDATE tournament_posts SET message_id = ? WHERE id = ?",
-                         (msg.message_id, int(post["id"])))
-            conn.commit()
-            conn.close()
-        except Exception as e:
-            logger.warning(f"Не удалось пересоздать пост сетки турнира {tournament_id}: {e}")
-
-
-async def _notify_next_pairs(bot: Bot, tournament_id: int):
-    """Рассылает лидерам пары следующего раунда (включая матч за 3-е место)."""
-    tournament = get_tournament(tournament_id)
-    fmt = str(tournament["t_format"] or "BO3").upper()
-    fmt_label = "Бо3" if fmt == "BO3" else ("Бо5" if fmt == "BO5" else fmt)
-    for m in get_tournament_matches(tournament_id):
-        if m["status"] != "pending" or not m["team_a_id"] or not m["team_b_id"]:
-            continue
-        stage = "🥉 матч за 3-е место" if m["bracket"] == "third" else "следующий раунд"
-        for mine, rival in ((m["team_a_id"], m["team_b_id"]), (m["team_b_id"], m["team_a_id"])):
-            my_team, rival_team = _team_row(mine), _team_row(rival)
-            if not my_team or not rival_team:
-                continue
-            contact = await _leader_contact(int(rival_team["leader_id"]))
-            try:
-                await bot.send_message(
-                    int(my_team["leader_id"]),
-                    f"⚔️ <b>Турнир #{tournament_id}</b> — {stage}!\n\n"
-                    f"У вас скрим <b>{fmt_label}</b> против команды "
-                    f"<b>{hd.quote(str(rival_team['name']))}</b>, "
-                    f"спишитесь с их лидером: {contact}\n\n"
-                    f"После игры отправьте результат командой /result",
-                    parse_mode="HTML")
-            except Exception:
-                pass
-            await asyncio.sleep(0.05)
-
-
-def _find_user_pending_match(user_id: int):
-    """Ищет незавершённый матч, где пользователь — лидер одной из команд."""
-    init_tournament_tables()
-    conn = db.get_connection()
-    row = conn.execute("""
-        SELECT m.*, t.t_format, t.id AS tid FROM tournament_matches m
-        JOIN tournaments t ON t.id = m.tournament_id
-        LEFT JOIN tournament_teams ta ON ta.id = m.team_a_id
-        LEFT JOIN tournament_teams tb ON tb.id = m.team_b_id
-        WHERE t.status = 'running' AND m.status = 'pending'
-          AND m.team_a_id IS NOT NULL AND m.team_b_id IS NOT NULL
-          AND (ta.leader_id = ? OR tb.leader_id = ?)
-        ORDER BY m.round_no, m.slot_no LIMIT 1
-    """, (user_id, user_id)).fetchone()
-    conn.close()
-    return row
-
-
-# ─── Сдача результата лидером ───────────────────────────────────────────────
-
-class TournamentResultStates(StatesGroup):
-    waiting_result = State()
-
-
-@router.message(F.text.in_({"/result", "/результат"}))
-async def tournament_result_start(message: Message, state: FSMContext):
-    """Лидер отправляет результат матча: фото + текст."""
-    match = _find_user_pending_match(message.from_user.id)
-    if not match:
-        await message.answer("📭 Сейчас у тебя нет активных турнирных матчей, "
-                             "по которым нужно сдать результат.")
-        return
-    a, b = _team_name(match["team_a_id"]), _team_name(match["team_b_id"])
-    await state.set_state(TournamentResultStates.waiting_result)
-    await state.update_data(result_match_id=int(match["id"]))
-    await message.answer(
-        f"📸 <b>Результат матча</b>\n\n"
-        f"Матч: <b>{hd.quote(a)}</b> 🆚 <b>{hd.quote(b)}</b>\n\n"
-        f"Отправь <b>фотографию</b> с результатом игры и подписью к ней "
-        f"(например: «2:1, победили мы»).\n"
-        f"Можно прислать несколько фото — затем нажми «Готово».\n"
-        f"Для отмены отправь /cancel.",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="✅ Готово, отправить админам",
-                                 callback_data="trnres:send")]]),
-    )
-
-
-@router.message(TournamentResultStates.waiting_result, F.text.startswith("/"))
-async def tournament_result_cancel(message: Message, state: FSMContext):
-    await state.clear()
-    await message.answer("❌ Отправка результата отменена.")
-
-
-@router.message(TournamentResultStates.waiting_result, F.photo)
-async def tournament_result_photo(message: Message, state: FSMContext):
-    data = await state.get_data()
-    photos = list(data.get("result_photos") or [])
-    photos.append(message.photo[-1].file_id)
-    note = data.get("result_note") or ""
-    if message.caption:
-        note = (note + "\n" + message.caption).strip()
-    await state.update_data(result_photos=photos, result_note=note)
-    await message.answer(
-        f"📸 Скриншот №{len(photos)} принят. Пришли ещё или нажми «Готово».",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="✅ Готово, отправить админам",
-                                 callback_data="trnres:send")]]),
-    )
-
-
-@router.message(TournamentResultStates.waiting_result, F.text)
-async def tournament_result_text(message: Message, state: FSMContext):
-    data = await state.get_data()
-    note = ((data.get("result_note") or "") + "\n" + message.text).strip()
-    await state.update_data(result_note=note)
-    await message.answer(
-        "📝 Комментарий сохранён. Пришли фото результата или нажми «Готово».",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="✅ Готово, отправить админам",
-                                 callback_data="trnres:send")]]),
-    )
-
-
-@router.callback_query(F.data == "trnres:send")
-async def tournament_result_send(call: CallbackQuery, state: FSMContext, bot: Bot):
-    """Отправляет заявку с результатом в чат администрации."""
-    import json
-    data = await state.get_data()
-    match_id = int(data.get("result_match_id") or 0)
-    match = _m_get(match_id)
-    if not match or match["status"] != "pending":
-        await state.clear()
-        await call.answer("Матч уже закрыт", show_alert=True)
-        return
-    photos = list(data.get("result_photos") or [])
-    note = (data.get("result_note") or "").strip()
-    if not photos and not note:
-        await call.answer("Сначала пришли фото или текст результата", show_alert=True)
-        return
-    await state.clear()
-
-    team_a, team_b = _team_row(match["team_a_id"]), _team_row(match["team_b_id"])
-    reporter_team = team_a if team_a and int(team_a["leader_id"]) == call.from_user.id else team_b
-
-    conn = db.get_connection()
-    cur = conn.execute(
-        "INSERT INTO tournament_results (match_id, tournament_id, reporter_id, reporter_team_id, "
-        "text_note, photos) VALUES (?, ?, ?, ?, ?, ?)",
-        (match_id, int(match["tournament_id"]), call.from_user.id,
-         int(reporter_team["id"]) if reporter_team else None, note, json.dumps(photos)),
-    )
-    conn.commit()
-    result_id = int(cur.lastrowid)
-    conn.close()
-
-    name_a = str(team_a["name"] if team_a else "A")
-    name_b = str(team_b["name"] if team_b else "B")
-    stage = "🥉 матч за 3-е место" if match["bracket"] == "third" else f"раунд {match['round_no']}"
-    caption = (
-        f"📨 <b>Результат турнирного матча</b>\n\n"
-        f"Турнир #{match['tournament_id']} · {stage}\n"
-        f"Матч: <b>{hd.quote(name_a)}</b> 🆚 <b>{hd.quote(name_b)}</b>\n"
-        f"Отправил: {await _leader_contact(call.from_user.id)} "
-        f"(команда {hd.quote(str(reporter_team['name'] if reporter_team else '—'))})\n\n"
-        f"📝 Комментарий: {hd.quote(note) if note else '—'}\n\n"
-        f"Кто победил?"
-    )
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"✅ Да, победил {name_a[:20]}",
-                              callback_data=f"trnres:win:{result_id}:{match['team_a_id']}")],
-        [InlineKeyboardButton(text=f"❌ Нет, победил {name_b[:20]}",
-                              callback_data=f"trnres:win:{result_id}:{match['team_b_id']}")],
-        [InlineKeyboardButton(text="🚫 Отклонить заявку", callback_data=f"trnres:rej:{result_id}")],
-    ])
-    import config as _cfg
-    admin_chat = _cfg.ADMIN_CHAT_ID
-    try:
-        if photos:
-            from aiogram.types import InputMediaPhoto
-            if len(photos) > 1:
-                await bot.send_media_group(admin_chat,
-                                           [InputMediaPhoto(media=p) for p in photos[:10]])
-                await bot.send_message(admin_chat, caption, parse_mode="HTML", reply_markup=kb)
-            else:
-                await bot.send_photo(admin_chat, photos[0], caption=caption[:1024],
-                                     parse_mode="HTML", reply_markup=kb)
-        else:
-            await bot.send_message(admin_chat, caption, parse_mode="HTML", reply_markup=kb)
-    except Exception as e:
-        logger.error(f"Не удалось отправить результат {result_id} админам: {e}")
-        await call.message.answer("❌ Не удалось связаться с администрацией. Сообщи админу вручную.")
-        await call.answer()
-        return
-    await call.message.edit_text(
-        "✅ Результат отправлен администрации на подтверждение. "
-        "Как только админ подтвердит — сетка обновится.", reply_markup=None)
-    await call.answer("Отправлено")
-
-
-# ─── Модерация результата администратором ───────────────────────────────────
-
-@router.callback_query(F.data.startswith("trnres:win:"))
-async def tournament_result_confirm(call: CallbackQuery, bot: Bot):
-    """Админ подтверждает победителя → продвижение по сетке и обновление постов."""
-    if not await _cb_is_admin(call.from_user.id):
-        await call.answer("⛔ Нет прав", show_alert=True)
-        return
-    _, _, result_id, winner_id = call.data.split(":")
-    result_id, winner_id = int(result_id), int(winner_id)
-
-    conn = db.get_connection()
-    res = conn.execute("SELECT * FROM tournament_results WHERE id = ?", (result_id,)).fetchone()
-    conn.close()
-    if not res or res["status"] != "pending":
-        await call.answer("Заявка уже обработана", show_alert=True)
-        return
-    match = _m_get(int(res["match_id"]))
-    if not match or match["status"] != "pending":
-        await call.answer("Матч уже закрыт", show_alert=True)
-        return
-
-    loser_id = int(match["team_b_id"]) if winner_id == int(match["team_a_id"]) \
-        else int(match["team_a_id"])
-    tournament_id = int(match["tournament_id"])
-
-    conn = db.get_connection()
-    conn.execute("UPDATE tournament_results SET status='accepted', decided_by=?, "
-                 "decided_at=CURRENT_TIMESTAMP WHERE id=?", (call.from_user.id, result_id))
-    conn.execute("UPDATE tournament_matches SET score_text=? WHERE id=?",
-                 (str(res["text_note"] or "")[:60], int(match["id"])))
-    conn.commit()
-    conn.close()
-
-    _advance_winner(tournament_id, match, winner_id, loser_id)
-    _promote_byes(tournament_id)
-    third_id = _ensure_third_place(tournament_id)
-
-    win_name = _team_name(winner_id)
-    lose_name = _team_name(loser_id)
-    await call.message.edit_reply_markup(reply_markup=None)
-    await call.message.answer(
-        f"✅ Результат подтверждён: победила <b>{hd.quote(win_name)}</b> "
-        f"(админ {hd.quote(call.from_user.username or call.from_user.first_name or 'admin')}).",
-        parse_mode="HTML")
-    await call.answer("Подтверждено")
-
-    # Уведомляем обе команды
-    for team_id, text in (
-        (winner_id, f"🎉 Победа в турнире #{tournament_id} засчитана! Вы проходите дальше."),
-        (loser_id, f"😔 В турнире #{tournament_id} засчитано поражение против "
-                   f"«{hd.quote(win_name)}»."),
-    ):
-        row = _team_row(team_id)
-        if row:
-            try:
-                await bot.send_message(int(row["leader_id"]), text, parse_mode="HTML")
-            except Exception:
-                pass
-
-    if third_id:
-        logger.info(f"Турнир {tournament_id}: создан матч за 3-е место #{third_id}")
-    await _repost_bracket(bot, tournament_id)
-    await _notify_next_pairs(bot, tournament_id)
-
-    if _tournament_is_over(tournament_id):
-        set_tournament_status(tournament_id, "finished")
-        podium = _podium(tournament_id)
-        for t in get_tournament_teams(tournament_id):
-            try:
-                await bot.send_message(int(t["leader_id"]),
-                                       f"🏁 <b>Турнир #{tournament_id} завершён!</b>\n\n{podium}",
-                                       parse_mode="HTML")
-            except Exception:
-                pass
-            await asyncio.sleep(0.05)
-        await _repost_bracket(bot, tournament_id)
-
-    await log_admin_action(
-        bot=bot, admin_id=call.from_user.id,
-        admin_name=call.from_user.username or call.from_user.first_name or "admin",
-        action_text=(f"🏆 Подтвердил результат матча турнира #{tournament_id}: "
-                     f"победа «{win_name}» над «{lose_name}»."),
-    )
-
-
-@router.callback_query(F.data.startswith("trnres:rej:"))
-async def tournament_result_reject(call: CallbackQuery, bot: Bot):
-    """Админ отклоняет заявку с результатом."""
-    if not await _cb_is_admin(call.from_user.id):
-        await call.answer("⛔ Нет прав", show_alert=True)
-        return
-    result_id = int(call.data.rsplit(":", 1)[-1])
-    conn = db.get_connection()
-    res = conn.execute("SELECT * FROM tournament_results WHERE id = ?", (result_id,)).fetchone()
-    if not res or res["status"] != "pending":
-        conn.close()
-        await call.answer("Заявка уже обработана", show_alert=True)
-        return
-    conn.execute("UPDATE tournament_results SET status='rejected', decided_by=?, "
-                 "decided_at=CURRENT_TIMESTAMP WHERE id=?", (call.from_user.id, result_id))
-    conn.commit()
-    conn.close()
-    await call.message.edit_reply_markup(reply_markup=None)
-    await call.message.answer("🚫 Заявка с результатом отклонена.")
-    await call.answer("Отклонено")
-    try:
-        await bot.send_message(
-            int(res["reporter_id"]),
-            "🚫 Ваша заявка с результатом турнирного матча отклонена администрацией. "
-            "Проверьте скриншоты и отправьте результат заново через /result.")
-    except Exception:
-        pass
-
-
-async def tournament_scheduler_task(bot: Bot) -> None:
-    """Фоновая задача: раз в минуту стартует турниры, у которых наступило время."""
-    await asyncio.sleep(45)
-    while True:
-        try:
-            for row in get_due_tournaments():
-                try:
-                    await start_tournament(bot, int(row["id"]))
-                except Exception as e:
-                    logger.error(f"Ошибка автостарта турнира {row['id']}: {e}")
-        except Exception as e:
-            logger.error(f"tournament scheduler error: {e}")
-        await asyncio.sleep(60)
-
-
-@router.startup()
-async def _launch_tournament_scheduler(bot: Bot = None, **kwargs):
-    """Поднимает планировщик турниров вместе с ботом (без правок main.py)."""
-    bot = bot or kwargs.get("bot")
-    if bot is None:
-        return
-    init_tournament_tables()
-    asyncio.create_task(tournament_scheduler_task(bot))
-    logger.info("Планировщик автостарта турниров запущен")
-
-
-# ─── UI: «Текущие турниры» ───────────────────────────────────────────────────
-
-class TournamentAdminStates(StatesGroup):
-    waiting_new_limit = State()
-
-
-def _tournaments_list_kb(rows) -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-    for row in rows:
-        teams = get_tournament_teams(int(row["id"]))
-        mark = "🧪 " if _is_test(row) else ""
-        builder.button(
-            text=f"{mark}#{row['id']} {TOURNAMENT_TYPES.get(row['t_type'], row['t_type'])} · "
-                 f"{len(teams)} уч. · {row['starts_at']}",
-            callback_data=f"trnadm:open:{row['id']}",
-        )
-    builder.button(text="🔄 Обновить", callback_data="trnadm:list")
-    builder.adjust(1)
-    return builder.as_markup()
-
-
-def _tournament_admin_card(tournament, teams) -> str:
-    t_key = tournament["t_type"]
-    lines = [
-        f"{_test_mark(tournament)}🏆 <b>Турнир #{tournament['id']}</b>",
-        "",
-        f"• Статус: <b>{TOURNAMENT_STATUS_LABEL.get(tournament['status'], tournament['status'])}</b>",
-        f"• Тип: <b>{TOURNAMENT_TYPES.get(t_key, t_key)}</b>",
-    ]
-    if t_key != "showdown":
-        lines.append(f"• Формат матча: <b>{tournament['t_format'] or '—'}</b>")
-    lines.append(f"• {_limit_label(t_key)}: <b>{_limit_text(tournament['team_limit'], t_key)}</b>")
-    lines.append(f"• Старт: <b>{hd.quote(str(tournament['starts_at']))}</b>")
-    lines.append("")
-    unit = _limit_unit(t_key)
-    lines.append(f"📋 <b>Поданные составы ({len(teams)} {unit}):</b>")
-    if teams:
-        for i, t in enumerate(teams, 1):
-            tag = f" [{hd.quote(str(t['tag']))}]" if t["tag"] else ""
-            when = str(t["registered_at"] or "")[:16]
-            lines.append(
-                f"{i}. {hd.quote(str(t['name'] or 'Без названия'))}{tag} "
-                f"— лидер ID {t['leader_id']} · {hd.quote(when)}"
-            )
-    else:
-        lines.append("Пока никто не подал заявку.")
-    return "\n".join(lines)
-
-
-def _tournament_admin_kb(tournament) -> InlineKeyboardMarkup:
-    tid = int(tournament["id"])
-    rows = [
-        [InlineKeyboardButton(text="✏️ Изменить лимит команд", callback_data=f"trnadm:limit:{tid}")],
-        [InlineKeyboardButton(text="🔄 Обновить список", callback_data=f"trnadm:open:{tid}")],
-    ]
-    if tournament["status"] == "registration":
-        rows.append([InlineKeyboardButton(text="▶️ Запустить турнир сейчас",
-                                          callback_data=f"trnadm:start:{tid}")])
-        rows.append([InlineKeyboardButton(text="🚫 Отменить турнир",
-                                          callback_data=f"trnadm:cancel:{tid}")])
-    rows.append([InlineKeyboardButton(text="◀️ К списку турниров", callback_data="trnadm:list")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-@router.message(F.text == "📋 Текущие турниры")
-async def admin_current_tournaments(message: Message):
-    """Список активных турниров: выбор турнира для управления."""
-    member = await get_member(message.from_user.id)
-    if not member or not is_any_admin(member):
-        await message.answer("⛔ Доступ только для администрации.")
-        return
-    rows = get_active_tournaments()
-    if not rows:
-        await message.answer("📭 Активных турниров нет. Создай новый через «🏆 Создание турнира».",
-                             reply_markup=admin_scrims_keyboard())
-        return
-    await message.answer(
-        "📋 <b>Текущие турниры</b>\n\nВыбери турнир для управления:",
-        parse_mode="HTML", reply_markup=_tournaments_list_kb(rows),
-    )
-
-
-@router.callback_query(F.data == "trnadm:list")
-async def admin_tournaments_list(call: CallbackQuery):
-    if not await _cb_is_admin(call.from_user.id):
-        await call.answer("⛔ Нет прав", show_alert=True)
-        return
-    rows = get_active_tournaments()
-    if not rows:
-        await call.message.edit_text("📭 Активных турниров нет.", reply_markup=None)
-        await call.answer()
-        return
-    await call.message.edit_text(
-        "📋 <b>Текущие турниры</b>\n\nВыбери турнир для управления:",
-        parse_mode="HTML", reply_markup=_tournaments_list_kb(rows),
-    )
-    await call.answer()
-
-
-@router.callback_query(F.data.startswith("trnadm:open:"))
-async def admin_tournament_open(call: CallbackQuery):
-    """Карточка турнира: параметры + актуальный список поданных составов."""
-    if not await _cb_is_admin(call.from_user.id):
-        await call.answer("⛔ Нет прав", show_alert=True)
-        return
-    tid = int(call.data.rsplit(":", 1)[-1])
-    tournament = get_tournament(tid)
-    if not tournament:
-        await call.answer("Турнир не найден", show_alert=True)
-        return
-    teams = get_tournament_teams(tid)
-    parts = _split_text(_tournament_admin_card(tournament, teams))
-    try:
-        await call.message.edit_text(parts[-1] if len(parts) == 1 else parts[0],
-                                     parse_mode="HTML",
-                                     reply_markup=_tournament_admin_kb(tournament))
-    except Exception:
-        await call.message.answer(parts[0], parse_mode="HTML",
-                                  reply_markup=_tournament_admin_kb(tournament))
-    for extra in parts[1:]:
-        await call.message.answer(extra, parse_mode="HTML")
-    await call.answer()
-
-
-@router.callback_query(F.data.startswith("trnadm:limit:"))
-async def admin_tournament_limit_ask(call: CallbackQuery, state: FSMContext):
-    """Изменение лимита команд у активного турнира."""
-    if not await _cb_is_admin(call.from_user.id):
-        await call.answer("⛔ Нет прав", show_alert=True)
-        return
-    tid = int(call.data.rsplit(":", 1)[-1])
-    tournament = get_tournament(tid)
-    if not tournament:
-        await call.answer("Турнир не найден", show_alert=True)
-        return
-    teams = get_tournament_teams(tid)
-    unit = _limit_unit(tournament["t_type"])
-    await state.set_state(TournamentAdminStates.waiting_new_limit)
-    await state.update_data(edit_tournament_id=tid)
-    await call.message.edit_text(
-        f"✏️ <b>Лимит турнира #{tid}</b>\n\n"
-        f"Сейчас: <b>{_limit_text(tournament['team_limit'], tournament['t_type'])}</b>, "
-        f"уже подано: <b>{len(teams)}</b>.\n\n"
-        f"Отправь новое число <b>{unit}</b> (от {max(2, len(teams))} до 128) "
-        f"или нажми «♾ Снять лимит».\nДля отмены отправь /cancel.",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="♾ Снять лимит", callback_data=f"trnadm:nolimit:{tid}")],
-            [InlineKeyboardButton(text="◀️ Назад", callback_data=f"trnadm:open:{tid}")],
-        ]),
-    )
-    await call.answer()
-
-
-@router.callback_query(F.data.startswith("trnadm:nolimit:"))
-async def admin_tournament_no_limit(call: CallbackQuery, state: FSMContext, bot: Bot):
-    if not await _cb_is_admin(call.from_user.id):
-        await call.answer("⛔ Нет прав", show_alert=True)
-        return
-    tid = int(call.data.rsplit(":", 1)[-1])
-    set_tournament_limit(tid, None)
-    await state.clear()
-    await _refresh_tournament_posts(bot, tid)
-    tournament = get_tournament(tid)
-    await call.message.edit_text(
-        _tournament_admin_card(tournament, get_tournament_teams(tid)),
-        parse_mode="HTML", reply_markup=_tournament_admin_kb(tournament),
-    )
-    await call.answer("Лимит снят")
-
-
-@router.message(TournamentAdminStates.waiting_new_limit, F.text.startswith("/")
-                | F.text.in_(TOURNAMENT_GUARD_TEXTS))
-async def admin_tournament_limit_guard(message: Message, state: FSMContext):
-    await state.clear()
-    await message.answer("❌ Изменение лимита отменено.", reply_markup=admin_scrims_keyboard())
-
-
-@router.message(TournamentAdminStates.waiting_new_limit)
-async def admin_tournament_limit_save(message: Message, state: FSMContext, bot: Bot):
-    data = await state.get_data()
-    tid = int(data.get("edit_tournament_id") or 0)
-    tournament = get_tournament(tid)
-    if not tournament:
-        await state.clear()
-        await message.answer("❌ Турнир не найден.", reply_markup=admin_scrims_keyboard())
-        return
-    teams = get_tournament_teams(tid)
-    unit = _limit_unit(tournament["t_type"])
-    text = (message.text or "").strip()
-    if not text.isdigit() or not (2 <= int(text) <= 128):
-        await message.answer(f"❌ Нужно целое число {unit} от 2 до 128. "
-                             f"Попробуй ещё раз или отправь /cancel.")
-        return
-    new_limit = int(text)
-    if new_limit < len(teams):
-        await message.answer(
-            f"❌ Лимит не может быть меньше числа уже поданных заявок ({len(teams)}). "
-            f"Введи число от {len(teams)} или отправь /cancel."
-        )
-        return
-    set_tournament_limit(tid, new_limit)
-    await state.clear()
-    await _refresh_tournament_posts(bot, tid)
-    tournament = get_tournament(tid)
-    await message.answer(
-        f"✅ Лимит турнира #{tid} изменён на <b>{new_limit} {unit}</b>.",
-        parse_mode="HTML", reply_markup=admin_scrims_keyboard(),
-    )
-    await message.answer(
-        _tournament_admin_card(tournament, get_tournament_teams(tid)),
-        parse_mode="HTML", reply_markup=_tournament_admin_kb(tournament),
-    )
-    await log_admin_action(
-        bot=bot, admin_id=message.from_user.id,
-        admin_name=message.from_user.username or message.from_user.first_name or "admin",
-        action_text=f"✏️ Изменил лимит турнира #{tid} на {new_limit} {unit}.",
-    )
-
-
-@router.callback_query(F.data.startswith("trnadm:start:"), ~F.data.startswith("trnadm:start_yes:"))
-async def admin_tournament_start_ask(call: CallbackQuery):
-    if not await _cb_is_admin(call.from_user.id):
-        await call.answer("⛔ Нет прав", show_alert=True)
-        return
-    tid = int(call.data.rsplit(":", 1)[-1])
-    await call.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text=f"✅ Да, запустить #{tid}", callback_data=f"trnadm:start_yes:{tid}"),
-        InlineKeyboardButton(text="❌ Отмена", callback_data=f"trnadm:open:{tid}"),
-    ]]))
-    await call.answer("Подтвердите запуск")
-
-
-@router.callback_query(F.data.startswith("trnadm:start_yes:"))
-async def admin_tournament_start_yes(call: CallbackQuery, bot: Bot):
-    """Ручной досрочный старт турнира администратором."""
-    if not await _cb_is_admin(call.from_user.id):
-        await call.answer("⛔ Нет прав", show_alert=True)
-        return
-    tid = int(call.data.rsplit(":", 1)[-1])
-    await call.answer("Запускаю турнир...")
-    result = await start_tournament(bot, tid, manual_by=call.from_user.id)
-    if result is None:
-        await call.message.edit_text(f"⚠️ Турнир #{tid} уже запущен или не найден.", reply_markup=None)
-        return
-    if result.get("cancelled"):
-        await call.message.edit_text(
-            f"🚫 Турнир #{tid} отменён: участников недостаточно ({result['teams']}).",
-            reply_markup=None,
-        )
-        return
-    await call.message.edit_text(
-        f"🔥 <b>Турнир #{tid} запущен!</b>\n\n"
-        f"Участников: <b>{result['teams']}</b>, автопроходов: <b>{result.get('byes', 0)}</b>.\n"
-        f"Уведомлений лидерам отправлено: <b>{result['notified']}</b>.\n"
-        f"Финальная сетка и расписание пар опубликованы в топиках.",
-        parse_mode="HTML", reply_markup=None,
-    )
-    await log_admin_action(
-        bot=bot, admin_id=call.from_user.id,
-        admin_name=call.from_user.username or call.from_user.first_name or "admin",
-        action_text=f"▶️ Досрочно запустил турнир #{tid} ({result['teams']} участников).",
-    )
-
-
-@router.callback_query(F.data.startswith("trnadm:cancel:"))
-async def admin_tournament_cancel(call: CallbackQuery, bot: Bot):
-    """Отмена турнира администратором с уведомлением участников."""
-    if not await _cb_is_admin(call.from_user.id):
-        await call.answer("⛔ Нет прав", show_alert=True)
-        return
-    tid = int(call.data.rsplit(":", 1)[-1])
-    if not set_tournament_status(tid, "cancelled"):
-        await call.answer("Турнир уже закрыт", show_alert=True)
-        return
-    teams = get_tournament_teams(tid)
-    for t in teams:
-        try:
-            await bot.send_message(int(t["leader_id"]),
-                                   f"🚫 Турнир #{tid} отменён администрацией.")
-        except Exception:
-            pass
-    for post in get_tournament_posts(tid):
-        try:
-            await bot.edit_message_reply_markup(chat_id=post["chat_id"],
-                                                message_id=post["message_id"], reply_markup=None)
-        except Exception:
-            pass
-    await call.message.edit_text(f"🚫 Турнир #{tid} отменён. Уведомлено команд: {len(teams)}.",
-                                 reply_markup=None)
-    await call.answer("Турнир отменён")
-    await log_admin_action(
-        bot=bot, admin_id=call.from_user.id,
-        admin_name=call.from_user.username or call.from_user.first_name or "admin",
-        action_text=f"🚫 Отменил турнир #{tid}.",
     )
 
 # ─── ЛОГИКА ОТКРЫТИЯ ПАПКИ ПУШ-СИСТЕМЫ ─────────────────────────────────────────
@@ -2626,10 +3449,12 @@ async def cmd_auto_setup_vigarik_threads(message: Message, bot: Bot):
 
 @router.message(F.text == "/get_id")
 async def cmd_get_chat_id_live(message: Message):
-    """Временная команда для моментального получения ID группы."""
+    """Показывает ID чата и текущего топика (нужен для настройки топиков «Турниры»)."""
+    thread_id = message.message_thread_id
     await message.answer(
         f"🆔 ID этого чата: {message.chat.id} \n"
-        f"📌 Скопируй его и вставь в config.py в поле LOGS_CHAT_ID"
+        f"📌 ID текущего топика: {thread_id if thread_id else 'General (без топика)'} \n\n"
+        "Для топика «Турниры» скопируй ID топика и внеси через «⚙️ Топики турниров».",
     )
 
 @router.callback_query(F.data == "run_username_check")
