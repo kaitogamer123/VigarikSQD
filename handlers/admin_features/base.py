@@ -1448,7 +1448,9 @@ BR_WIN = (88, 158, 121)       # прошедший дальше (линия/по
 
 def render_bracket_image(columns, title: str, subtitle: str = "",
                          third=None, solo: bool = False, labels=None,
-                         playin=None, placements=None) -> bytes | None:
+                         playin=None, placements=None,
+                         active_col: int | None = None,
+                         active_playin: bool = False) -> bytes | None:
     """Сетка турнира в сдержанном редакционном стиле.
 
     columns[0] — участники, columns[r] — победители раунда r.
@@ -1466,9 +1468,13 @@ def render_bracket_image(columns, title: str, subtitle: str = "",
         total_rounds = max(0, len(columns) - 1)
 
         def stage_label(col_index: int) -> str:
-            # последняя колонка — уже не матч, а обладатель места
+            # последняя колонка — обладатель места; пока финал не закрыт, это «Финал»
             if not solo and len(columns) > 1 and col_index == len(columns) - 1:
-                return "Чемпион"
+                champ = _clean_team(columns[-1][0] if columns[-1] else "")
+                decided = bool(champ) and champ.upper() != "BYE" and not any(
+                    w in champ for w in ("Победитель", "Финал", "Полуфинал", "1/", "ждёт", "—")
+                )
+                return "Чемпион" if decided else "Финал"
             if labels and col_index < len(labels) and labels[col_index]:
                 return labels[col_index]
             if col_index <= 0:
@@ -1487,12 +1493,14 @@ def render_bracket_image(columns, title: str, subtitle: str = "",
         top = label_y + 26
 
         rows = len(columns[0])
-        third_h = 112 if (third and (third.get("side_a") or third.get("side_b"))) else 0
-        playin_h = 0
-        if playin:
-            playin_h = 40 + 26 * math.ceil(len(playin) / 2) + 16
-        extra = playin_h + third_h
-        height = max(520, top + rows * row_h - v_gap + (48 if extra else 56) + extra)
+        bottom = top + rows * row_h - v_gap
+        third_h = 96 if (third and (third.get("side_a") or third.get("side_b"))) else 0
+        playin_rows = math.ceil(len(playin) / 2) if playin else 0
+        # нижние блоки: больше воздуха перед карточкой за 3-4 места
+        playin_block = (44 + 30 + 26 * playin_rows + 24) if playin else 0
+        third_block = (52 + third_h + 56) if third_h else 0
+        height = max(520, bottom + (56 if not (playin or third_h) else 0)
+                     + playin_block + third_block)
         width = max(980, pad * 2 + len(columns) * box_w + (len(columns) - 1) * gap_x)
 
         img = Image.new("RGB", (width, height), BR_BG)
@@ -1545,8 +1553,14 @@ def render_bracket_image(columns, title: str, subtitle: str = "",
                     centers.append((a + b) / 2)
             col_positions.append(centers)
             x = pad + c * (box_w + gap_x)
-            draw.text((x, label_y), _fit_text(draw, stage_label(c).upper(), f_stage, box_w),
-                      font=f_stage, fill=BR_MUTED)
+            is_active = active_col is not None and c == active_col
+            label_text = stage_label(c).upper()
+            draw.text((x, label_y), _fit_text(draw, label_text, f_stage, box_w),
+                      font=f_stage, fill=(126, 201, 160) if is_active else BR_MUTED)
+            if is_active:
+                # тонкая зелёная черта + подпись «текущий раунд»
+                bar_w = min(box_w, draw.textlength(label_text, font=f_stage) + 4)
+                draw.rectangle([x, label_y + 17, x + bar_w, label_y + 19], fill=BR_WIN)
 
         # коннекторы рисуются первыми и уходят под карточки
         for c in range(1, len(columns)):
@@ -1592,11 +1606,14 @@ def render_bracket_image(columns, title: str, subtitle: str = "",
 
         # предварительный раунд
         if playin:
-            y0 = top + rows * row_h - v_gap + 10
-            draw.text((pad, y0), "ПРЕДВАРИТЕЛЬНЫЙ РАУНД", font=f_stage, fill=BR_MUTED)
+            y0 = bottom + 48
+            draw.text((pad, y0), "ПРЕДВАРИТЕЛЬНЫЙ РАУНД", font=f_stage,
+                      fill=(126, 201, 160) if active_playin else BR_MUTED)
+            if active_playin:
+                draw.rectangle([pad, y0 + 17, pad + 128, y0 + 19], fill=BR_WIN)
             for i, (a, b) in enumerate(playin):
                 px = pad + (i % 2) * (box_w + gap_x)
-                py = y0 + 26 + (i // 2) * 26
+                py = y0 + 30 + (i // 2) * 26
                 draw.text((px, py),
                           _fit_text(draw, f"{_clean_team(a)}  ·  {_clean_team(b)}",
                                     f_slot, box_w + gap_x - 24),
@@ -1604,17 +1621,17 @@ def render_bracket_image(columns, title: str, subtitle: str = "",
 
         # матч за 3-4 места: обычная карточка с акцентной полосой
         if third_h:
-            y0 = top + rows * row_h - v_gap + 10
+            y0 = bottom + 52
             if playin:
-                y0 += playin_h
+                y0 = bottom + playin_block + 40
             box3_w = min(width - pad * 2, box_w * 2 + gap_x)
             draw.rounded_rectangle([pad, y0, pad + box3_w, y0 + 92], radius=8,
                                    fill=BR_SURFACE, outline=BR_LINE, width=1)
             draw.rectangle([pad, y0 + 1, pad + 3, y0 + 91], fill=BR_COPPER)
             draw.text((pad + 20, y0 + 14), "МАТЧ ЗА 3-4 МЕСТА",
                       font=f_stage, fill=BR_COPPER)
-            a = _clean_team(third.get("side_a") or "ждём проигравшего полуфинала")
-            b = _clean_team(third.get("side_b") or "ждём проигравшего полуфинала")
+            a = _clean_team(third.get("side_a") or "ждёт полуфинала")
+            b = _clean_team(third.get("side_b") or "ждёт полуфинала")
             winner = _clean_team(third.get("winner") or "")
             draw.text((pad + 20, y0 + 36),
                       _fit_text(draw, f"{a}   ·   {b}", f_slot, box3_w - 40),
@@ -1687,11 +1704,35 @@ def _bracket_columns_for(row, participants=None):
                 # явная пара, чтобы в боксе не было «[ ]» и «vs vs»
                 col.append(f"{m['side_a']} vs {m['side_b']}")
             elif m.get("side_a") or m.get("side_b"):
-                col.append(f"{m.get('side_a') or m.get('side_b')} · ждёт соперника")
+                # компактно: «TEST-05 · ждёт» вместо обрезанного «ждёт сопер…»
+                col.append(f"{_clean_team(m.get('side_a') or m.get('side_b'))} · ждёт")
             else:
-                col.append(f"Победитель {_stage_label(row, r)} №{i + 1}")
+                # ещё не сыгранная пара — короткое имя стадии: «1/4 финала», «Полуфинал», «Финал»
+                col.append(_stage_label(row, r))
         columns.append(col)
     return columns, get_third_place_match(row["id"]), playin
+
+
+def _active_column(row, playin) -> int | None:
+    """Колонка текущего раунда (для зелёной подсветки заголовка).
+
+    Возвращает None, когда идёт предварительный раунд: он рисуется отдельным блоком.
+    """
+    has_playin = bool(playin)
+    total = _total_rounds(_bracket_size(row))
+    for r in range(1, total + 1):
+        matches = get_tournament_matches(row["id"], r)
+        if not matches:
+            if has_playin and r == 1:
+                return None
+            return (r - 1) if has_playin else r
+        pending = [m for m in matches
+                   if not m.get("winner") and m.get("status") not in ("bye", "solo")]
+        if pending:
+            if has_playin and r == 1:
+                return None      # предвариловка показана отдельным блоком
+            return (r - 1) if has_playin else r
+    return None
 
 
 def _bracket_subtitle(row, participants=None) -> str:
@@ -1719,6 +1760,17 @@ def _render_for_row(row, title_suffix: str = "", participants=None) -> bytes | N
     # в заголовке не дублируем; «актуальная сетка» оставляем только до финала
     suffix = "" if placements else title_suffix
     test_mark = " · ТЕСТ" if is_test_tournament(row) else ""
+    active_col = _active_column(row, playin)
+    active_playin = False
+    if playin:
+        try:
+            playin_matches = get_tournament_matches(int(row["id"]), 1)
+            active_playin = any(
+                not m.get("winner") and m.get("status") not in ("bye", "solo")
+                for m in playin_matches
+            )
+        except Exception:
+            active_playin = False
     return render_bracket_image(
         columns,
         f"Турнир #{row['id']} · {row['t_type']}{suffix}{test_mark}",
@@ -1728,6 +1780,8 @@ def _render_for_row(row, title_suffix: str = "", participants=None) -> bytes | N
         labels=labels,
         playin=playin,
         placements=placements,
+        active_col=active_col,
+        active_playin=active_playin,
     )
 
 
@@ -2876,8 +2930,8 @@ def _open_matches_for_admin(tid: int) -> list[dict]:
 
 def _match_title(row, m) -> str:
     stage = _stage_label(row, int(m["round"]))
-    a = m["side_a"] or "ждёт соперника"
-    b = m["side_b"] or "ждёт соперника"
+    a = m["side_a"] or "ждёт"
+    b = m["side_b"] or "ждёт"
     return f"{stage}: {a} 🆚 {b}"
 
 
