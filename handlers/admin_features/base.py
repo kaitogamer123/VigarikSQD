@@ -562,6 +562,7 @@ def ensure_tournament_tables() -> None:
             tournament_id INTEGER NOT NULL,
             chat_id INTEGER NOT NULL,
             message_id INTEGER NOT NULL,
+            thread_id INTEGER,
             kind TEXT DEFAULT 'bracket',
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             UNIQUE (tournament_id, chat_id, kind),
@@ -585,6 +586,10 @@ def ensure_tournament_tables() -> None:
         cur.execute("ALTER TABLE tournament_matches ADD COLUMN resolved_by INTEGER")
     if "resolved_at" not in mcols:
         cur.execute("ALTER TABLE tournament_matches ADD COLUMN resolved_at DATETIME")
+    # thread_id нужен, чтобы пересоздавать пост сетки именно в топике, а не в общем чате
+    pcols = {row["name"] for row in cur.execute("PRAGMA table_info(tournament_posts)").fetchall()}
+    if "thread_id" not in pcols:
+        cur.execute("ALTER TABLE tournament_posts ADD COLUMN thread_id INTEGER")
     cur.execute("""
         UPDATE tournaments SET scheduled_at = (
             SELECT substr(scheduled_text, 7, 4) || '-' || substr(scheduled_text, 4, 2) || '-'
@@ -644,7 +649,8 @@ def get_tournament(tournament_id: int):
     conn = db.get_connection()
     row = conn.execute("SELECT * FROM tournaments WHERE id = ?", (int(tournament_id),)).fetchone()
     conn.close()
-    return row
+    # dict, а не sqlite3.Row: дальше по коду используются .get()
+    return dict(row) if row else None
 
 
 def get_tournaments(limit: int = 10):
@@ -654,7 +660,7 @@ def get_tournaments(limit: int = 10):
         "SELECT * FROM tournaments ORDER BY id DESC LIMIT ?", (int(limit),)
     ).fetchall()
     conn.close()
-    return rows
+    return [dict(r) for r in rows]
 
 
 # ─── Этап 4: активные турниры, правка лимитов, матчи, автостарт ─────────────
@@ -672,7 +678,7 @@ def get_active_tournaments():
         TOURNAMENT_ACTIVE_STATUSES,
     ).fetchall()
     conn.close()
-    return rows
+    return [dict(r) for r in rows]
 
 
 def get_due_tournaments(now_iso: str):
@@ -685,7 +691,7 @@ def get_due_tournaments(now_iso: str):
         ("registration", "announced", now_iso),
     ).fetchall()
     conn.close()
-    return rows
+    return [dict(r) for r in rows]
 
 
 def update_tournament_limit(tournament_id: int, team_limit) -> None:
@@ -746,7 +752,7 @@ def get_tournament_matches(tournament_id: int, round_no: int = 1):
         (int(tournament_id), int(round_no)),
     ).fetchall()
     conn.close()
-    return rows
+    return [dict(r) for r in rows]
 
 
 def tournament_matches_exist(tournament_id: int) -> bool:
@@ -764,7 +770,7 @@ def get_match(match_id: int):
     conn = db.get_connection()
     row = conn.execute("SELECT * FROM tournament_matches WHERE id = ?", (int(match_id),)).fetchone()
     conn.close()
-    return row
+    return dict(row) if row else None
 
 
 def set_match_winner(match_id: int, winner: str, status: str, admin_id: int) -> None:
@@ -825,7 +831,7 @@ def get_match_report(report_id: int):
     conn = db.get_connection()
     row = conn.execute("SELECT * FROM match_reports WHERE id = ?", (int(report_id),)).fetchone()
     conn.close()
-    return row
+    return dict(row) if row else None
 
 
 def get_pending_reports(limit: int = 15):
@@ -835,7 +841,7 @@ def get_pending_reports(limit: int = 15):
         "SELECT * FROM match_reports WHERE status = 'pending' ORDER BY id DESC LIMIT ?", (int(limit),)
     ).fetchall()
     conn.close()
-    return rows
+    return [dict(r) for r in rows]
 
 
 def set_match_report_status(report_id: int, status: str, admin_id: int) -> None:
@@ -862,14 +868,17 @@ def has_pending_report(match_id: int) -> bool:
 
 # ─── Посты с сеткой (Этап 5, п.3: обновление с учётом лимита 2 дня) ─────────
 
-def save_bracket_post(tournament_id: int, chat_id: int, message_id: int, kind: str = "bracket") -> None:
+def save_bracket_post(tournament_id: int, chat_id: int, message_id: int,
+                      kind: str = "bracket", thread_id=None) -> None:
     ensure_tournament_tables()
     conn = db.get_connection()
     conn.execute(
-        "INSERT INTO tournament_posts (tournament_id, chat_id, message_id, kind) VALUES (?, ?, ?, ?) "
+        "INSERT INTO tournament_posts (tournament_id, chat_id, message_id, thread_id, kind) "
+        "VALUES (?, ?, ?, ?, ?) "
         "ON CONFLICT (tournament_id, chat_id, kind) DO UPDATE SET message_id = excluded.message_id, "
-        "created_at = CURRENT_TIMESTAMP",
-        (int(tournament_id), int(chat_id), int(message_id), kind),
+        "thread_id = excluded.thread_id, created_at = CURRENT_TIMESTAMP",
+        (int(tournament_id), int(chat_id), int(message_id),
+         int(thread_id) if thread_id else None, kind),
     )
     conn.commit()
     conn.close()
@@ -883,7 +892,7 @@ def get_bracket_posts(tournament_id: int, kind: str = "bracket"):
         (int(tournament_id), kind),
     ).fetchall()
     conn.close()
-    return rows
+    return [dict(r) for r in rows]
 
 
 def delete_bracket_post(post_id: int) -> None:
@@ -991,7 +1000,7 @@ def get_third_place_match(tournament_id: int):
         (int(tournament_id),),
     ).fetchone()
     conn.close()
-    return row
+    return dict(row) if row else None
 
 
 def set_tournament_status(tournament_id: int, status: str) -> None:
@@ -1040,7 +1049,7 @@ def get_tournament_participants(tournament_id: int):
         (int(tournament_id),),
     ).fetchall()
     conn.close()
-    return rows
+    return [dict(r) for r in rows]
 
 
 def count_test_participants(tournament_id: int) -> int:
@@ -1121,6 +1130,22 @@ async def save_tournament_topic(clan_key: str, topic_id: int) -> None:
     await set_setting(f"{TOURNAMENT_SETTINGS_PREFIX}{clan_key}", str(int(topic_id)))
 
 
+async def _test_publish_targets() -> list[tuple[int, int | None, str]]:
+    """🧪 Тестовый турнир: посты идут ТОЛЬКО в топик основы (Squad).
+
+    ID топика берётся из настроек «⚙️ Топики турниров» (ключ tournament_topic_squad).
+    Если он не задан — падаем в админ-чат, чтобы не потерять пост.
+    """
+    chat_id = (config.CLAN_CHATS.get("squad") or {}).get("chat_id")
+    raw_topic = await get_setting(f"{TOURNAMENT_SETTINGS_PREFIX}squad")
+    if chat_id and raw_topic and str(raw_topic).strip().lstrip("-").isdigit():
+        return [(int(chat_id), int(str(raw_topic).strip()), "🧪 основа (Squad)")]
+    if config.ADMIN_CHAT_ID:
+        return [(int(config.ADMIN_CHAT_ID), None,
+                 "🧪 админ-чат (топик основы не задан — ⚙️ Топики турниров)")]
+    return []
+
+
 # ─── Сетка: слоты и автопроходы/BYE ─────────────────────────────────────────
 
 def _bracket_slots_for(t_type: str, team_limit) -> list[str]:
@@ -1137,7 +1162,8 @@ def _bracket_slots_for(t_type: str, team_limit) -> list[str]:
         size *= 2
     slots = []
     byes = size - target
-    real = [f"Команда {i}" for i in range(1, target + 1)]
+    # до регистрации показываем честные «свободные слоты», а не выдуманные команды
+    real = [f"Свободный слот {i}" for i in range(1, target + 1)]
     # BYE распределяем в конец пар, чтобы «живые» команды встречались между собой
     ordered: list[str] = []
     insert_positions = set()
@@ -1191,76 +1217,246 @@ def _load_font(size: int):
         return ImageFont.load_default()
 
 
-def render_bracket_image(slots: list[str], title: str) -> bytes | None:
-    """Рисует PNG с сеткой. Возвращает None, если Pillow недоступен."""
+def _fit_text(draw, text, font, max_width: int) -> str:
+    """Обрезает подпись по пикселям, чтобы она не вылезала из бокса."""
+    text = str(text or "").strip() or "—"
+    try:
+        if draw.textlength(text, font=font) <= max_width:
+            return text
+        while len(text) > 1 and draw.textlength(text + "…", font=font) > max_width:
+            text = text[:-1]
+        return text + "…"
+    except Exception:
+        return text[:28]
+
+
+def _round_title(total: int, round_no: int) -> str:
+    """1/8 финала / 1/4 финала / Полуфинал / Финал."""
+    total = max(1, int(total))
+    round_no = max(1, int(round_no))
+    if round_no >= total:
+        return "Финал"
+    if round_no == total - 1:
+        return "Полуфинал"
+    return f"1/{2 ** (total - round_no)} финала"
+
+
+def render_bracket_image(columns, title: str, subtitle: str = "",
+                         third=None, solo: bool = False) -> bytes | None:
+    """Красивая сетка: колонки по раундам, ровные линии, реальные названия команд.
+
+    columns[0] — участники, columns[r] — победители раунда r.
+    BYE подсвечивается серым, известные победители — зелёным.
+    """
     if not PIL_AVAILABLE:
         return None
     try:
-        # сетка работает корректно только со степенью двойки — дополняем BYE
-        slots = list(slots or [])
-        size = 1
-        while size < max(2, len(slots)):
-            size *= 2
-        slots = slots + ["BYE"] * (size - len(slots))
-        total = max(2, len(slots))
-        rounds = max(1, int(math.log2(total)))
-        slot_h, slot_w, gap_x, pad = 92, 300, 78, 60
-        width = pad * 2 + rounds * slot_w + (rounds - 1) * gap_x
-        height = total * slot_h + pad * 2 + 110
+        columns = [list(col) for col in (columns or [])]
+        if not columns:
+            columns = [["Свободный слот", "Свободный слот"]]
+        if solo:
+            total_rounds = 0
+        else:
+            size = 1
+            while size < max(2, len(columns[0])):
+                size *= 2
+            columns[0] = list(columns[0]) + ["BYE"] * (size - len(columns[0]))
+            total_rounds = max(1, int(math.log2(size)))
+            while len(columns) < total_rounds + 1:
+                prev = columns[-1]
+                round_no = len(columns)
+                columns.append([f"Победитель {_round_title(total_rounds, round_no)} "
+                                f"№{i + 1}" for i in range(max(1, len(prev) // 2))])
+            columns = columns[:total_rounds + 1]
 
-        img = Image.new("RGB", (width, height), (17, 21, 33))
+        box_w, box_h, v_gap, gap_x, pad = 264, 58, 20, 66, 42
+        row_h = box_h + v_gap
+        header_h = 148
+        base_h = header_h + len(columns[0]) * row_h + pad
+        third_h = 132 if (third and (third.get("side_a") or third.get("side_b"))) else 0
+        height = max(560, base_h + third_h + (36 if third_h else 0))
+        width = max(1000, pad * 2 + len(columns) * box_w + (len(columns) - 1) * gap_x)
+
+        img = Image.new("RGB", (width, height), (15, 20, 32))
         draw = ImageDraw.Draw(img)
-        f_title = _load_font(46)
-        f_slot = _load_font(28)
-        f_small = _load_font(22)
+        f_title = _load_font(38)
+        f_sub = _load_font(19)
+        f_round = _load_font(18)
+        f_slot = _load_font(20)
+        f_small = _load_font(16)
+        f_third = _load_font(22)
 
-        draw.text((pad, 26), title, font=f_title, fill=(255, 214, 102))
-        draw.text((pad, 86), f"Сетка на {total} позиций · автопроходы (BYE) учтены",
-                  font=f_small, fill=(150, 165, 195))
+        # фон-шапка
+        draw.rectangle([0, 0, width, 112], fill=(22, 29, 46))
+        draw.rectangle([0, 110, width, 114], fill=(255, 209, 102))
+        draw.text((pad, 24), _fit_text(draw, title, f_title, width - pad * 2),
+                  font=f_title, fill=(255, 214, 102))
+        if subtitle:
+            draw.text((pad, 74), _fit_text(draw, subtitle, f_sub, width - pad * 2),
+                      font=f_sub, fill=(166, 181, 208))
 
-        def slot_box(x, y, text, muted=False):
+        top = header_h
+        col_positions: list[list[float]] = []
+        for c, col in enumerate(columns):
+            if c == 0:
+                centers = [top + i * row_h + box_h / 2 for i in range(len(col))]
+            else:
+                prev = col_positions[c - 1]
+                centers = []
+                for i in range(len(col)):
+                    a = prev[2 * i] if 2 * i < len(prev) else prev[-1]
+                    b = prev[2 * i + 1] if 2 * i + 1 < len(prev) else a
+                    centers.append((a + b) / 2)
+            col_positions.append(centers)
+
+            x = pad + c * (box_w + gap_x)
+            round_label = "Участники" if c == 0 else _round_title(total_rounds, c)
+            if solo:
+                round_label = "Участники ShowDown"
+            label_w = draw.textlength(round_label, font=f_round)
+            draw.text((x + (box_w - label_w) / 2, top - 32), round_label,
+                      font=f_round, fill=(120, 150, 210))
+
+        # линии между колонками
+        for c in range(1, len(columns)):
+            x_prev = pad + (c - 1) * (box_w + gap_x) + box_w
+            x_cur = pad + c * (box_w + gap_x)
+            mid_x = x_prev + gap_x / 2
+            for i, y_cur in enumerate(col_positions[c]):
+                y_a = col_positions[c - 1][2 * i] if 2 * i < len(col_positions[c - 1]) else y_cur
+                y_b = col_positions[c - 1][2 * i + 1] if 2 * i + 1 < len(col_positions[c - 1]) else y_a
+                draw.line([(x_prev, y_a), (mid_x, y_a)], fill=(70, 92, 136), width=2)
+                draw.line([(x_prev, y_b), (mid_x, y_b)], fill=(70, 92, 136), width=2)
+                draw.line([(mid_x, y_a), (mid_x, y_b)], fill=(70, 92, 136), width=2)
+                draw.line([(mid_x, y_cur), (x_cur, y_cur)], fill=(70, 92, 136), width=2)
+
+        # боксы
+        placeholder_words = ("Победитель", "Свободный слот", "Слот ", "ждёт соперника", "?")
+        for c, col in enumerate(columns):
+            x = pad + c * (box_w + gap_x)
+            for i, name in enumerate(col):
+                cy = col_positions[c][i]
+                name = str(name or "—")
+                is_bye = name.strip().upper() == "BYE"
+                is_placeholder = any(w in name for w in placeholder_words) or name.strip() == "—"
+                is_winner = (not is_placeholder) and (not is_bye) and c > 0
+                if is_bye:
+                    fill, outline, color = (24, 30, 44), (52, 64, 88), (110, 122, 146)
+                elif is_placeholder:
+                    fill, outline, color = (26, 33, 49), (64, 80, 110), (126, 141, 168)
+                elif is_winner:
+                    fill, outline, color = (21, 52, 44), (52, 211, 153), (209, 250, 229)
+                else:
+                    fill, outline, color = (30, 38, 57), (88, 108, 146), (234, 240, 250)
+                draw.rounded_rectangle(
+                    [x, cy - box_h / 2, x + box_w, cy + box_h / 2],
+                    radius=11, fill=fill, outline=outline, width=2,
+                )
+                prefix = ""
+                if is_bye:
+                    prefix = "BYE · "
+                label = _fit_text(draw, prefix + name, f_slot, box_w - 26)
+                draw.text((x + 13, cy - 12), label, font=f_slot, fill=color)
+
+        # чемпион
+        if not solo and len(columns) > 1:
+            champ = str(columns[-1][0] or "")
+            if champ and not any(w in champ for w in placeholder_words) and champ.upper() != "BYE":
+                x = pad + (len(columns) - 1) * (box_w + gap_x)
+                cy = col_positions[-1][0]
+                draw.text((x, cy - box_h / 2 - 28), "🏆 Чемпион",
+                          font=f_small, fill=(255, 214, 102))
+
+        # матч за 3-4 места
+        if third_h:
+            y0 = header_h + len(columns[0]) * row_h + 4
+            box3_w = min(width - pad * 2, box_w * 2 + gap_x)
             draw.rounded_rectangle(
-                [x, y, x + slot_w, y + slot_h - 22], radius=10,
-                fill=(29, 36, 54) if not muted else (24, 30, 44),
-                outline=(86, 104, 148), width=2,
+                [pad, y0, pad + box3_w, y0 + 104], radius=14,
+                fill=(43, 32, 20), outline=(245, 158, 11), width=2,
             )
-            label = (text or "")[:22]
-            draw.text((x + 14, y + 12), label, font=f_slot,
-                      fill=(232, 238, 250) if not muted else (120, 135, 165))
+            draw.text((pad + 18, y0 + 12), "🥉 Матч за 3-4 места",
+                      font=f_third, fill=(253, 186, 116))
+            a = str(third.get("side_a") or "ждём проигравшего полуфинала")
+            b = str(third.get("side_b") or "ждём проигравшего полуфинала")
+            winner = str(third.get("winner") or "")
+            draw.text((pad + 18, y0 + 50),
+                      _fit_text(draw, f"{a}  🆚  {b}", f_slot, box3_w - 36),
+                      font=f_slot, fill=(245, 230, 210))
+            if winner:
+                draw.text((pad + 18, y0 + 76),
+                          _fit_text(draw, f"Победитель: {winner}", f_small, box3_w - 36),
+                          font=f_small, fill=(74, 222, 128))
 
-        # первый круг
-        y = pad + 110
-        positions = []
-        for slot in slots:
-            slot_box(pad, y, slot, muted=(slot == "BYE"))
-            positions.append((pad, y))
-            y += slot_h
-
-        # остальные круги
-        cur = positions
-        x = pad
-        for r in range(rounds - 1):
-            x += slot_w + gap_x
-            nxt = []
-            step = (cur[1][1] - cur[0][1]) * 2 if len(cur) > 1 else slot_h
-            for i in range(0, len(cur), 2):
-                y1, y2 = cur[i][1], cur[i + 1][1] if i + 1 < len(cur) else cur[i][1]
-                mid = (y1 + y2) // 2
-                draw.line([(x - gap_x + slot_w, y1 + (slot_h - 22) // 2), (x, mid)],
-                          fill=(86, 104, 148), width=2)
-                if i + 1 < len(cur):
-                    draw.line([(x - gap_x + slot_w, y2 + (slot_h - 22) // 2), (x, mid)],
-                              fill=(86, 104, 148), width=2)
-                draw.line([(x, mid), (x + slot_w, mid)], fill=(86, 104, 148), width=2)
-                slot_box(x, mid - (slot_h - 22) // 2, f"Победитель {r + 2}")
-                nxt.append((x, mid - (slot_h - 22) // 2))
-            cur = nxt
         buf = io.BytesIO()
         img.save(buf, format="PNG")
         return buf.getvalue()
     except Exception as e:  # noqa: BLE001
         logger.error(f"render_bracket_image error: {e}")
         return None
+
+
+def _bracket_columns_for(row, participants=None):
+    """Собирает колонки сетки с РЕАЛЬНЫМИ названиями команд из регистрации."""
+    if participants is None:
+        participants = get_tournament_participants(row["id"])
+    solo = row["t_type"] == TOURNAMENT_SHOWDOWN
+    first = _build_bracket_slots(participants, row["t_type"]) if participants else []
+    if not first:
+        try:
+            first = json.loads(row["bracket_slots"] or "[]")
+        except Exception:
+            first = []
+    # None / пустая строка — это BYE, а не «None» в названии команды
+    first = ["BYE" if (x is None or not str(x).strip() or str(x).strip().upper() == "BYE")
+             else str(x).strip() for x in first]
+    if solo:
+        return ([first] if first else [["Свободный слот"] * TOURNAMENT_SHOWDOWN_LIMIT]), None
+    if not first:
+        first = ["Свободный слот", "Свободный слот"]
+    size = 1
+    while size < max(2, len(first)):
+        size *= 2
+    first = (first + ["BYE"] * size)[:size]
+    total = max(1, int(math.log2(size)))
+
+    columns = [first]
+    for r in range(1, total + 1):
+        prev = columns[-1]
+        matches = {m["pair_index"]: m for m in get_tournament_matches(row["id"], r)}
+        col = []
+        for i in range(max(1, len(prev) // 2)):
+            m = matches.get(i) or {}
+            if m.get("winner"):
+                col.append(str(m["winner"]))
+            elif m.get("side_a") and m.get("side_b"):
+                col.append(f"{m['side_a']} / {m['side_b']}")
+            elif m.get("side_a") or m.get("side_b"):
+                col.append(f"{m.get('side_a') or m.get('side_b')} · ждёт соперника")
+            else:
+                col.append(f"Победитель {_round_title(total, r)} №{i + 1}")
+        columns.append(col)
+    return columns, get_third_place_match(row["id"])
+
+
+def _bracket_subtitle(row, participants=None) -> str:
+    if participants is None:
+        participants = get_tournament_participants(row["id"])
+    fmt = TOURNAMENT_FORMAT_LABELS.get(row["t_format"], "—") if row["t_format"] else "—"
+    return (f"Тип: {row['t_type']} · Формат: {fmt} · Лимит: {_limit_text(row)} · "
+            f"Начало: {row['scheduled_text'] or '—'} · Команд: {len(participants)}"
+            + (" · ТЕСТ" if is_test_tournament(row) else ""))
+
+
+def _render_for_row(row, title_suffix: str = "", participants=None) -> bytes | None:
+    columns, third = _bracket_columns_for(row, participants)
+    return render_bracket_image(
+        columns,
+        f"Турнир #{row['id']} · {row['t_type']}{title_suffix}",
+        _bracket_subtitle(row, participants),
+        third=third,
+        solo=(row["t_type"] == TOURNAMENT_SHOWDOWN),
+    )
 
 
 # ─── Тексты анонса ───────────────────────────────────────────────────────────
@@ -1303,10 +1499,15 @@ def _announcement_text(row, participants, for_clan_post: bool = True) -> str:
         _participants_block(participants),
     ]
     if for_clan_post:
-        slots = json.loads(row["bracket_slots"] or "[]")
-        pairs = _bracket_pairs_text(slots)
+        # реальные пары: матчи турнира, а до старта — зарегистрированные команды
+        matches = get_tournament_matches(row["id"], 1)
+        if matches:
+            pairs = _pairs_schedule_text(matches).split("\n")
+        else:
+            columns, _third = _bracket_columns_for(row, participants)
+            pairs = _bracket_pairs_text(columns[0])
         if pairs:
-            lines += ["", "🗺 <b>Предварительная сетка (1-й круг)</b>"]
+            lines += ["", "🗺 <b>Сетка (1-й круг)</b>"]
             lines += [f"• {hd.quote(p)}" for p in pairs[:16]]
             if len(pairs) > 16:
                 lines.append(f"... и ещё {len(pairs) - 16}")
@@ -1345,14 +1546,13 @@ def _no_composition_text() -> str:
 async def _post_to_clan_topics(bot: Bot, row, participants) -> tuple[list[str], list[str]]:
     """Пост-анонс с картинкой сетки в топик «Турниры» каждого клана."""
     sent, failed = [], []
-    png = render_bracket_image(json.loads(row["bracket_slots"] or "[]"),
-                               f"Турнир #{row['id']} · {row['t_type']}"
-                               + (" · ТЕСТ" if is_test_tournament(row) else ""))
-    # 🧪 Тестовый турнир: посты уходят только в админ-чат, клановые топики не трогаем
+    # реальные названия команд из регистрации (а не «Команда 1»)
+    png = _render_for_row(row, " · анонс", participants)
+    # 🧪 Тестовый турнир: посты уходят только в топик основы (Squad)
     if is_test_tournament(row):
-        if not config.ADMIN_CHAT_ID:
-            return sent, ["ADMIN_CHAT_ID не задан в config.py"]
-        targets = [(int(config.ADMIN_CHAT_ID), None, "🧪 админ-чат")]
+        targets = await _test_publish_targets()
+        if not targets:
+            return sent, ["не задан топик основы (⚙️ Топики турниров) и ADMIN_CHAT_ID"]
     else:
         topics = await get_tournament_topics()
         if not topics:
@@ -1367,13 +1567,14 @@ async def _post_to_clan_topics(bot: Bot, row, participants) -> tuple[list[str], 
             continue
         try:
             if png:
-                await bot.send_photo(
+                post = await bot.send_photo(
                     chat_id=chat_id,
                     message_thread_id=topic_id,
                     photo=BufferedInputFile(png, filename=f"tournament_{row['id']}_bracket.png"),
                     caption=_announcement_caption(row),
                     parse_mode="HTML",
                 )
+                save_bracket_post(row["id"], chat_id, post.message_id, thread_id=topic_id)
                 await bot.send_message(
                     chat_id=chat_id,
                     message_thread_id=topic_id,
@@ -1391,6 +1592,23 @@ async def _post_to_clan_topics(bot: Bot, row, participants) -> tuple[list[str], 
         except Exception as e:
             logger.warning(f"tournament announce to {label} failed: {e}")
             failed.append(f"{label}: {e}")
+            # 🧪 fallback: топик основы мог быть указан неверно — не теряем пост
+            if is_test_tournament(row) and config.ADMIN_CHAT_ID and chat_id != config.ADMIN_CHAT_ID:
+                try:
+                    await bot.send_message(
+                        int(config.ADMIN_CHAT_ID),
+                        f"⚠️ Не смог отправить в топик основы (ID {topic_id}): {e}\n"
+                        "Проверь ID через «⚙️ Топики турниров». Пост анонса ниже.",
+                        parse_mode="HTML",
+                    )
+                    await bot.send_message(
+                        int(config.ADMIN_CHAT_ID),
+                        _announcement_text(row, participants),
+                        parse_mode="HTML",
+                    )
+                    sent.append("🧪 админ-чат (fallback)")
+                except Exception as e2:
+                    failed.append(f"fallback: {e2}")
     return sent, failed
 
 
@@ -1486,9 +1704,8 @@ async def _dm_registered_players(bot: Bot, row) -> dict:
 
 
 async def _send_preview(call: CallbackQuery, row, as_caption: bool = False):
-    """Картинка сетки (или текстовая сетка, если Pillow отсутствует)."""
-    slots = json.loads(row["bracket_slots"] or "[]")
-    png = render_bracket_image(slots, f"Турнир #{row['id']} · {row['t_type']}")
+    """Картинка сетки с реальными командами (или текстовая сетка без Pillow)."""
+    png = _render_for_row(row)
     if png:
         await call.message.answer_photo(
             photo=BufferedInputFile(png, filename=f"tournament_{row['id']}_bracket.png"),
@@ -1496,7 +1713,9 @@ async def _send_preview(call: CallbackQuery, row, as_caption: bool = False):
             parse_mode="HTML",
         )
         return
-    pairs = _bracket_pairs_text(slots)
+    columns, _third = _bracket_columns_for(row)
+    pairs = [f"{a or '—'} 🆚 {b or '—'}"
+             for a, b in zip(columns[0][::2], columns[0][1::2])]
     text = "\n".join([f"🗺 <b>Сетка турнира #{row['id']}</b>"] + [f"• {hd.quote(p)}" for p in pairs])
     text += "\n\nℹ️ Библиотека Pillow не установлена — картинка сетки недоступна. Установи: pip install Pillow"
     await call.message.answer(text, parse_mode="HTML")
@@ -1607,18 +1826,14 @@ def _tournament_start_text(row, participants, matches) -> str:
 async def _post_tournament_start(bot: Bot, row, participants, matches) -> tuple[list[str], list[str]]:
     """Финальный пост с сеткой и парами: кланам — в топик «Турниры», тесту — в админ-чат."""
     sent, failed = [], []
-    png = render_bracket_image(
-        [s if s else "BYE" for s in _build_bracket_slots(participants, row["t_type"])],
-        f"Турнир #{row['id']} · {row['t_type']} · СТАРТ"
-        + (" · ТЕСТ" if is_test_tournament(row) else ""),
-    )
+    png = _render_for_row(row, " · СТАРТ", participants)
     text = _tournament_start_text(row, participants, matches)
     caption = _bracket_status_caption(row)
-    # 🧪 Тестовый турнир: посты старта — только в админ-чат, клановые топики не трогаем
+    # 🧪 Тестовый турнир: посты старта — только в топик основы (Squad)
     if is_test_tournament(row):
-        if not config.ADMIN_CHAT_ID:
-            return sent, ["ADMIN_CHAT_ID не задан в config.py"]
-        targets = [(int(config.ADMIN_CHAT_ID), None, "🧪 админ-чат")]
+        targets = await _test_publish_targets()
+        if not targets:
+            return sent, ["не задан топик основы (⚙️ Топики турниров) и ADMIN_CHAT_ID"]
     else:
         topics = await get_tournament_topics()
         if not topics:
@@ -1628,8 +1843,8 @@ async def _post_tournament_start(bot: Bot, row, participants, matches) -> tuple[
             for clan, topic in topics.items()
         ]
     for chat_id, thread_id, label in targets:
-        if not chat_id or (not thread_id and not is_test_tournament(row)):
-            failed.append(f"{label}: нет chat_id/топика")
+        if not chat_id:
+            failed.append(f"{label}: нет chat_id")
             continue
         try:
             # пост с сеткой — именно его потом обновляем по мере результатов
@@ -1641,7 +1856,7 @@ async def _post_tournament_start(bot: Bot, row, participants, matches) -> tuple[
                     caption=caption[:1024],
                     parse_mode="HTML",
                 )
-                save_bracket_post(row["id"], chat_id, post.message_id)
+                save_bracket_post(row["id"], chat_id, post.message_id, thread_id=thread_id)
             await bot.send_message(
                 chat_id=chat_id, message_thread_id=thread_id, text=text, parse_mode="HTML",
             )
@@ -1649,6 +1864,20 @@ async def _post_tournament_start(bot: Bot, row, participants, matches) -> tuple[
         except Exception as e:
             logger.warning(f"tournament start post to {label} failed: {e}")
             failed.append(f"{label}: {e}")
+            if is_test_tournament(row) and config.ADMIN_CHAT_ID and chat_id != config.ADMIN_CHAT_ID:
+                try:
+                    await bot.send_message(
+                        int(config.ADMIN_CHAT_ID),
+                        f"⚠️ Не смог отправить сетку в топик основы (ID {thread_id}): {e}\n"
+                        "Проверь ID через «⚙️ Топики турниров».",
+                        parse_mode="HTML",
+                    )
+                    await bot.send_message(
+                        int(config.ADMIN_CHAT_ID), text, parse_mode="HTML",
+                    )
+                    sent.append("🧪 админ-чат (fallback)")
+                except Exception as e2:
+                    failed.append(f"fallback: {e2}")
     return sent, failed
 
 
@@ -2069,8 +2298,7 @@ async def _upsert_bracket_post(bot: Bot, row, caption: str) -> tuple[int, int]:
         slots = []
     if not slots:
         slots = _build_bracket_slots(get_tournament_participants(row["id"]), row["t_type"])
-    png = render_bracket_image([s if s else "BYE" for s in slots],
-                               f"Турнир #{row['id']} · {row['t_type']} · актуальная сетка")
+    png = _render_for_row(row, " · актуальная сетка")
     import config
     for post in get_bracket_posts(row["id"]):
         chat_id = int(post["chat_id"])
@@ -2119,22 +2347,22 @@ async def _upsert_bracket_post(bot: Bot, row, caption: str) -> tuple[int, int]:
                     f"{caption}\n\n"
                     f"{_pairs_schedule_text(get_tournament_matches(row['id'], 1))}"
                 )
+                # тот же топик, где был старый пост (а не общий чат)
+                thread_id = post.get("thread_id")
                 if png:
                     sent = await bot.send_photo(
                         chat_id=chat_id,
-                        message_thread_id=(config.CLAN_CHATS.get(
-                            _clan_key_by_chat(chat_id)) or {}).get("thread_id"),
+                        message_thread_id=thread_id,
                         photo=BufferedInputFile(png, filename=f"tournament_{row['id']}_bracket.png"),
                         caption=text[:1024], parse_mode="HTML",
                     )
                 else:
                     sent = await bot.send_message(
                         chat_id=chat_id,
-                        message_thread_id=(config.CLAN_CHATS.get(
-                            _clan_key_by_chat(chat_id)) or {}).get("thread_id"),
+                        message_thread_id=thread_id,
                         text=text, parse_mode="HTML",
                     )
-                save_bracket_post(row["id"], chat_id, sent.message_id)
+                save_bracket_post(row["id"], chat_id, sent.message_id, thread_id=thread_id)
                 recreated += 1
             except Exception as e2:
                 logger.warning(f"bracket post recreation failed in {chat_id}: {e2}")
@@ -2497,13 +2725,27 @@ async def admin_tournament_topics_cancel(message: Message, state: FSMContext):
 
 @router.message(TournamentSettingsStates.waiting_topics)
 async def admin_tournament_topics_save(message: Message, state: FSMContext, bot: Bot):
-    """Парсим 'academy=123 squad=456 events=789' и сохраняем в настройки."""
+    """Парсим 'academy=123 squad=456 events=789' либо ссылку t.me/c/<chat>/<thread>.
+
+    Ссылка на топик основы вида https://t.me/c/2187842577/405196 сохраняется как squad:
+    chat_id берётся из config.CLAN_CHATS, а 405196 — message_thread_id топика.
+    """
     import re as _re
     raw = message.text or ""
     found = dict(_re.findall(r"(academy|squad|events)\s*[=:]\s*(-?\d+)", raw, flags=_re.IGNORECASE))
     if not found:
+        link = _re.search(r"t\.me/c/(\d+)(?:/(\d+))?", raw)
+        if link:
+            # для тестового режима нужен именно топик основы
+            found = {"squad": link.group(2) or link.group(1)}
+    if not found:
         await message.answer(
-            "❌ Не нашёл ни одного ID. Формат: <code>academy=33272 squad=129460 events=5361</code>",
+            "❌ Не нашёл ни одного ID.\n\n"
+            "Формат: <code>academy=33272 squad=129460 events=5361</code>\n"
+            "Или ссылка на топик основы: <code>https://t.me/c/2187842577/405196</code>\n\n"
+            "⚠️ Второе число в ссылке должно быть ID топика (message_thread_id), "
+            "а не ID отдельного сообщения. Надёжнее — написать <code>get_id</code> "
+            "внутри нужного топика.",
             parse_mode="HTML",
         )
         return
