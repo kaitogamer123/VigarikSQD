@@ -557,6 +557,14 @@ def ensure_tournament_tables() -> None:
             FOREIGN KEY (tournament_id) REFERENCES tournaments(id) ON DELETE CASCADE
         );
         CREATE INDEX IF NOT EXISTS idx_match_reports ON match_reports (status, tournament_id);
+        CREATE TABLE IF NOT EXISTS tournament_rounds (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tournament_id INTEGER NOT NULL,
+            round_no INTEGER NOT NULL,
+            started_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (tournament_id, round_no),
+            FOREIGN KEY (tournament_id) REFERENCES tournaments(id) ON DELETE CASCADE
+        );
         CREATE TABLE IF NOT EXISTS tournament_posts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             tournament_id INTEGER NOT NULL,
@@ -956,8 +964,22 @@ def advance_winner(tournament_id: int, round_no: int, pair_index: int, winner: s
         return info
 
     next_round = round_no + 1
-    next_pair = int(pair_index) // 2
-    side = "a" if int(pair_index) % 2 == 0 else "b"
+    # предвариловка: каждый победитель идёт в свою пару основной сетки
+    # (плей-ин матч 1 → матч 1, матч 2 → матч 2), а не по два в один
+    participants = get_tournament_participants(tournament_id)
+    names = [p["team_name"] or "" for p in participants]
+    plan = _seed_plan(names, row["t_type"]) if names else {"playin_pairs": []}
+    is_playin = bool(plan.get("playin_pairs")) and round_no == 1 and \
+        int(pair_index) < len(plan["playin_pairs"])
+    if is_playin:
+        next_pair = int(pair_index)
+        side = "a"
+        existing = get_tournament_matches(tournament_id, next_round)
+        if any(int(x["pair_index"]) == next_pair and x["side_a"] for x in existing):
+            side = "b"
+    else:
+        next_pair = int(pair_index) // 2
+        side = "a" if int(pair_index) % 2 == 0 else "b"
     match_id = upsert_match_side(tournament_id, next_round, next_pair, side, winner)
     info["next_match_id"] = match_id
     nxt = get_match(match_id)
@@ -1206,14 +1228,25 @@ def _first_main_column(plan: dict) -> list:
     if plan.get("solo"):
         return list(plan["names"])
     playin = plan.get("playin_pairs") or []
-    col = []
-    for i, (_a, _b) in enumerate(playin):
-        col.append(f"Победитель пары {i + 1}")
-    col.extend(plan.get("direct") or [])
     size = max(2, int(plan.get("main_size") or 2))
-    while len(col) < size:
-        col.append("BYE")
-    return col[:size]
+    direct = list(plan.get("direct") or [])
+    col: list = ["BYE"] * size
+    if playin:
+        # каждый победитель предвариловки встаёт в свою пару к команде,
+        # прошедшей напрямую: W1 — в матч 0, W2 — в матч 1 и т.д.
+        for i in range(len(playin)):
+            pos = i * 2
+            if pos >= size:
+                pos = next((j for j in range(size) if col[j] == "BYE"), 0)
+            col[pos] = f"Победитель пары {i + 1}"
+    for name in direct:
+        if name == "BYE":
+            continue
+        pos = next((i for i, v in enumerate(col) if v == "BYE"), None)
+        if pos is None:
+            break
+        col[pos] = name
+    return col
 
 
 def _bracket_slots_for(t_type: str, team_limit) -> list[str]:
@@ -1310,7 +1343,8 @@ def _round_title(total: int, round_no: int) -> str:
 
 
 def render_bracket_image(columns, title: str, subtitle: str = "",
-                         third=None, solo: bool = False) -> bytes | None:
+                         third=None, solo: bool = False, labels=None,
+                         playin=None) -> bytes | None:
     """Красивая сетка: колонки по раундам, ровные линии, реальные названия команд.
 
     columns[0] — участники, columns[r] — победители раунда r.
@@ -1328,6 +1362,8 @@ def render_bracket_image(columns, title: str, subtitle: str = "",
         total_rounds = max(0, len(columns) - 1)
 
         def stage_label(col_index: int) -> str:
+            if labels and col_index < len(labels) and labels[col_index]:
+                return labels[col_index]
             if col_index <= 0:
                 return "Участники ShowDown" if solo else "Участники"
             from_end = len(columns) - col_index   # 1 = последняя колонка = финал
@@ -1343,10 +1379,13 @@ def render_bracket_image(columns, title: str, subtitle: str = "",
 
         box_w, box_h, v_gap, gap_x, pad = 264, 58, 20, 66, 42
         row_h = box_h + v_gap
-        header_h = 148
+        header_h = 136
         base_h = header_h + len(columns[0]) * row_h + pad
         third_h = 132 if (third and (third.get("side_a") or third.get("side_b"))) else 0
-        height = max(560, base_h + third_h + (36 if third_h else 0))
+        playin_h = 0
+        if playin:
+            playin_h = 76 + 26 * math.ceil(len(playin) / 2) + 30
+        height = max(560, base_h + third_h + playin_h + (36 if third_h else 0))
         width = max(1000, pad * 2 + len(columns) * box_w + (len(columns) - 1) * gap_x)
 
         img = Image.new("RGB", (width, height), (15, 20, 32))
@@ -1358,14 +1397,11 @@ def render_bracket_image(columns, title: str, subtitle: str = "",
         f_small = _load_font(16)
         f_third = _load_font(22)
 
-        # фон-шапка
-        draw.rectangle([0, 0, width, 112], fill=(22, 29, 46))
-        draw.rectangle([0, 110, width, 114], fill=(255, 209, 102))
+        # фон-шапка: только заголовок, без серой строки-подписи
+        draw.rectangle([0, 0, width, 92], fill=(22, 29, 46))
+        draw.rectangle([0, 90, width, 94], fill=(255, 209, 102))
         draw.text((pad, 24), _fit_text(draw, title, f_title, width - pad * 2),
                   font=f_title, fill=(255, 214, 102))
-        if subtitle:
-            draw.text((pad, 74), _fit_text(draw, subtitle, f_sub, width - pad * 2),
-                      font=f_sub, fill=(166, 181, 208))
 
         top = header_h
         col_positions: list[list[float]] = []
@@ -1384,7 +1420,7 @@ def render_bracket_image(columns, title: str, subtitle: str = "",
             x = pad + c * (box_w + gap_x)
             round_label = stage_label(c)
             label_w = draw.textlength(round_label, font=f_round)
-            draw.text((x + (box_w - label_w) / 2, top - 32), round_label,
+            draw.text((x + (box_w - label_w) / 2, top - 30), round_label,
                       font=f_round, fill=(120, 150, 210))
 
         # линии между колонками
@@ -1437,9 +1473,23 @@ def render_bracket_image(columns, title: str, subtitle: str = "",
                 draw.text((x, cy - box_h / 2 - 28), "🏆 Чемпион",
                           font=f_small, fill=(255, 214, 102))
 
+        # предварительный раунд: показываем отдельным блоком под сеткой
+        if playin:
+            y0 = header_h + len(columns[0]) * row_h + 4
+            draw.text((pad, y0), "Предварительный раунд", font=f_third,
+                      fill=(120, 200, 255))
+            for i, (a, b) in enumerate(playin):
+                px = pad + (i % 2) * (box_w + gap_x)
+                py = y0 + 34 + (i // 2) * 30
+                draw.text((px, py),
+                          _fit_text(draw, f"{a} 🆚 {b}", f_slot, box_w + gap_x - 20),
+                          font=f_slot, fill=(190, 205, 230))
+
         # матч за 3-4 места
         if third_h:
             y0 = header_h + len(columns[0]) * row_h + 4
+            if playin:
+                y0 += playin_h
             box3_w = min(width - pad * 2, box_w * 2 + gap_x)
             draw.rounded_rectangle(
                 [pad, y0, pad + box3_w, y0 + 104], radius=14,
@@ -1482,12 +1532,15 @@ def _bracket_columns_for(row, participants=None):
              else str(x).strip() for x in first]
     if solo:
         names = [p["team_name"] or "—" for p in participants] or first
-        return ([names] if names else [["Свободный слот"] * TOURNAMENT_SHOWDOWN_LIMIT]), None
+        return ([names] if names else [["Свободный слот"] * TOURNAMENT_SHOWDOWN_LIMIT]), None, []
     names = [p["team_name"] or "—" for p in participants]
     plan = _seed_plan(names, row["t_type"]) if names else None
+    playin = []
     if plan and plan["playin_pairs"]:
-        # колонка 0 — все участники, колонка 1 — предварительный раунд
-        columns = [names, [f"{a} 🆚 {b}" for a, b in plan["playin_pairs"]]]
+        # предвариловка рисуется отдельным блоком, а сетка остаётся ровной
+        playin = plan["playin_pairs"]
+        first = _first_main_column(plan)
+        columns = [first]
         total = plan["total_rounds"]           # включает предвариловку
         start_round = 2                        # основная сетка начинается со 2-го круга
     else:
@@ -1521,7 +1574,7 @@ def _bracket_columns_for(row, participants=None):
             else:
                 col.append(f"Победитель пары {i + 1}")
         columns.append(col)
-    return columns, get_third_place_match(row["id"])
+    return columns, get_third_place_match(row["id"]), playin
 
 
 def _bracket_subtitle(row, participants=None) -> str:
@@ -1534,13 +1587,24 @@ def _bracket_subtitle(row, participants=None) -> str:
 
 
 def _render_for_row(row, title_suffix: str = "", participants=None) -> bytes | None:
-    columns, third = _bracket_columns_for(row, participants)
+    columns, third, playin = _bracket_columns_for(row, participants)
+    if row["t_type"] == TOURNAMENT_SHOWDOWN:
+        labels = ["Участники ShowDown"]
+    else:
+        # первая колонка = сетка, дальше по раундам.
+        # при предвариловке основная сетка начинается со 2-го раунда (round=2)
+        offset = 1 if playin else 0
+        labels = ["Участники"] + [
+            _stage_label(row, r + offset) for r in range(1, len(columns))
+        ]
     return render_bracket_image(
         columns,
         f"Турнир #{row['id']} · {row['t_type']}{title_suffix}",
-        _bracket_subtitle(row, participants),
+        "",  # серая строка-подпись убрана по просьбе
         third=third,
         solo=(row["t_type"] == TOURNAMENT_SHOWDOWN),
+        labels=labels,
+        playin=playin,
     )
 
 
@@ -1589,7 +1653,7 @@ def _announcement_text(row, participants, for_clan_post: bool = True) -> str:
         if matches:
             pairs = _pairs_schedule_text(matches).split("\n")
         else:
-            columns, _third = _bracket_columns_for(row, participants)
+            columns, _third, _playin = _bracket_columns_for(row, participants)
             pairs = _bracket_pairs_text(columns[0])
         if pairs:
             lines += ["", "🗺 <b>Сетка (1-й круг)</b>"]
@@ -1798,7 +1862,7 @@ async def _send_preview(call: CallbackQuery, row, as_caption: bool = False):
             parse_mode="HTML",
         )
         return
-    columns, _third = _bracket_columns_for(row)
+    columns, _third, _playin = _bracket_columns_for(row)
     pairs = [f"{a or '—'} 🆚 {b or '—'}"
              for a, b in zip(columns[0][::2], columns[0][1::2])]
     text = "\n".join([f"🗺 <b>Сетка турнира #{row['id']}</b>"] + [f"• {hd.quote(p)}" for p in pairs])
@@ -1865,6 +1929,19 @@ def _stage_label(row, round_no: int) -> str:
     if int(round_no) == 0:
         return "Матч за 3-4 места"
     total = _total_rounds(_bracket_size(row))
+    # предварительный раунд (play-in) появляется, когда команд не хватает до сетки
+    participants = get_tournament_participants(row["id"])
+    names = [p["team_name"] or "" for p in participants]
+    plan = _seed_plan(names, row["t_type"]) if names else {"playin_pairs": []}
+    has_playin = bool(plan.get("playin_pairs"))
+    if has_playin:
+        if int(round_no) == 1:
+            return "Предварительный раунд"
+        if int(round_no) >= total:
+            return "Финал"
+        if int(round_no) == total - 1:
+            return "Полуфинал"
+        return f"1/{_fmt_num(2 ** (total - int(round_no)))} финала"
     if int(round_no) >= total:
         return "Финал"
     if int(round_no) == total - 1:
@@ -1872,13 +1949,146 @@ def _stage_label(row, round_no: int) -> str:
     return f"1/{_fmt_num(2 ** (total - int(round_no)))} финала"
 
 
+# ─── Автостарт следующего круга (Этап 5+) ───────────────────────────────────
+
+def mark_round_started(tournament_id: int, round_no: int) -> None:
+    ensure_tournament_tables()
+    conn = db.get_connection()
+    conn.execute(
+        "INSERT OR IGNORE INTO tournament_rounds (tournament_id, round_no) VALUES (?, ?)",
+        (int(tournament_id), int(round_no)),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_started_rounds(tournament_id: int) -> set:
+    ensure_tournament_tables()
+    conn = db.get_connection()
+    rows = conn.execute(
+        "SELECT round_no FROM tournament_rounds WHERE tournament_id = ?",
+        (int(tournament_id),),
+    ).fetchall()
+    conn.close()
+    return {int(r["round_no"]) for r in rows}
+
+
+def _round_resolved(matches) -> bool:
+    """Раунд закрыт: у каждого матча есть победитель (или это BYE)."""
+    if not matches:
+        return False
+    return all(bool(m["winner"]) or m["status"] == "bye" for m in matches)
+
+
+async def _round_publish_targets(row):
+    if is_test_tournament(row):
+        return await _test_publish_targets()
+    topics = await get_tournament_topics()
+    return [
+        ((config.CLAN_CHATS.get(clan) or {}).get("chat_id"), topic, f"{clan} (топик {topic})")
+        for clan, topic in topics.items()
+    ]
+
+
+async def _dm_new_pairs(bot: Bot, row, pairs, stage: str) -> int:
+    """ЛС капитанам новых пар: «У вас скрим Бо3 против …, спишитесь с лидером…»."""
+    participants = {p["team_name"]: p for p in get_tournament_participants(row["id"])}
+    fmt = TOURNAMENT_FORMAT_LABELS.get(row["t_format"], "Бо3") if row["t_format"] else "Бо3"
+    sent = 0
+    for a_name, b_name in pairs:
+        a, b = participants.get(a_name), participants.get(b_name)
+        if not a or not b or not a.get("leader_id") or not b.get("leader_id"):
+            continue
+        for me, opp in ((a, b), (b, a)):
+            try:
+                mention = await _leader_mention(opp["leader_id"])
+                await bot.send_message(
+                    int(me["leader_id"]),
+                    f"⚔️ <b>{hd.quote(stage)}</b> · у вас скрим {hd.quote(fmt)} против команды "
+                    f"{hd.quote(str(opp['team_name']))}, спишитесь с их лидером: "
+                    f"<b>{hd.quote(mention)}</b>.\n"
+                    f"• Турнир #{row['id']}",
+                    parse_mode="HTML",
+                )
+                sent += 1
+            except Exception:
+                pass
+            await asyncio.sleep(TOURNAMENT_DM_PAUSE)
+    return sent
+
+
+async def _announce_round_start(bot: Bot, row, round_no: int, matches) -> None:
+    """Публикует старт круга в топик и присылает пары капитанам."""
+    pairs = [(m["side_a"], m["side_b"]) for m in matches
+             if m["side_a"] and m["side_b"] and not m["winner"]]
+    if not pairs:
+        return
+    stage = _stage_label(row, round_no)
+    text = (
+        f"🚨 <b>Старт: {hd.quote(stage)}</b> · турнир #{row['id']}\n\n"
+        + "\n".join(f"• {hd.quote(a)} 🆚 {hd.quote(b)}" for a, b in pairs)
+        + "\n\nСдайте результат через «🏁 Мои матчи» или его внесёт администрация."
+    )
+    for chat_id, thread_id, _label in await _round_publish_targets(row):
+        if not chat_id:
+            continue
+        try:
+            await bot.send_message(chat_id=chat_id, message_thread_id=thread_id,
+                                   text=text, parse_mode="HTML")
+        except Exception as e:
+            logger.warning(f"round announce failed: {e}")
+    await _dm_new_pairs(bot, row, pairs, stage)
+    mark_round_started(row["id"], round_no)
+
+
+async def _auto_start_rounds(bot: Bot, row) -> list[str]:
+    """Как только все матчи круга закрыты — следующий круг стартует сам."""
+    notes = []
+    tid = int(row["id"])
+    started = get_started_rounds(tid)
+    total = _total_rounds(_bracket_size(row))
+    finished_all = True
+    for r in range(1, total + 1):
+        matches = get_tournament_matches(tid, r)
+        if not matches:
+            if not _round_resolved(get_tournament_matches(tid, r - 1)):
+                finished_all = False
+            break
+        if not _round_resolved(matches):
+            finished_all = False
+            ready = [m for m in matches if m["side_a"] and m["side_b"]]
+            if ready and r not in started:
+                await _announce_round_start(bot, row, r, matches)
+                notes.append(f"▶️ Автостарт: {_stage_label(row, r)}")
+            break
+    third = get_third_place_match(tid)
+    if third and third["side_a"] and third["side_b"] and not third["winner"] \
+            and 0 not in started:
+        await _announce_round_start(bot, row, 0, [third])
+        notes.append("▶️ Автостарт: матч за 3-4 места")
+    if finished_all and third and third["winner"]:
+        set_tournament_status(tid, "finished")
+    return notes
+
+
+def _row_val(row, key: str, default=None):
+    """Безопасное чтение поля из dict или sqlite3.Row (у Row нет .get())."""
+    if row is None:
+        return default
+    try:
+        value = row[key]
+        return default if value is None else value
+    except (KeyError, IndexError, TypeError):
+        return default
+
+
 def _pairs_schedule_text(matches) -> str:
     lines = []
     for i, m in enumerate(matches, start=1):
-        a, b = m.get("side_a"), m.get("side_b")
-        if m.get("status") == "bye":
+        a, b = _row_val(m, "side_a"), _row_val(m, "side_b")
+        if _row_val(m, "status", "scheduled") == "bye":
             lines.append(f"{_fmt_num(i)}. {hd.quote(str(b or a))} → автопроход (BYE)")
-        elif m.get("status") == "solo":
+        elif _row_val(m, "status", "scheduled") == "solo":
             lines.append(f"{_fmt_num(i)}. {hd.quote(str(a))} — соло-слот ShowDown")
         else:
             lines.append(f"{_fmt_num(i)}. {hd.quote(str(a))} 🆚 {hd.quote(str(b))}")
@@ -2011,6 +2221,7 @@ async def start_tournament(bot: Bot, row) -> str:
         update_tournament_bracket(tid, first_col)
     # победители BYE-матчей сразу продвигаются в следующий круг
     _propagate_auto_advances(tid)
+    mark_round_started(tid, 1)   # первый круг объявлен постом старта
     set_tournament_status(tid, "running")
 
     topics_sent, topics_failed = await _post_tournament_start(bot, row, participants, matches)
@@ -2507,6 +2718,180 @@ def _bracket_status_caption(row) -> str:
             lines.append(f"{hd.quote(str(third['side_a']))} 🆚 "
                          f"{hd.quote(str(third['side_b'] or 'ждём проигравшего полуфинала'))}")
     return "\n".join(lines)
+
+
+# ─── Ручной ввод победителей администрацией ─────────────────────────────────
+
+def _open_matches_for_admin(tid: int) -> list[dict]:
+    """Все матчи турнира, где ещё нет победителя (включая матч за 3-4 места)."""
+    row = get_tournament(tid)
+    if not row:
+        return []
+    total = _total_rounds(_bracket_size(row))
+    out = []
+    for r in range(1, total + 1):
+        for m in get_tournament_matches(tid, r):
+            if m["winner"] or m["status"] == "bye":
+                continue
+            out.append(m)
+    third = get_third_place_match(tid)
+    if third and not third["winner"] and third["side_a"] and third["side_b"]:
+        out.append(third)
+    return out
+
+
+def _match_title(row, m) -> str:
+    stage = _stage_label(row, int(m["round"]))
+    a = m["side_a"] or "ждёт соперника"
+    b = m["side_b"] or "ждёт соперника"
+    return f"{stage}: {a} 🆚 {b}"
+
+
+@router.callback_query(F.data.startswith("tour_res:list:"))
+async def admin_results_list(call: CallbackQuery):
+    if not await _cb_is_admin(call.from_user.id):
+        await call.answer("⛔ Нет прав", show_alert=True)
+        return
+    tid = int(call.data.rsplit(":", 1)[-1])
+    row = get_tournament(tid)
+    if not row:
+        await call.answer("Турнир не найден", show_alert=True)
+        return
+    matches = _open_matches_for_admin(tid)
+    if not matches:
+        await call.answer("Все матчи уже закрыты", show_alert=True)
+        await call.message.edit_text(
+            "✅ Незакрытых матчей нет — сетка заполнена.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="◀️ К турниру", callback_data=f"tour_cur:open:{tid}"),
+            ]]),
+        )
+        return
+    rows = []
+    for m in matches[:20]:
+        label = _match_title(row, m)
+        if m["side_a"] and m["side_b"]:
+            rows.append((f"✍️ {label}", f"tour_res:pick:{m['id']}"))
+        else:
+            rows.append((f"⏳ {label}", f"tour_cur:open:{tid}"))
+    rows.append(("◀️ К турниру", f"tour_cur:open:{tid}"))
+    await call.message.edit_text(
+        f"✍️ <b>Внести победителей · турнир #{tid}</b>\n\n"
+        "Выбери матч, затем укажи победителя. Когда все матчи круга будут закрыты, "
+        "следующий круг стартует автоматически.",
+        parse_mode="HTML",
+        reply_markup=simple_list_keyboard(rows),
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("tour_res:pick:"))
+async def admin_result_pick(call: CallbackQuery):
+    if not await _cb_is_admin(call.from_user.id):
+        await call.answer("⛔ Нет прав", show_alert=True)
+        return
+    m = get_match(int(call.data.rsplit(":", 1)[-1]))
+    if not m:
+        await call.answer("Матч не найден", show_alert=True)
+        return
+    row = get_tournament(int(m["tournament_id"]))
+    if not row:
+        await call.answer("Турнир не найден", show_alert=True)
+        return
+    if m["winner"]:
+        await call.answer("Победитель уже записан", show_alert=True)
+        return
+    a, b = str(m["side_a"] or "—"), str(m["side_b"] or "—")
+    await call.message.edit_text(
+        f"✍️ <b>{hd.quote(_stage_label(row, int(m['round'])))}</b>\n"
+        f"{hd.quote(a)} 🆚 {hd.quote(b)}\n\nКто победил?",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"🏆 {a[:20]}", callback_data=f"tour_res:win:{m['id']}:a")],
+            [InlineKeyboardButton(text=f"🏆 {b[:20]}", callback_data=f"tour_res:win:{m['id']}:b")],
+            [InlineKeyboardButton(text="◀️ К матчам", callback_data=f"tour_res:list:{m['tournament_id']}")],
+        ]),
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("tour_res:win:"))
+async def admin_result_win(call: CallbackQuery, bot: Bot):
+    """Админ вручную записывает победителя: та же логика, что при подтверждении фото."""
+    if not await _cb_is_admin(call.from_user.id):
+        await call.answer("⛔ Нет прав", show_alert=True)
+        return
+    parts = call.data.split(":")
+    if len(parts) < 4:
+        await call.answer("Некорректная кнопка", show_alert=True)
+        return
+    match_id, side = int(parts[2]), parts[3]
+    m = get_match(match_id)
+    if not m:
+        await call.answer("Матч не найден", show_alert=True)
+        return
+    row = get_tournament(int(m["tournament_id"]))
+    if not row:
+        await call.answer("Турнир не найден", show_alert=True)
+        return
+    if m["winner"]:
+        await call.answer("Победитель уже записан", show_alert=True)
+        return
+    winner = m["side_a"] if side == "a" else m["side_b"]
+    loser = m["side_b"] if side == "a" else m["side_a"]
+    if not winner:
+        await call.answer("У матча ещё нет этого участника", show_alert=True)
+        return
+
+    is_third = int(m["round"]) == 0
+    set_match_winner(match_id, str(winner), "confirmed", call.from_user.id)
+    notes = []
+    if is_third:
+        set_tournament_status(int(m["tournament_id"]), "finished")
+        notes.append("🥉 Матч за 3-4 места закрыт, турнир завершён.")
+    else:
+        info = advance_winner(int(m["tournament_id"]), int(m["round"]), int(m["pair_index"]), str(winner))
+        if info["tournament_finished"]:
+            notes.append("🏁 Финал закрыт.")
+        if register_semifinal_loser(int(m["tournament_id"]), int(m["round"]), str(loser)):
+            notes.append("🥉 Сформирован матч за 3-4 места.")
+        _propagate_auto_advances(int(m["tournament_id"]))
+        notes.extend(await _auto_start_rounds(bot, row))
+
+    updated, recreated = await _upsert_bracket_post(bot, row, _bracket_status_caption(row))
+    notes.append(f"🗺 Сетка: обновлено {updated}, создано заново {recreated}.")
+
+    for p in get_tournament_participants(int(m["tournament_id"])):
+        if p["team_name"] not in (winner, loser) or not p["leader_id"]:
+            continue
+        try:
+            await bot.send_message(
+                int(p["leader_id"]),
+                f"{'✅' if p['team_name'] == winner else '❌'} <b>Результат внесён администрацией</b>\n"
+                f"• {hd.quote(str(p['team_name']))}: "
+                f"{'победа, проходите дальше' if p['team_name'] == winner else 'поражение'}\n"
+                f"• Турнир #{m['tournament_id']}",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+    await log_admin_action(
+        bot=bot, admin_id=call.from_user.id,
+        admin_name=call.from_user.username or call.from_user.full_name or "admin",
+        action_text=(f"✍️ Внёс результат вручную: турнир #{m['tournament_id']}, "
+                     f"матч {m['side_a']} vs {m['side_b']}, победил {winner}."),
+    )
+    await call.message.edit_text(
+        f"✅ Победитель записан: <b>{hd.quote(str(winner))}</b>.\n"
+        + "\n".join(notes),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="✍️ Ещё матчи", callback_data=f"tour_res:list:{m['tournament_id']}"),
+            InlineKeyboardButton(text="◀️ К турниру", callback_data=f"tour_cur:open:{m['tournament_id']}"),
+        ]]),
+    )
+    await call.answer("Победитель записан")
 
 
 # ─── Кнопки и хендлеры раздела «🏆 Турниры» ─────────────────────────────────
@@ -3276,6 +3661,8 @@ async def _apply_result(call: CallbackQuery, report_id: int, winner: str, status
                 f"{hd.quote(str(third['side_b']))}."
             )
         _propagate_auto_advances(int(m["tournament_id"]))
+        # если все матчи круга закрыты — следующий круг стартует автоматически
+        notes.extend(await _auto_start_rounds(bot, get_tournament(int(m["tournament_id"]))))
 
     # обновляем посты с сеткой (с обработкой лимита редактирования 48 ч)
     updated, recreated = await _upsert_bracket_post(bot, row, _bracket_status_caption(row))

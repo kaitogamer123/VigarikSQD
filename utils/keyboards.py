@@ -128,8 +128,9 @@ def tournament_current_list_keyboard(rows: list[dict]) -> InlineKeyboardMarkup:
 
 
 def tournament_current_admin_keyboard(tournament_id: int) -> InlineKeyboardMarkup:
-    """Действия над активным турниром: лимит, составы, время, ручной старт."""
+    """Действия над активным турниром: результаты, лимит, составы, время, старт."""
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✍️ Внести победителей", callback_data=f"tour_res:list:{tournament_id}")],
         [InlineKeyboardButton(text="🔢 Изменить лимит команд", callback_data=f"tour_cur:limit:{tournament_id}")],
         [InlineKeyboardButton(text="🕐 Изменить время старта", callback_data=f"tour_cur:time:{tournament_id}")],
         [InlineKeyboardButton(text="👥 Список поданных составов", callback_data=f"tour:members:{tournament_id}")],
@@ -202,6 +203,7 @@ def tournament_test_keyboard(tournament_id: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🧪 +2 тестовых состава", callback_data=f"ttest:fill:{tournament_id}:2")],
         [InlineKeyboardButton(text="🧪 +4 тестовых состава", callback_data=f"ttest:fill:{tournament_id}:4")],
         [InlineKeyboardButton(text="🧻 Убрать тестовые составы", callback_data=f"ttest:clear:{tournament_id}")],
+        [InlineKeyboardButton(text="✍️ Внести победителей", callback_data=f"tour_res:list:{tournament_id}")],
         [InlineKeyboardButton(text="🖼 Сетка", callback_data=f"tour:preview:{tournament_id}"),
          InlineKeyboardButton(text="👥 Участники", callback_data=f"tour:members:{tournament_id}")],
         [InlineKeyboardButton(text="▶️ Запустить турнир", callback_data=f"tour_cur:start_ask:{tournament_id}")],
