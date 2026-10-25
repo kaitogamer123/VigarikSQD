@@ -31,3 +31,8 @@ logs/
 # 7. Автоматические бэкапы файлов (резервные копии перед изменениями)
 backups/
 backup_*/
+
+# 8. Фон сетки турнира: бинарник живёт только на сервере
+assets/tournament_bg.jpg
+assets/tournament_bg.png
+assets/tournament_bg.jpeg

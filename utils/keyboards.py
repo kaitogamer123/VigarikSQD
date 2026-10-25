@@ -127,19 +127,40 @@ def tournament_current_list_keyboard(rows: list[dict]) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-def tournament_current_admin_keyboard(tournament_id: int) -> InlineKeyboardMarkup:
-    """Действия над активным турниром: результаты, лимит, составы, время, старт."""
-    return InlineKeyboardMarkup(inline_keyboard=[
+def tournament_current_admin_keyboard(tournament_id: int,
+                                      can_delete: bool = False) -> InlineKeyboardMarkup:
+    """Действия над активным турниром: результаты, лимит, составы, время, старт, удаление."""
+    rows = [
         [InlineKeyboardButton(text="✍️ Внести победителей", callback_data=f"tour_res:list:{tournament_id}")],
         [InlineKeyboardButton(text="🔢 Изменить лимит команд", callback_data=f"tour_cur:limit:{tournament_id}")],
         [InlineKeyboardButton(text="🕐 Изменить время старта", callback_data=f"tour_cur:time:{tournament_id}")],
         [InlineKeyboardButton(text="👥 Список поданных составов", callback_data=f"tour:members:{tournament_id}")],
         [InlineKeyboardButton(text="▶️ Запустить турнир сейчас", callback_data=f"tour_cur:start_ask:{tournament_id}")],
-        [
-            InlineKeyboardButton(text="🔄 Обновить", callback_data=f"tour_cur:open:{tournament_id}"),
-            InlineKeyboardButton(text="◀️ К списку", callback_data="tour_cur:list"),
-        ],
+    ]
+    if can_delete:
+        rows.append([InlineKeyboardButton(text="🗑 Удалить турнир",
+                                          callback_data=f"tour_del:ask:{tournament_id}")])
+    rows.append([
+        InlineKeyboardButton(text="🔄 Обновить", callback_data=f"tour_cur:open:{tournament_id}"),
+        InlineKeyboardButton(text="◀️ К списку", callback_data="tour_cur:list"),
     ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def tournament_delete_confirm_keyboard(tournament_id: int) -> InlineKeyboardMarkup:
+    """Подтверждение удаления: действие необратимо."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🗑 Да, удалить навсегда",
+                              callback_data=f"tour_del:yes:{tournament_id}")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data=f"tour_del:no:{tournament_id}")],
+    ])
+
+
+def tournament_deleted_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🏆 К списку турниров", callback_data="tour:list:refresh"),
+        InlineKeyboardButton(text="⚔️ К текущим", callback_data="tour_cur:list"),
+    ]])
 
 
 def tournament_current_back_keyboard() -> InlineKeyboardMarkup:
@@ -197,9 +218,10 @@ def tournament_type_keyboard() -> ReplyKeyboardMarkup:
     ], resize_keyboard=True)
 
 
-def tournament_test_keyboard(tournament_id: int) -> InlineKeyboardMarkup:
+def tournament_test_keyboard(tournament_id: int,
+                             can_delete: bool = False) -> InlineKeyboardMarkup:
     """Инструменты тестового турнира: фейковые составы, старт, сетка, сброс."""
-    return InlineKeyboardMarkup(inline_keyboard=[
+    rows = [
         [InlineKeyboardButton(text="🧪 +2 тестовых состава", callback_data=f"ttest:fill:{tournament_id}:2")],
         [InlineKeyboardButton(text="🧪 +4 тестовых состава", callback_data=f"ttest:fill:{tournament_id}:4")],
         [InlineKeyboardButton(text="🧻 Убрать тестовые составы", callback_data=f"ttest:clear:{tournament_id}")],
@@ -207,8 +229,12 @@ def tournament_test_keyboard(tournament_id: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🖼 Сетка", callback_data=f"tour:preview:{tournament_id}"),
          InlineKeyboardButton(text="👥 Участники", callback_data=f"tour:members:{tournament_id}")],
         [InlineKeyboardButton(text="▶️ Запустить турнир", callback_data=f"tour_cur:start_ask:{tournament_id}")],
-        [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"ttest:open:{tournament_id}")],
-    ])
+    ]
+    if can_delete:
+        rows.append([InlineKeyboardButton(text="🗑 Удалить турнир",
+                                          callback_data=f"tour_del:ask:{tournament_id}")])
+    rows.append([InlineKeyboardButton(text="🔄 Обновить", callback_data=f"ttest:open:{tournament_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def tournament_format_keyboard() -> ReplyKeyboardMarkup:
@@ -256,9 +282,10 @@ def tournament_publish_keyboard(tournament_id: int) -> InlineKeyboardMarkup:
     ]])
 
 
-def tournament_admin_keyboard(tournament_id: int) -> InlineKeyboardMarkup:
+def tournament_admin_keyboard(tournament_id: int,
+                              can_delete: bool = False) -> InlineKeyboardMarkup:
     """Управление созданным турниром из списка «🏆 Турниры»."""
-    return InlineKeyboardMarkup(inline_keyboard=[
+    rows = [
         [InlineKeyboardButton(text="📣 Анонс в топики и ЛС", callback_data=f"tour:announce:{tournament_id}")],
         [
             InlineKeyboardButton(text="🖼 Сетка", callback_data=f"tour:preview:{tournament_id}"),
@@ -268,7 +295,11 @@ def tournament_admin_keyboard(tournament_id: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="❌ Отменить турнир", callback_data=f"tour:cancel_ask:{tournament_id}"),
             InlineKeyboardButton(text="🔄 Обновить", callback_data="tour:list:refresh"),
         ],
-    ])
+    ]
+    if can_delete:
+        rows.append([InlineKeyboardButton(text="🗑 Удалить турнир",
+                                          callback_data=f"tour_del:ask:{tournament_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def tournaments_list_keyboard(rows: list[dict]) -> InlineKeyboardMarkup:
