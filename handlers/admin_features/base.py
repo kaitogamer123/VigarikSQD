@@ -1431,13 +1431,29 @@ def _round_title(total: int, round_no: int) -> str:
     return f"1/{2 ** (total - round_no)} финала"
 
 
+# ─── Дизайн-токены сетки (спокойная типографика вместо «геймерского неона») ──
+BR_BG = (11, 13, 16)          # общий фон
+BR_HEAD = (16, 19, 24)        # шапка
+BR_SURFACE = (18, 22, 28)     # карточки
+BR_LINE = (42, 48, 58)        # коннекторы и разделители
+BR_TEXT = (230, 233, 237)
+BR_MUTED = (126, 136, 150)
+BR_DIM = (96, 105, 118)
+BR_BRASS = (208, 172, 100)    # 1 место / акцент
+BR_SILVER = (174, 182, 194)   # 2 место
+BR_COPPER = (188, 137, 92)    # 3 место
+BR_BRONZE = (140, 124, 106)   # 4 место
+BR_WIN = (88, 158, 121)       # прошедший дальше (линия/полоса)
+
+
 def render_bracket_image(columns, title: str, subtitle: str = "",
                          third=None, solo: bool = False, labels=None,
                          playin=None, placements=None) -> bytes | None:
-    """Красивая сетка: колонки по раундам, ровные линии, реальные названия команд.
+    """Сетка турнира в сдержанном редакционном стиле.
 
     columns[0] — участники, columns[r] — победители раунда r.
-    BYE подсвечивается серым, известные победители — зелёным.
+    Победитель отмечается тонкой линией и полосой слева, а не заливкой;
+    призёры — типографикой (место + название), без «пилюль».
     """
     if not PIL_AVAILABLE:
         return None
@@ -1445,97 +1461,77 @@ def render_bracket_image(columns, title: str, subtitle: str = "",
         columns = [list(col) for col in (columns or [])]
         if not columns:
             columns = [["Свободный слот", "Свободный слот"]]
-        # колонки уже подготовлены вызывающим кодом: [участники, раунд 1, раунд 2, ...]
-        # BYE больше не раздувает первый круг: предвариловка показывается отдельной колонкой
         solo = bool(solo) or len(columns) == 1
+        placements = [(int(p), str(n)) for p, n in (placements or [])]
         total_rounds = max(0, len(columns) - 1)
 
         def stage_label(col_index: int) -> str:
+            # последняя колонка — уже не матч, а обладатель места
+            if not solo and len(columns) > 1 and col_index == len(columns) - 1:
+                return "Чемпион"
             if labels and col_index < len(labels) and labels[col_index]:
                 return labels[col_index]
             if col_index <= 0:
-                return "Участники ShowDown" if solo else "Участники"
-            from_end = len(columns) - col_index   # 1 = последняя колонка = финал
-            if from_end == 1:
-                return "Финал"
-            if from_end == 2:
-                return "Полуфинал"
-            if from_end == 3:
-                return "1/4 финала"
-            if from_end == 4:
-                return "1/8 финала"
-            return f"1/{2 ** (from_end - 1)} финала"
+                return "Участники"
+            from_end = len(columns) - col_index
+            return {1: "Финал", 2: "Полуфинал", 3: "1/4 финала", 4: "1/8 финала"}.get(
+                from_end, f"1/{2 ** (from_end - 1)} финала")
 
-        box_w, box_h, v_gap, gap_x, pad = 264, 58, 20, 66, 42
+        # сетка отступов кратна 4 — визуальный ритм
+        pad = 48
+        box_w, box_h, v_gap, gap_x = 268, 56, 18, 64
         row_h = box_h + v_gap
-        placements = [(int(p), str(n)) for p, n in (placements or [])]
-        # таблица призёров над сеткой: тёмный фон + 4 плитки в ряд
-        tile_gap = 16
-        tile_h = 96
-        panel_h = (40 + tile_h + 22) if placements else 0
-        header_h = 136 + panel_h
-        base_h = header_h + len(columns[0]) * row_h + pad
-        third_h = 132 if (third and (third.get("side_a") or third.get("side_b"))) else 0
+        header_h = 96
+        panel_h = 112 if placements else 0
+        label_y = header_h + panel_h + 34
+        top = label_y + 26
+
+        rows = len(columns[0])
+        third_h = 112 if (third and (third.get("side_a") or third.get("side_b"))) else 0
         playin_h = 0
         if playin:
-            playin_h = 76 + 26 * math.ceil(len(playin) / 2) + 30
-        height = max(560, base_h + third_h + playin_h + (36 if third_h else 0))
-        width = max(1000, pad * 2 + len(columns) * box_w + (len(columns) - 1) * gap_x)
+            playin_h = 40 + 26 * math.ceil(len(playin) / 2) + 16
+        extra = playin_h + third_h
+        height = max(520, top + rows * row_h - v_gap + (48 if extra else 56) + extra)
+        width = max(980, pad * 2 + len(columns) * box_w + (len(columns) - 1) * gap_x)
 
-        img = Image.new("RGB", (width, height), (15, 20, 32))
+        img = Image.new("RGB", (width, height), BR_BG)
         draw = ImageDraw.Draw(img)
-        f_title = _load_font(38)
-        f_sub = _load_font(19)
-        f_round = _load_font(18)
-        f_slot = _load_font(20)
-        f_small = _load_font(16)
-        f_third = _load_font(22)
+        f_title = _load_font(31)
+        f_meta = _load_font(13)
+        f_rank = _load_font(13)
+        f_name = _load_font(21)
+        f_stage = _load_font(12)
+        f_slot = _load_font(18)
+        f_small = _load_font(13)
 
-        # фон-шапка: только заголовок, без серой строки-подписи
-        draw.rectangle([0, 0, width, 92], fill=(22, 29, 46))
-        draw.rectangle([0, 90, width, 94], fill=(255, 209, 102))
-        draw.text((pad, 24), _fit_text(draw, title, f_title, width - pad * 2),
-                  font=f_title, fill=(255, 214, 102))
+        # шапка: заголовок слева, служебная метка справа, тонкая линия снизу
+        draw.rectangle([0, 0, width, header_h], fill=BR_HEAD)
+        draw.rectangle([pad, 30, pad + 3, 66], fill=BR_BRASS)
+        draw.text((pad + 18, 26), _fit_text(draw, title, f_title, width - pad * 2 - 190),
+                  font=f_title, fill=BR_TEXT)
+        meta = "ПОБЕДИТЕЛИ" if placements else ("СЕТКА" if not solo else "SHOWDOWN")
+        draw.text((width - pad - draw.textlength(meta, font=f_meta), 32),
+                  meta, font=f_meta, fill=BR_MUTED)
+        draw.line([(0, header_h), (width, header_h)], fill=BR_LINE, width=1)
 
-        # ── таблица победителей над сеткой (тёмная, плитки по местам) ─────────
+        # призёры: место + название, разделены волосяными линиями
         if placements:
-            py0 = 94
-            draw.rectangle([0, py0, width, py0 + panel_h], fill=(19, 25, 38))
-            draw.line([(0, py0 + panel_h - 2), (width, py0 + panel_h - 2)],
-                      fill=(255, 209, 102), width=2)
+            y = header_h
+            rank_color = {1: BR_BRASS, 2: BR_SILVER, 3: BR_COPPER, 4: BR_BRONZE}
+            cells = placements[:4]
+            cell_w = (width - pad * 2) / max(1, len(cells))
+            for i, (place, name) in enumerate(cells):
+                x = pad + i * cell_w
+                if i:
+                    draw.line([(x, y + 20), (x, y + 92)], fill=BR_LINE, width=1)
+                color = rank_color.get(place, BR_MUTED)
+                draw.text((x + 24, y + 28), f"{place} место", font=f_rank, fill=color)
+                draw.text((x + 24, y + 50), _fit_text(draw, name, f_name, cell_w - 48),
+                          font=f_name, fill=BR_TEXT)
+            draw.line([(0, y + panel_h), (width, y + panel_h)], fill=BR_LINE, width=1)
 
-            # 1 — золото, 2 — серебро, 3 — бронза, 4 — тёмная бронза
-            medal = {
-                1: {"accent": (255, 209, 102), "fill": (45, 39, 21), "label": "1 место"},
-                2: {"accent": (203, 213, 225), "fill": (35, 41, 54), "label": "2 место"},
-                3: {"accent": (251, 146, 60), "fill": (46, 33, 21), "label": "3 место"},
-                4: {"accent": (180, 144, 110), "fill": (35, 31, 28), "label": "4 место"},
-            }
-            f_place = _load_font(17)
-            tiles = placements[:4]
-            tile_w = (width - pad * 2 - tile_gap * (len(tiles) - 1)) / max(1, len(tiles))
-            for i, (place, name) in enumerate(tiles):
-                tx = pad + i * (tile_w + tile_gap)
-                ty = py0 + 26
-                style = medal.get(place, {"accent": (150, 165, 195), "fill": (28, 35, 49),
-                                          "label": f"{place} место"})
-                draw.rounded_rectangle(
-                    [tx, ty, tx + tile_w, ty + tile_h], radius=14,
-                    fill=style["fill"], outline=style["accent"], width=2,
-                )
-                # плашка места: ширину считаем по реальному тексту, а не «на глаз»
-                label = style["label"]
-                badge_w = draw.textlength(label, font=f_place) + 26
-                draw.rounded_rectangle(
-                    [tx + 12, ty + 12, tx + 12 + badge_w, ty + 38], radius=8,
-                    fill=style["accent"],
-                )
-                draw.text((tx + 25, ty + 17), label, font=f_place, fill=(24, 24, 24))
-                draw.text((tx + 12, ty + 52),
-                          _fit_text(draw, name, f_slot, tile_w - 24),
-                          font=f_slot, fill=(238, 242, 250))
-
-        top = header_h
+        # заголовки стадий
         col_positions: list[list[float]] = []
         for c, col in enumerate(columns):
             if c == 0:
@@ -1548,14 +1544,11 @@ def render_bracket_image(columns, title: str, subtitle: str = "",
                     b = prev[2 * i + 1] if 2 * i + 1 < len(prev) else a
                     centers.append((a + b) / 2)
             col_positions.append(centers)
-
             x = pad + c * (box_w + gap_x)
-            round_label = stage_label(c)
-            label_w = draw.textlength(round_label, font=f_round)
-            draw.text((x + (box_w - label_w) / 2, top - 30), round_label,
-                      font=f_round, fill=(120, 150, 210))
+            draw.text((x, label_y), _fit_text(draw, stage_label(c).upper(), f_stage, box_w),
+                      font=f_stage, fill=BR_MUTED)
 
-        # линии между колонками
+        # коннекторы рисуются первыми и уходят под карточки
         for c in range(1, len(columns)):
             x_prev = pad + (c - 1) * (box_w + gap_x) + box_w
             x_cur = pad + c * (box_w + gap_x)
@@ -1563,83 +1556,73 @@ def render_bracket_image(columns, title: str, subtitle: str = "",
             for i, y_cur in enumerate(col_positions[c]):
                 y_a = col_positions[c - 1][2 * i] if 2 * i < len(col_positions[c - 1]) else y_cur
                 y_b = col_positions[c - 1][2 * i + 1] if 2 * i + 1 < len(col_positions[c - 1]) else y_a
-                draw.line([(x_prev, y_a), (mid_x, y_a)], fill=(70, 92, 136), width=2)
-                draw.line([(x_prev, y_b), (mid_x, y_b)], fill=(70, 92, 136), width=2)
-                draw.line([(mid_x, y_a), (mid_x, y_b)], fill=(70, 92, 136), width=2)
-                draw.line([(mid_x, y_cur), (x_cur, y_cur)], fill=(70, 92, 136), width=2)
+                draw.line([(x_prev, y_a), (mid_x, y_a)], fill=BR_LINE, width=2)
+                draw.line([(x_prev, y_b), (mid_x, y_b)], fill=BR_LINE, width=2)
+                if y_a != y_b:
+                    draw.line([(mid_x, y_a), (mid_x, y_b)], fill=BR_LINE, width=2)
+                draw.line([(mid_x, y_cur), (x_cur, y_cur)], fill=BR_LINE, width=2)
 
-        # боксы
-        placeholder_words = ("Победитель", "Свободный слот", "Слот ", "ждёт соперника", "?")
+        placeholder_words = ("Победитель", "Свободный слот", "Слот ", "ждёт", "?")
         for c, col in enumerate(columns):
             x = pad + c * (box_w + gap_x)
             for i, name in enumerate(col):
                 cy = col_positions[c][i]
-                name = str(name or "—")
-                is_bye = name.strip().upper() == "BYE"
-                is_placeholder = any(w in name for w in placeholder_words) or name.strip() == "—"
-                is_winner = (not is_placeholder) and (not is_bye) and c > 0
+                raw = _clean_team(name)
+                is_bye = raw.strip().upper() == "BYE"
+                is_placeholder = any(w in raw for w in placeholder_words) or raw.strip() in ("—", "")
+                advanced = (not is_placeholder) and (not is_bye) and c > 0
                 if is_bye:
-                    fill, outline, color = (24, 30, 44), (52, 64, 88), (110, 122, 146)
+                    outline, fill, color = (34, 40, 48), (14, 17, 22), BR_DIM
                 elif is_placeholder:
-                    fill, outline, color = (26, 33, 49), (64, 80, 110), (126, 141, 168)
-                elif is_winner:
-                    fill, outline, color = (21, 52, 44), (52, 211, 153), (209, 250, 229)
+                    outline, fill, color = (34, 40, 48), (14, 17, 22), BR_MUTED
+                elif advanced:
+                    outline, fill, color = BR_WIN, (16, 24, 21), (207, 232, 217)
                 else:
-                    fill, outline, color = (30, 38, 57), (88, 108, 146), (234, 240, 250)
+                    outline, fill, color = (52, 60, 72), BR_SURFACE, BR_TEXT
                 draw.rounded_rectangle(
                     [x, cy - box_h / 2, x + box_w, cy + box_h / 2],
-                    radius=11, fill=fill, outline=outline, width=2,
+                    radius=6, fill=fill, outline=outline, width=1,
                 )
-                prefix = ""
-                if is_bye:
-                    prefix = "BYE · "
-                label = _fit_text(draw, prefix + name, f_slot, box_w - 26)
-                draw.text((x + 13, cy - 12), label, font=f_slot, fill=color)
+                if advanced:
+                    draw.rectangle([x, cy - box_h / 2 + 5, x + 3, cy + box_h / 2 - 5], fill=BR_WIN)
+                label = "BYE" if is_bye else raw
+                draw.text((x + 14, cy - 11),
+                          _fit_text(draw, label, f_slot, box_w - 28),
+                          font=f_slot, fill=color)
 
-        # чемпион
-        if not solo and len(columns) > 1:
-            champ = _clean_team(columns[-1][0] if columns[-1] else "")
-            if champ and not any(w in champ for w in placeholder_words) and champ.upper() != "BYE":
-                x = pad + (len(columns) - 1) * (box_w + gap_x)
-                cy = col_positions[-1][0]
-                draw.text((x, cy - box_h / 2 - 28), "ЧЕМПИОН",
-                          font=f_small, fill=(255, 214, 102))
-
-        # предварительный раунд: показываем отдельным блоком под сеткой
+        # предварительный раунд
         if playin:
-            y0 = header_h + len(columns[0]) * row_h + 4
-            draw.text((pad, y0), "ПРЕДВАРИТЕЛЬНЫЙ РАУНД", font=f_third,
-                      fill=(120, 200, 255))
+            y0 = top + rows * row_h - v_gap + 10
+            draw.text((pad, y0), "ПРЕДВАРИТЕЛЬНЫЙ РАУНД", font=f_stage, fill=BR_MUTED)
             for i, (a, b) in enumerate(playin):
                 px = pad + (i % 2) * (box_w + gap_x)
-                py = y0 + 34 + (i // 2) * 30
+                py = y0 + 26 + (i // 2) * 26
                 draw.text((px, py),
-                          _fit_text(draw, f"{_clean_team(a)} vs {_clean_team(b)}",
-                                    f_slot, box_w + gap_x - 20),
-                          font=f_slot, fill=(190, 205, 230))
+                          _fit_text(draw, f"{_clean_team(a)}  ·  {_clean_team(b)}",
+                                    f_slot, box_w + gap_x - 24),
+                          font=f_slot, fill=BR_TEXT)
 
-        # матч за 3-4 места
+        # матч за 3-4 места: обычная карточка с акцентной полосой
         if third_h:
-            y0 = header_h + len(columns[0]) * row_h + 4
+            y0 = top + rows * row_h - v_gap + 10
             if playin:
                 y0 += playin_h
             box3_w = min(width - pad * 2, box_w * 2 + gap_x)
-            draw.rounded_rectangle(
-                [pad, y0, pad + box3_w, y0 + 104], radius=14,
-                fill=(43, 32, 20), outline=(245, 158, 11), width=2,
-            )
-            draw.text((pad + 18, y0 + 12), "МАТЧ ЗА 3-4 МЕСТА",
-                      font=f_third, fill=(253, 186, 116))
+            draw.rounded_rectangle([pad, y0, pad + box3_w, y0 + 92], radius=8,
+                                   fill=BR_SURFACE, outline=BR_LINE, width=1)
+            draw.rectangle([pad, y0 + 1, pad + 3, y0 + 91], fill=BR_COPPER)
+            draw.text((pad + 20, y0 + 14), "МАТЧ ЗА 3-4 МЕСТА",
+                      font=f_stage, fill=BR_COPPER)
             a = _clean_team(third.get("side_a") or "ждём проигравшего полуфинала")
             b = _clean_team(third.get("side_b") or "ждём проигравшего полуфинала")
             winner = _clean_team(third.get("winner") or "")
-            draw.text((pad + 18, y0 + 50),
-                      _fit_text(draw, f"{a}  vs  {b}", f_slot, box3_w - 36),
-                      font=f_slot, fill=(245, 230, 210))
+            draw.text((pad + 20, y0 + 36),
+                      _fit_text(draw, f"{a}   ·   {b}", f_slot, box3_w - 40),
+                      font=f_slot, fill=BR_TEXT)
             if winner:
-                draw.text((pad + 18, y0 + 76),
-                          _fit_text(draw, f"Победитель: {winner}", f_small, box3_w - 36),
-                          font=f_small, fill=(74, 222, 128))
+                draw.text((pad + 20, y0 + 64),
+                          _fit_text(draw, f"Победитель: {winner}", f_small, box3_w - 40),
+                          font=f_small, fill=(158, 214, 178))
 
         buf = io.BytesIO()
         img.save(buf, format="PNG")
@@ -1732,11 +1715,13 @@ def _render_for_row(row, title_suffix: str = "", participants=None) -> bytes | N
         labels = ["Участники"] + [
             _stage_label(row, r + offset) for r in range(1, len(columns))
         ]
-    # когда призёры уже известны — сверху таблица, а не «актуальная сетка»
-    suffix = " · Победители" if placements else title_suffix
+    # статус («Победители»/«Сетка») уже выводится меткой в шапке —
+    # в заголовке не дублируем; «актуальная сетка» оставляем только до финала
+    suffix = "" if placements else title_suffix
+    test_mark = " · ТЕСТ" if is_test_tournament(row) else ""
     return render_bracket_image(
         columns,
-        f"Турнир #{row['id']} · {row['t_type']}{suffix}",
+        f"Турнир #{row['id']} · {row['t_type']}{suffix}{test_mark}",
         "",  # серая строка-подпись убрана по просьбе
         third=third,
         solo=(row["t_type"] == TOURNAMENT_SHOWDOWN),
