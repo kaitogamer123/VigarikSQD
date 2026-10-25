@@ -1471,7 +1471,7 @@ def render_bracket_image(columns, title: str, subtitle: str = "",
         placements = [(int(p), str(n)) for p, n in (placements or [])]
         # таблица призёров над сеткой: тёмный фон + 4 плитки в ряд
         tile_gap = 16
-        tile_h = 92
+        tile_h = 96
         panel_h = (40 + tile_h + 22) if placements else 0
         header_h = 136 + panel_h
         base_h = header_h + len(columns[0]) * row_h + pad
@@ -1506,30 +1506,32 @@ def render_bracket_image(columns, title: str, subtitle: str = "",
 
             # 1 — золото, 2 — серебро, 3 — бронза, 4 — тёмная бронза
             medal = {
-                1: {"accent": (255, 209, 102), "fill": (45, 39, 21), "label": "1 МЕСТО"},
-                2: {"accent": (203, 213, 225), "fill": (35, 41, 54), "label": "2 МЕСТО"},
-                3: {"accent": (251, 146, 60), "fill": (46, 33, 21), "label": "3 МЕСТО"},
-                4: {"accent": (180, 144, 110), "fill": (35, 31, 28), "label": "4 МЕСТО"},
+                1: {"accent": (255, 209, 102), "fill": (45, 39, 21), "label": "1 место"},
+                2: {"accent": (203, 213, 225), "fill": (35, 41, 54), "label": "2 место"},
+                3: {"accent": (251, 146, 60), "fill": (46, 33, 21), "label": "3 место"},
+                4: {"accent": (180, 144, 110), "fill": (35, 31, 28), "label": "4 место"},
             }
+            f_place = _load_font(17)
             tiles = placements[:4]
             tile_w = (width - pad * 2 - tile_gap * (len(tiles) - 1)) / max(1, len(tiles))
             for i, (place, name) in enumerate(tiles):
                 tx = pad + i * (tile_w + tile_gap)
                 ty = py0 + 26
                 style = medal.get(place, {"accent": (150, 165, 195), "fill": (28, 35, 49),
-                                          "label": f"{place} МЕСТО"})
+                                          "label": f"{place} место"})
                 draw.rounded_rectangle(
                     [tx, ty, tx + tile_w, ty + tile_h], radius=14,
                     fill=style["fill"], outline=style["accent"], width=2,
                 )
-                # цветной маркер места
+                # плашка места: ширину считаем по реальному тексту, а не «на глаз»
+                label = style["label"]
+                badge_w = draw.textlength(label, font=f_place) + 26
                 draw.rounded_rectangle(
-                    [tx + 12, ty + 12, tx + 96, ty + 32], radius=6,
+                    [tx + 12, ty + 12, tx + 12 + badge_w, ty + 38], radius=8,
                     fill=style["accent"],
                 )
-                marker_text = _fit_text(draw, style["label"], f_small, 76)
-                draw.text((tx + 17, ty + 16), marker_text, font=f_small, fill=(24, 24, 24))
-                draw.text((tx + 12, ty + 50),
+                draw.text((tx + 25, ty + 17), label, font=f_place, fill=(24, 24, 24))
+                draw.text((tx + 12, ty + 52),
                           _fit_text(draw, name, f_slot, tile_w - 24),
                           font=f_slot, fill=(238, 242, 250))
 
