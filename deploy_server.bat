@@ -1,50 +1,21 @@
 @echo off
-chcp 65001 > nul
-title Авто-деплой VigarikSQD
+chcp 65001 >nul
+title Deploy VigarikSQD
 
-echo ==============================================
-echo [1/2] Отправка изменений в GitHub...
-echo ==============================================
+echo ============================================
+echo  [1/2] Push to GitHub VigarikSQD/master
+echo ============================================
 git push VigarikSQD master
-if errorlevel 1 (
-    echo.
-    echo ❌ ОШИБКА: git push не выполнен. Деплой на сервер отменён.
-    pause
-    exit /b 1
-)
+if errorlevel 1 echo ERROR: git push failed. Deploy stopped.
+if not errorlevel 1 echo Push OK.
 
 echo.
-echo ==============================================
-echo [2/2] Обновление, проверка библиотек и перезапуск на сервере...
-echo ==============================================
-ssh root@185.251.38.246 "cd ~/VigarikSQD && chmod +x update.sh && ./update.sh"
-set SSH_CODE=%errorlevel%
-
-if not "%SSH_CODE%"=="0" (
-    echo.
-    echo ==============================================
-    echo  ❌ ДЕПЛОЙ НЕ ЗАВЕРШЁН (код %SSH_CODE%)
-    echo ==============================================
-    echo  Чаще всего это проверка зависимостей из requirements.txt:
-    echo  какая-то библиотека не установилась или не импортируется.
-    echo  Бот при этом продолжает работать на старой версии.
-    echo.
-    echo  Что сделать:
-    echo    1) смотри вывод этапа [4/5] выше — там список ✅/❌ по каждой библиотеке;
-    echo    2) на сервере выполни: cd ~/VigarikSQD ^&^& venv/bin/pip install -r requirements.txt
-    echo    3) повтори deploy_server.bat.
-    echo ==============================================
-    pause
-    exit /b %SSH_CODE%
-)
+echo ============================================
+echo  [2/2] Server update: deps check, restart
+echo ============================================
+if not errorlevel 1 ssh root@185.251.38.246 "cd ~/VigarikSQD && chmod +x update.sh && ./update.sh"
+if errorlevel 1 echo ERROR: server deploy failed. See output above. Bot keeps old version.
+if not errorlevel 1 echo SUCCESS: bot updated, all libraries from requirements.txt verified.
 
 echo.
-echo ==============================================
-echo  Готово! Бот обновлён, все библиотеки из requirements.txt на месте.
-echo ==============================================
-
-set /p show_logs="Хотите ли вы открыть окно логов? (Y/N): "
-if /i "%show_logs%"=="Y" (
-    echo Подключение к окну логов бота...
-    ssh -t root@185.251.38.246 "screen -r vigarik_bot"
-)
+pause

@@ -764,6 +764,57 @@ def get_tournament_matches(tournament_id: int, round_no: int = 1):
     return [dict(r) for r in rows]
 
 
+def get_all_tournament_matches(tournament_id: int):
+    """Все матчи турнира (включая матч за 3-4 места с round=0)."""
+    ensure_tournament_tables()
+    conn = db.get_connection()
+    rows = conn.execute(
+        "SELECT * FROM tournament_matches WHERE tournament_id = ? ORDER BY round, pair_index",
+        (int(tournament_id),),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_placements(tournament_id: int) -> list[tuple[int, str]]:
+    """Итоговые места: [(1, 'TEST-01'), (2, 'TEST-08'), (3, 'TEST-03'), (4, 'TEST-05')]."""
+    row = get_tournament(tournament_id)
+    if not row:
+        return []
+    matches = get_all_tournament_matches(tournament_id)
+    third = get_third_place_match(tournament_id)
+    placements: list[tuple[int, str]] = []
+
+    # финал — строго последний раунд сетки (иначе после полуфинала
+    # «1 место» присудили бы победителю полуфинала)
+    final_round = _total_rounds(_bracket_size(row))
+    final = next(
+        (m for m in matches
+         if int(m["round"]) == final_round and m["side_a"] and m["side_b"]),
+        None,
+    )
+    if final and final["winner"]:
+        loser = final["side_b"] if final["winner"] == final["side_a"] else final["side_a"]
+        placements.append((1, _clean_team(final["winner"])))
+        if loser:
+            placements.append((2, _clean_team(loser)))
+
+    if third and third["winner"] and third["side_a"] and third["side_b"]:
+        loser3 = third["side_b"] if third["winner"] == third["side_a"] else third["side_a"]
+        placements.append((3, _clean_team(third["winner"])))
+        if loser3:
+            placements.append((4, _clean_team(loser3)))
+    return placements
+
+
+def placements_text(tournament_id: int) -> str:
+    """Текстовая таблица призёров для постов/подтверждений."""
+    rows = get_placements(tournament_id)
+    if not rows:
+        return ""
+    return "\n".join(f"{place} место — {name}" for place, name in rows)
+
+
 def tournament_matches_exist(tournament_id: int) -> bool:
     ensure_tournament_tables()
     conn = db.get_connection()
@@ -972,11 +1023,14 @@ def advance_winner(tournament_id: int, round_no: int, pair_index: int, winner: s
     is_playin = bool(plan.get("playin_pairs")) and round_no == 1 and \
         int(pair_index) < len(plan["playin_pairs"])
     if is_playin:
-        next_pair = int(pair_index)
-        side = "a"
-        existing = get_tournament_matches(tournament_id, next_round)
-        if any(int(x["pair_index"]) == next_pair and x["side_a"] for x in existing):
-            side = "b"
+        # куда именно встал слот «Победитель пары N» в первой колонке основной сетки
+        main_col = _first_main_column(plan)
+        label = f"Победитель пары {int(pair_index) + 1}"
+        if label in main_col:
+            pos = main_col.index(label)
+            next_pair, side = pos // 2, ("a" if pos % 2 == 0 else "b")
+        else:
+            next_pair, side = int(pair_index), "a"
     else:
         next_pair = int(pair_index) // 2
         side = "a" if int(pair_index) % 2 == 0 else "b"
@@ -1232,10 +1286,13 @@ def _first_main_column(plan: dict) -> list:
     direct = list(plan.get("direct") or [])
     col: list = ["BYE"] * size
     if playin:
-        # каждый победитель предвариловки встаёт в свою пару к команде,
-        # прошедшей напрямую: W1 — в матч 0, W2 — в матч 1 и т.д.
+        # победителей предвариловки разводим по разным половинам сетки,
+        # чтобы W1 и W2 не встретились в первом же матче основной сетки
+        step = max(1, size // max(1, len(playin)))
         for i in range(len(playin)):
-            pos = i * 2
+            pos = i * step
+            while pos < size and col[pos] != "BYE":
+                pos += 1
             if pos >= size:
                 pos = next((j for j in range(size) if col[j] == "BYE"), 0)
             col[pos] = f"Победитель пары {i + 1}"
@@ -1296,8 +1353,12 @@ def _bracket_pairs_text(slots: list[str]) -> list[str]:
             lines.append(f"{b} → автопроход (BYE)")
         elif b == "BYE":
             lines.append(f"{a} → автопроход (BYE)")
+        elif str(a).startswith("Победитель пары"):
+            lines.append(f"{b} → ждёт победителя предварительного раунда")
+        elif str(b).startswith("Победитель пары"):
+            lines.append(f"{a} → ждёт победителя предварительного раунда")
         else:
-            lines.append(f"{a} 🆚 {b}")
+            lines.append(f"{a} vs {b}")
     return lines
 
 
@@ -1318,9 +1379,37 @@ def _load_font(size: int):
         return ImageFont.load_default()
 
 
+def _clean_team(text) -> str:
+    """Убирает мусор из названия состава: 'TEST-03 [] TEST-05' → 'TEST-03 vs TEST-05'.
+
+    Появлялось из-за пустых тегов («[]») и эмодзи-крестика, который шрифт не рисует.
+    """
+    raw = str(text or "")
+    # убираем только эмодзи/пиктограммы (шрифт DejaVu их не рисует);
+    # буквы, цифры, «№», тире и кавычки сохраняем
+    cleaned = []
+    for ch in raw:
+        code = ord(ch)
+        if ch in {"🆚", "⚔", "⚔️"}:
+            cleaned.append(" vs ")
+            continue
+        if (
+            0x1F000 <= code <= 0x1FAFF      # эмодзи
+            or 0x2600 <= code <= 0x27BF     # символы/дингбаты
+            or 0xFE00 <= code <= 0xFE0F     # variation selectors
+            or 0x1F1E6 <= code <= 0x1F1FF   # флаги
+            or code in (0x2192, 0x2190)     # стрелки
+        ):
+            continue
+        cleaned.append(ch)
+    out = "".join(cleaned).replace("[]", "")
+    out = " ".join(out.split())
+    return out.strip()
+
+
 def _fit_text(draw, text, font, max_width: int) -> str:
     """Обрезает подпись по пикселям, чтобы она не вылезала из бокса."""
-    text = str(text or "").strip() or "—"
+    text = _clean_team(text) or "—"
     try:
         if draw.textlength(text, font=font) <= max_width:
             return text
@@ -1344,7 +1433,7 @@ def _round_title(total: int, round_no: int) -> str:
 
 def render_bracket_image(columns, title: str, subtitle: str = "",
                          third=None, solo: bool = False, labels=None,
-                         playin=None) -> bytes | None:
+                         playin=None, placements=None) -> bytes | None:
     """Красивая сетка: колонки по раундам, ровные линии, реальные названия команд.
 
     columns[0] — участники, columns[r] — победители раунда r.
@@ -1379,7 +1468,11 @@ def render_bracket_image(columns, title: str, subtitle: str = "",
 
         box_w, box_h, v_gap, gap_x, pad = 264, 58, 20, 66, 42
         row_h = box_h + v_gap
-        header_h = 136
+        placements = [(int(p), str(n)) for p, n in (placements or [])]
+        # белая таблица призёров над сеткой (как в макете)
+        panel_row_h = 42
+        panel_h = (34 + panel_row_h * len(placements) + 18) if placements else 0
+        header_h = 136 + panel_h
         base_h = header_h + len(columns[0]) * row_h + pad
         third_h = 132 if (third and (third.get("side_a") or third.get("side_b"))) else 0
         playin_h = 0
@@ -1402,6 +1495,22 @@ def render_bracket_image(columns, title: str, subtitle: str = "",
         draw.rectangle([0, 90, width, 94], fill=(255, 209, 102))
         draw.text((pad, 24), _fit_text(draw, title, f_title, width - pad * 2),
                   font=f_title, fill=(255, 214, 102))
+
+        # ── таблица победителей над сеткой ────────────────────────────────────
+        if placements:
+            py0 = 94
+            draw.rectangle([0, py0, width, py0 + panel_h], fill=(244, 246, 250))
+            draw.rectangle([0, py0 + panel_h - 3, width, py0 + panel_h], fill=(255, 209, 102))
+            draw.text((pad, py0 + 16), "Победители", font=f_third, fill=(28, 34, 48))
+            place_word = {1: "1 место", 2: "2 место", 3: "3 место", 4: "4 место"}
+            place_color = {1: (196, 132, 10), 2: (90, 104, 128), 3: (150, 96, 40), 4: (150, 96, 40)}
+            for i, (place, name) in enumerate(placements[:8]):
+                ry = py0 + 54 + i * panel_row_h
+                label = place_word.get(place, f"{place} место")
+                draw.text((pad, ry), _fit_text(draw, label, f_slot, 140),
+                          font=f_slot, fill=place_color.get(place, (28, 34, 48)))
+                draw.text((pad + 150, ry), _fit_text(draw, name, f_slot, width - pad * 2 - 150),
+                          font=f_slot, fill=(20, 24, 34))
 
         top = header_h
         col_positions: list[list[float]] = []
@@ -1466,23 +1575,24 @@ def render_bracket_image(columns, title: str, subtitle: str = "",
 
         # чемпион
         if not solo and len(columns) > 1:
-            champ = str(columns[-1][0] or "")
+            champ = _clean_team(columns[-1][0] if columns[-1] else "")
             if champ and not any(w in champ for w in placeholder_words) and champ.upper() != "BYE":
                 x = pad + (len(columns) - 1) * (box_w + gap_x)
                 cy = col_positions[-1][0]
-                draw.text((x, cy - box_h / 2 - 28), "🏆 Чемпион",
+                draw.text((x, cy - box_h / 2 - 28), "ЧЕМПИОН",
                           font=f_small, fill=(255, 214, 102))
 
         # предварительный раунд: показываем отдельным блоком под сеткой
         if playin:
             y0 = header_h + len(columns[0]) * row_h + 4
-            draw.text((pad, y0), "Предварительный раунд", font=f_third,
+            draw.text((pad, y0), "ПРЕДВАРИТЕЛЬНЫЙ РАУНД", font=f_third,
                       fill=(120, 200, 255))
             for i, (a, b) in enumerate(playin):
                 px = pad + (i % 2) * (box_w + gap_x)
                 py = y0 + 34 + (i // 2) * 30
                 draw.text((px, py),
-                          _fit_text(draw, f"{a} 🆚 {b}", f_slot, box_w + gap_x - 20),
+                          _fit_text(draw, f"{_clean_team(a)} vs {_clean_team(b)}",
+                                    f_slot, box_w + gap_x - 20),
                           font=f_slot, fill=(190, 205, 230))
 
         # матч за 3-4 места
@@ -1495,13 +1605,13 @@ def render_bracket_image(columns, title: str, subtitle: str = "",
                 [pad, y0, pad + box3_w, y0 + 104], radius=14,
                 fill=(43, 32, 20), outline=(245, 158, 11), width=2,
             )
-            draw.text((pad + 18, y0 + 12), "🥉 Матч за 3-4 места",
+            draw.text((pad + 18, y0 + 12), "МАТЧ ЗА 3-4 МЕСТА",
                       font=f_third, fill=(253, 186, 116))
-            a = str(third.get("side_a") or "ждём проигравшего полуфинала")
-            b = str(third.get("side_b") or "ждём проигравшего полуфинала")
-            winner = str(third.get("winner") or "")
+            a = _clean_team(third.get("side_a") or "ждём проигравшего полуфинала")
+            b = _clean_team(third.get("side_b") or "ждём проигравшего полуфинала")
+            winner = _clean_team(third.get("winner") or "")
             draw.text((pad + 18, y0 + 50),
-                      _fit_text(draw, f"{a}  🆚  {b}", f_slot, box3_w - 36),
+                      _fit_text(draw, f"{a}  vs  {b}", f_slot, box3_w - 36),
                       font=f_slot, fill=(245, 230, 210))
             if winner:
                 draw.text((pad + 18, y0 + 76),
@@ -1568,11 +1678,12 @@ def _bracket_columns_for(row, participants=None):
             if m.get("winner"):
                 col.append(str(m["winner"]))
             elif m.get("side_a") and m.get("side_b"):
-                col.append(f"{m['side_a']} / {m['side_b']}")
+                # явная пара, чтобы в боксе не было «[ ]» и «vs vs»
+                col.append(f"{m['side_a']} vs {m['side_b']}")
             elif m.get("side_a") or m.get("side_b"):
                 col.append(f"{m.get('side_a') or m.get('side_b')} · ждёт соперника")
             else:
-                col.append(f"Победитель пары {i + 1}")
+                col.append(f"Победитель {_stage_label(row, r)} №{i + 1}")
         columns.append(col)
     return columns, get_third_place_match(row["id"]), playin
 
@@ -1588,6 +1699,7 @@ def _bracket_subtitle(row, participants=None) -> str:
 
 def _render_for_row(row, title_suffix: str = "", participants=None) -> bytes | None:
     columns, third, playin = _bracket_columns_for(row, participants)
+    placements = [] if row["t_type"] == TOURNAMENT_SHOWDOWN else get_placements(int(row["id"]))
     if row["t_type"] == TOURNAMENT_SHOWDOWN:
         labels = ["Участники ShowDown"]
     else:
@@ -1597,14 +1709,17 @@ def _render_for_row(row, title_suffix: str = "", participants=None) -> bytes | N
         labels = ["Участники"] + [
             _stage_label(row, r + offset) for r in range(1, len(columns))
         ]
+    # когда призёры уже известны — сверху таблица, а не «актуальная сетка»
+    suffix = " · Победители" if placements else title_suffix
     return render_bracket_image(
         columns,
-        f"Турнир #{row['id']} · {row['t_type']}{title_suffix}",
+        f"Турнир #{row['id']} · {row['t_type']}{suffix}",
         "",  # серая строка-подпись убрана по просьбе
         third=third,
         solo=(row["t_type"] == TOURNAMENT_SHOWDOWN),
         labels=labels,
         playin=playin,
+        placements=placements,
     )
 
 
@@ -1625,7 +1740,8 @@ def _participants_block(participants, limit_rows: int = 20) -> str:
         return "Пока никто не зарегистрирован — стань первым!"
     lines = []
     for i, p in enumerate(participants[:limit_rows], start=1):
-        lines.append(f"{i}. {hd.quote(p['team_name'] or '—')} [{hd.quote(p['team_tag'] or '—')}]")
+        tag = (p["team_tag"] or "").strip()
+        lines.append(f"{i}. {hd.quote(p['team_name'] or '—')}" + (f" [{hd.quote(tag)}]" if tag else ""))
     if len(participants) > limit_rows:
         lines.append(f"... и ещё {len(participants) - limit_rows}")
     return "\n".join(lines)
@@ -1863,7 +1979,7 @@ async def _send_preview(call: CallbackQuery, row, as_caption: bool = False):
         )
         return
     columns, _third, _playin = _bracket_columns_for(row)
-    pairs = [f"{a or '—'} 🆚 {b or '—'}"
+    pairs = [f"{_clean_team(a) or '—'} vs {_clean_team(b) or '—'}"
              for a, b in zip(columns[0][::2], columns[0][1::2])]
     text = "\n".join([f"🗺 <b>Сетка турнира #{row['id']}</b>"] + [f"• {hd.quote(p)}" for p in pairs])
     text += "\n\nℹ️ Библиотека Pillow не установлена — картинка сетки недоступна. Установи: pip install Pillow"
@@ -2224,7 +2340,12 @@ async def start_tournament(bot: Bot, row) -> str:
     mark_round_started(tid, 1)   # первый круг объявлен постом старта
     set_tournament_status(tid, "running")
 
-    topics_sent, topics_failed = await _post_tournament_start(bot, row, participants, matches)
+    # в посте старта показываем и предвариловку, и реальные пары основной сетки
+    post_matches = list(matches)
+    if plan["playin_pairs"]:
+        post_matches += [m for m in get_tournament_matches(tid, 2)
+                         if m["side_a"] and m["side_b"]]
+    topics_sent, topics_failed = await _post_tournament_start(bot, row, participants, post_matches)
 
     # ── ЛС капитанам (п.3 ТЗ): соперник + @username его лидера
     by_name = {p["team_name"]: p for p in participants}
@@ -2432,6 +2553,7 @@ async def admin_current_tournament_card(call: CallbackQuery):
     auto = ""
     if row["scheduled_at"] and row["status"] in ("registration", "announced"):
         auto = "\n⏰ Автозапуск по расписанию включён."
+    winners = placements_text(row["id"])
     text = (
         f"⚔️ <b>Текущий турнир #{row['id']}</b>\n"
         f"• Тип: {hd.quote(TOURNAMENT_TYPE_LABELS.get(row['t_type'], row['t_type']))}\n"
@@ -2442,6 +2564,7 @@ async def admin_current_tournament_card(call: CallbackQuery):
         f"👥 Поданных составов: <b>{_fmt_num(len(participants))}</b>\n"
         f"{_participants_block(participants, 15)}\n\n"
         f"🗺 Пар 1-го круга: {_fmt_num(len(matches))}{auto}"
+        + (f"\n\n🏅 <b>Победители</b>\n{hd.quote(winners)}" if winners else "")
     )
     try:
         await call.message.edit_text(text, parse_mode="HTML",
@@ -2711,12 +2834,15 @@ def _bracket_status_caption(row) -> str:
     third = get_third_place_match(row["id"])
     lines += ["", "<b>Пары 1-го круга</b>", _pairs_schedule_text(matches)]
     if third and third["side_a"]:
-        lines += ["", "<b>🥉 Матч за 3-4 места</b>"]
+        lines += ["", "<b>Матч за 3-4 места</b>"]
         if third["winner"]:
-            lines.append(f"✅ Победитель: {hd.quote(str(third['winner']))}")
+            lines.append(f"Победитель: {hd.quote(str(third['winner']))}")
         else:
-            lines.append(f"{hd.quote(str(third['side_a']))} 🆚 "
+            lines.append(f"{hd.quote(str(third['side_a']))} vs "
                          f"{hd.quote(str(third['side_b'] or 'ждём проигравшего полуфинала'))}")
+    winners = placements_text(int(row["id"]))
+    if winners:
+        lines += ["", "<b>Победители</b>", hd.quote(winners)]
     return "\n".join(lines)
 
 
@@ -2853,6 +2979,8 @@ async def admin_result_win(call: CallbackQuery, bot: Bot):
         info = advance_winner(int(m["tournament_id"]), int(m["round"]), int(m["pair_index"]), str(winner))
         if info["tournament_finished"]:
             notes.append("🏁 Финал закрыт.")
+            if not get_third_place_match(int(m["tournament_id"])):
+                set_tournament_status(int(m["tournament_id"]), "finished")
         if register_semifinal_loser(int(m["tournament_id"]), int(m["round"]), str(loser)):
             notes.append("🥉 Сформирован матч за 3-4 места.")
         _propagate_auto_advances(int(m["tournament_id"]))
@@ -2860,6 +2988,9 @@ async def admin_result_win(call: CallbackQuery, bot: Bot):
 
     updated, recreated = await _upsert_bracket_post(bot, row, _bracket_status_caption(row))
     notes.append(f"🗺 Сетка: обновлено {updated}, создано заново {recreated}.")
+    placement_rows = placements_text(int(m["tournament_id"]))
+    if placement_rows:
+        notes.append("🏅 Победители:\n" + placement_rows)
 
     for p in get_tournament_participants(int(m["tournament_id"])):
         if p["team_name"] not in (winner, loser) or not p["leader_id"]:
@@ -3667,6 +3798,9 @@ async def _apply_result(call: CallbackQuery, report_id: int, winner: str, status
     # обновляем посты с сеткой (с обработкой лимита редактирования 48 ч)
     updated, recreated = await _upsert_bracket_post(bot, row, _bracket_status_caption(row))
     notes.append(f"🗺 Посты с сеткой: обновлено {updated}, создано заново {recreated}.")
+    placement_rows = placements_text(int(m["tournament_id"]))
+    if placement_rows:
+        notes.append("🏅 Победители:\n" + placement_rows)
 
     # уведомления лидерам
     for p in get_tournament_participants(int(m["tournament_id"])):
