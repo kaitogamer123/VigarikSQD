@@ -2648,8 +2648,10 @@ def _announcement_text(row, participants, for_clan_post: bool = True) -> str:
     typ = TOURNAMENT_TYPE_LABELS.get(row["t_type"], row["t_type"])
     fmt = TOURNAMENT_FORMAT_LABELS.get(row["t_format"], "—") if row["t_format"] else "—"
     status = TOURNAMENT_STATUS_LABEL.get(row["status"], row["status"])
+    test_mark = "🧪 <b>ТЕСТ</b> · " if is_test_tournament(row) else ""
     lines = [
         f"🏆 <b>{hd.quote(_tournament_title(row, prefix='ТУРНИР').upper())}</b>",
+        f"{test_mark}проверка механики турнира" if test_mark else "",
         "",
         f"• Тип скрима: <b>{hd.quote(str(typ))}</b>",
         f"• Формат: <b>{hd.quote(str(fmt))}</b>" if row["t_format"] else "• Формат: <b>—</b>",
@@ -2686,8 +2688,9 @@ def _announcement_text(row, participants, for_clan_post: bool = True) -> str:
 def _announcement_caption(row) -> str:
     """Короткая подпись к картинке (лимит Telegram — 1024 символа)."""
     typ = TOURNAMENT_TYPE_LABELS.get(row["t_type"], row["t_type"])
+    test_mark = " · 🧪 ТЕСТ" if is_test_tournament(row) else ""
     return (
-        f"🏆 <b>{hd.quote(_tournament_title(row))} — {hd.quote(str(typ))}</b>\n"
+        f"🏆 <b>{hd.quote(_tournament_title(row))} — {hd.quote(str(typ))}</b>{test_mark}\n"
         f"👥 Лимит: {_limit_text(row)}"
     )
 
@@ -4174,18 +4177,27 @@ async def admin_tournament_announce(call: CallbackQuery, bot: Bot):
     if row["status"] in ("cancelled", "finished"):
         await call.answer("Турнир уже закрыт", show_alert=True)
         return
+    if row["status"] != "registration" and row["status"] != "announced":
+        await call.answer("Регистрация уже началась — анонс только до старта", show_alert=True)
+        return
     participants = get_tournament_participants(tournament_id)
+    is_test = is_test_tournament(row)
     await call.answer("Публикую анонс...", show_alert=False)
-    status_msg = await call.message.answer("⏳ Публикую анонс в топики и рассылаю приглашения в ЛС...")
+    status_msg = await call.message.answer(
+        "⏳ Публикую тестовый анонс в топик основы..."
+        if is_test else
+        "⏳ Публикую анонс в топики и рассылаю приглашения в ЛС..."
+    )
 
     topics_sent, topics_failed = await _post_to_clan_topics(bot, row, participants)
     dm = await _dm_registered_players(bot, row)
     mark_tournament_published(tournament_id)
 
     report = [
-        f"📣 <b>Анонс турнира #{tournament_id} отправлен</b>",
+        f"📣 <b>{hd.quote(_tournament_title(row))} — "
+        f"{'тестовый анонс отправлен' if is_test else 'анонс отправлен'}</b>",
         "",
-        f"🗂 Топики кланов: ✅ {len(topics_sent)}",
+        f"🗂 {'Топик основы' if is_test else 'Топики кланов'}: ✅ {len(topics_sent)}",
     ]
     for t in topics_sent:
         report.append(f"  • {hd.quote(t)}")
@@ -4193,16 +4205,27 @@ async def admin_tournament_announce(call: CallbackQuery, bot: Bot):
         report.append(f"  ❌ не отправлено: {len(topics_failed)}")
         for t in topics_failed:
             report.append(f"  • {hd.quote(t)}")
-    report += [
-        "",
-        f"📨 Рассылка в ЛС: зарегистрированных {dm['total']}, пропущено {dm['skipped']}",
-        f"  • лидеров составов пригласили: {dm['with_team']} (отправлено {dm['invited']})",
-        f"  • без состава (нужно создать): {dm['without_team']}",
-        f"  • не лидеры (уведомлены): {dm['not_leader']}",
-        f"  • ошибок доставки: {dm['failed']}",
-        "",
-        "Если топики не настроены — задай их через «⚙️ Топики турниров» и повтори анонс.",
-    ]
+    if is_test:
+        report += [
+            "",
+            f"📨 ЛС: приглашения только лидерам записанных составов — {dm['invited']}, "
+            f"ошибок {dm['failed']}",
+            "Массовой рассылки в тестовом режиме нет.",
+            "",
+            "Если топик основы не настроен — задай его через «⚙️ Топики турниров» "
+            "(<code>test=ID</code> или ссылкой).",
+        ]
+    else:
+        report += [
+            "",
+            f"📨 Рассылка в ЛС: зарегистрированных {dm['total']}, пропущено {dm['skipped']}",
+            f"  • лидеров составов пригласили: {dm['with_team']} (отправлено {dm['invited']})",
+            f"  • без состава (нужно создать): {dm['without_team']}",
+            f"  • не лидеры (уведомлены): {dm['not_leader']}",
+            f"  • ошибок доставки: {dm['failed']}",
+            "",
+            "Если топики не настроены — задай их через «⚙️ Топики турниров» и повтори анонс.",
+        ]
     try:
         await status_msg.edit_text("\n".join(report), parse_mode="HTML")
     except Exception:
@@ -4213,8 +4236,10 @@ async def admin_tournament_announce(call: CallbackQuery, bot: Bot):
         admin_id=call.from_user.id,
         admin_name=call.from_user.username or call.from_user.full_name or "admin",
         action_text=(
-            f"📣 Опубликовал анонс турнира #{tournament_id}: топики {len(topics_sent)}, "
-            f"приглашений в ЛС {dm['invited']}, без состава {dm['without_team']}."
+            f"📣 Опубликовал {'ТЕСТОВЫЙ ' if is_test else ''}анонс "
+            f"{_tournament_title(row)}: топиков {len(topics_sent)}, "
+            f"приглашений в ЛС {dm['invited']}."
+            + ("" if is_test else f", без состава {dm['without_team']}.")
         ),
     )
     await call.answer()
