@@ -2040,17 +2040,18 @@ def render_bracket_image(columns, title: str, subtitle: str = "",
         row_h = box_h + v_gap
         header_h = 96
         panel_h = 112 if placements else 0
-        label_y = header_h + panel_h + 34
-        top = label_y + 26
+        # запас под призовой полосой, чтобы подписи не прилипали к карточкам
+        label_y = header_h + panel_h + 46
+        top = label_y + 36
 
         rows = len(columns[0])
         bottom = top + rows * row_h - v_gap
         third_h = 96 if (third and (third.get("side_a") or third.get("side_b"))) else 0
         playin_rows = math.ceil(len(playin) / 2) if playin else 0
-        # нижние блоки: больше воздуха перед карточкой за 3-4 места
-        playin_block = (44 + 30 + 26 * playin_rows + 24) if playin else 0
-        third_block = (52 + third_h + 56) if third_h else 0
-        height = max(520, bottom + (56 if not (playin or third_h) else 0)
+        # нижние блоки с воздухом: предвариловка и матч за 3-4 места
+        playin_block = (58 + 34 + 26 * playin_rows + 30) if playin else 0
+        third_block = (68 + third_h + 68) if third_h else 0
+        height = max(520, bottom + (68 if not (playin or third_h) else 0)
                      + playin_block + third_block)
         width = max(980, pad * 2 + len(columns) * box_w + (len(columns) - 1) * gap_x)
 
@@ -2060,12 +2061,13 @@ def render_bracket_image(columns, title: str, subtitle: str = "",
             # затемняющие полосы под шапкой и призёрами — текст поверх рисунка читается
             overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
             od = ImageDraw.Draw(overlay)
-            od.rectangle([0, 0, width, header_h], fill=(8, 12, 20, 190))
-            if placements:
-                od.rectangle([0, header_h, width, header_h + panel_h], fill=(8, 12, 20, 170))
+            od.rectangle([0, 0, width, header_h + panel_h + 18], fill=(8, 12, 20, 205))
             img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
         else:
             img = Image.new("RGB", (width, height), BR_BG)
+        # карточки рисуем на отдельном слое с прозрачностью — фон просвечивает
+        cards = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        cdraw = ImageDraw.Draw(cards)
         draw = ImageDraw.Draw(img)
         f_title = _load_font(31, BR_TITLE_FAMILY)
         f_meta = _load_font(13, BR_TITLE_FAMILY)
@@ -2091,15 +2093,15 @@ def render_bracket_image(columns, title: str, subtitle: str = "",
         # шапка: заголовок слева, справа — короткий статус строчными буквами
         if themed_bg is None:
             draw.rectangle([0, 0, width, header_h], fill=BR_HEAD)
-        draw.rectangle([pad, 30, pad + 3, 66], fill=BR_BRASS)
-        draw.text((pad + 18, 26), _fit_text(draw, title, f_title, width - pad * 2 - 190),
-                  font=f_title, fill=BR_TEXT)
+        draw.rectangle([pad, 26, pad + 4, 72], fill=BR_BRASS)
+        draw.text((pad + 20, 24), _fit_text(draw, title, f_title, width - pad * 2 - 210),
+                  font=f_title, fill=(246, 242, 232))
         if live_cells:
             meta, meta_color = f"идёт {live_cells} {word}", BR_LIVE
         elif placements:
-            meta, meta_color = "призовые места", BR_MUTED
+            meta, meta_color = "призовые места", (196, 186, 168)
         else:
-            meta, meta_color = "сетка турнира", BR_MUTED
+            meta, meta_color = "сетка турнира", (196, 186, 168)
         draw.text((width - pad - draw.textlength(meta, font=f_meta), 32),
                   meta, font=f_meta, fill=meta_color)
         draw.line([(0, header_h), (width, header_h)], fill=BR_LINE, width=1)
@@ -2144,7 +2146,8 @@ def render_bracket_image(columns, title: str, subtitle: str = "",
                 bar_w = min(box_w, draw.textlength(label_text, font=f_stage) + 4)
                 draw.rectangle([x, label_y + 17, x + bar_w, label_y + 18], fill=BR_LIVE)
 
-        # коннекторы рисуются первыми и уходят под карточки
+        # коннекторы: тёплый светлый тон + тень, чтобы не сливались с небом
+        wire_shadow, wire_color = (12, 16, 24), (222, 214, 196)
         for c in range(1, len(columns)):
             x_prev = pad + (c - 1) * (box_w + gap_x) + box_w
             x_cur = pad + c * (box_w + gap_x)
@@ -2152,11 +2155,14 @@ def render_bracket_image(columns, title: str, subtitle: str = "",
             for i, y_cur in enumerate(col_positions[c]):
                 y_a = col_positions[c - 1][2 * i] if 2 * i < len(col_positions[c - 1]) else y_cur
                 y_b = col_positions[c - 1][2 * i + 1] if 2 * i + 1 < len(col_positions[c - 1]) else y_a
-                draw.line([(x_prev, y_a), (mid_x, y_a)], fill=BR_LINE, width=2)
-                draw.line([(x_prev, y_b), (mid_x, y_b)], fill=BR_LINE, width=2)
+                segments = [[(x_prev, y_a), (mid_x, y_a)], [(x_prev, y_b), (mid_x, y_b)]]
                 if y_a != y_b:
-                    draw.line([(mid_x, y_a), (mid_x, y_b)], fill=BR_LINE, width=2)
-                draw.line([(mid_x, y_cur), (x_cur, y_cur)], fill=BR_LINE, width=2)
+                    segments.append([(mid_x, y_a), (mid_x, y_b)])
+                segments.append([(mid_x, y_cur), (x_cur, y_cur)])
+                for seg in segments:
+                    draw.line(seg, fill=wire_shadow, width=4)
+                for seg in segments:
+                    draw.line(seg, fill=wire_color, width=2)
 
         placeholder_words = ("Победитель", "Свободный слот", "Слот ", "ждёт", "?")
         stage_words = ("1/2 финала", "1/4 финала", "1/8 финала", "1/16 финала",
@@ -2178,56 +2184,48 @@ def render_bracket_image(columns, title: str, subtitle: str = "",
                 is_advanced = (not is_placeholder) and (not is_waiting) \
                     and (not is_live) and (not is_bye) and c > 0
 
+                # обводка «под бумагу»: тёплый песочный тон читается на синем небе
+                card_line = (214, 206, 188)
                 if is_live:
                     outline, fill, color = BR_LIVE, BR_LIVE_FILL, BR_LIVE_TEXT
                     live_count += 1
                 elif is_advanced:
-                    outline, fill, color = BR_LINE, BR_SURFACE, BR_TEXT
+                    outline, fill, color = card_line, BR_SURFACE, BR_TEXT
                 elif is_waiting:
-                    outline, fill, color = BR_LINE, BR_HEAD, BR_MUTED
+                    outline, fill, color = card_line, BR_HEAD, BR_MUTED
                 elif is_placeholder or is_bye:
-                    outline, fill, color = BR_LINE, BR_HEAD, BR_DIM
+                    outline, fill, color = (176, 172, 158), BR_HEAD, BR_DIM
                 else:
-                    outline, fill, color = BR_MUTED, BR_SURFACE, BR_TEXT
+                    outline, fill, color = card_line, BR_SURFACE, BR_TEXT
 
-                draw.rounded_rectangle(
+                # карточка полупрозрачная: фон просвечивает, но текст остаётся читаемым
+                card_alpha = 168 if is_placeholder or is_bye else 196
+                cdraw.rounded_rectangle(
                     [x, cy - box_h / 2, x + box_w, cy + box_h / 2],
-                    radius=BR_RADIUS, fill=fill,
-                    outline=outline, width=2 if is_live else 1,
+                    radius=BR_RADIUS, fill=(*fill, card_alpha),
+                    outline=(*outline, 255), width=2 if is_live else 1,
                 )
                 if is_live or is_advanced:
-                    strip = BR_LIVE if is_live else BR_MUTED
-                    draw.rectangle([x, cy - box_h / 2 + 5, x + 3, cy + box_h / 2 - 5],
-                                   fill=strip)
+                    strip = BR_LIVE if is_live else (150, 143, 128)
+                    cdraw.rectangle([x, cy - box_h / 2 + 5, x + 3, cy + box_h / 2 - 5],
+                                    fill=(*strip, 255))
 
                 label = "BYE" if is_bye else raw
-                if is_live:
-                    # подпись «идёт» — без капса и без легенды над сеткой
-                    tag = "идёт"
-                    tag_w = draw.textlength(tag, font=f_small) + 14
-                    tx0 = x + box_w - tag_w - 8
-                    draw.rounded_rectangle([tx0, cy - 9, tx0 + tag_w, cy + 9],
-                                           radius=max(2, BR_RADIUS),
-                                           fill=fill, outline=BR_LIVE, width=1)
-                    draw.text((tx0 + 7, cy - 6), tag, font=f_small, fill=BR_LIVE_TEXT)
-                    draw.text((x + 14, cy - 11),
-                              _fit_text(draw, label, f_slot, box_w - 28 - tag_w),
-                              font=f_slot, fill=color)
-                else:
-                    draw.text((x + 14, cy - 11),
-                              _fit_text(draw, label, f_slot, box_w - 28),
-                              font=f_slot, fill=color)
+                # плашку «идёт» убрали: статус читается по зелёной рамке и полосе слева
+                draw.text((x + 14, cy - 11),
+                          _fit_text(draw, label, f_slot, box_w - 28),
+                          font=f_slot, fill=color)
 
         # предварительный раунд
         if playin:
-            y0 = bottom + 48
+            y0 = bottom + 58
             draw.text((pad, y0), "Предварительный раунд", font=f_stage,
                       fill=BR_LIVE if active_playin else BR_MUTED)
             if active_playin:
                 draw.rectangle([pad, y0 + 17, pad + 128, y0 + 18], fill=BR_LIVE)
             for i, (a, b) in enumerate(playin):
                 px = pad + (i % 2) * (box_w + gap_x)
-                py = y0 + 30 + (i // 2) * 26
+                py = y0 + 34 + (i // 2) * 26
                 pair_text = f"{_clean_team(a)} vs {_clean_team(b)}"
                 if active_playin:
                     draw.ellipse([px, py + 7, px + 7, py + 14], fill=BR_LIVE)
@@ -2239,16 +2237,16 @@ def render_bracket_image(columns, title: str, subtitle: str = "",
                               _fit_text(draw, pair_text, f_slot, box_w + gap_x - 24),
                               font=f_slot, fill=BR_TEXT)
 
-        # матч за 3-4 места: обычная карточка с акцентной полосой
+        # матч за 3-4 места: полупрозрачная карточка с медной полосой
         if third_h:
-            y0 = bottom + 52
+            y0 = bottom + 68
             if playin:
-                y0 = bottom + playin_block + 40
+                y0 = bottom + playin_block + 52
             box3_w = min(width - pad * 2, box_w * 2 + gap_x)
-            draw.rounded_rectangle([pad, y0, pad + box3_w, y0 + 92],
-                                   radius=BR_RADIUS + 2,
-                                   fill=BR_SURFACE, outline=BR_LINE, width=1)
-            draw.rectangle([pad, y0 + 1, pad + 3, y0 + 91], fill=BR_COPPER)
+            cdraw.rounded_rectangle([pad, y0, pad + box3_w, y0 + 92],
+                                    radius=BR_RADIUS + 2,
+                                    fill=(*BR_SURFACE, 200), outline=(*BR_SILVER, 200), width=1)
+            cdraw.rectangle([pad, y0 + 1, pad + 3, y0 + 91], fill=BR_COPPER)
             draw.text((pad + 20, y0 + 14), "Матч за 3–4 места",
                       font=f_stage, fill=BR_COPPER)
             a = _clean_team(third.get("side_a") or "ждёт полуфинала")
@@ -2262,6 +2260,8 @@ def render_bracket_image(columns, title: str, subtitle: str = "",
                           _fit_text(draw, f"Победитель: {winner}", f_small, box3_w - 40),
                           font=f_small, fill=(158, 214, 178))
 
+        # накладываем слой карточек поверх фона
+        img = Image.alpha_composite(img.convert("RGBA"), cards).convert("RGB")
         buf = io.BytesIO()
         img.save(buf, format="PNG")
         return buf.getvalue()
