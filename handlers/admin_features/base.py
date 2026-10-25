@@ -4,6 +4,7 @@ import io
 import json
 import logging
 import math
+import os
 from datetime import datetime
 from aiogram import Router, F, Bot
 from aiogram.exceptions import TelegramBadRequest
@@ -1450,15 +1451,18 @@ def _round_title(total: int, round_no: int) -> str:
 # board    — тёмное арена-табло: графит, тонкие линии, только янтарный акцент
 # ledger   — клубный журнал: тёплый серо-зелёный, плотная вёрстка, малый радиус
 BR_THEME_LABELS = {
+    "sunset": "Закат",
     "protocol": "Протокол",
     "board": "Табло",
     "ledger": "Журнал",
 }
 BR_THEME_DESCRIPTIONS = {
+    "sunset": "закатное море и палуба, приглушённый фон под сеткой",
     "protocol": "светлый печатный бланк, серифные заголовки, острые углы",
     "board": "тёмное табло арены, линии без рамок, янтарный акцент",
     "ledger": "тёплый клубный журнал, плотные строки, малый радиус",
 }
+BR_THEME_ORDER = ("sunset", "protocol", "board", "ledger")
 BR_THEMES = {
     "protocol": {
         "bg": (243, 243, 239), "head": (233, 234, 228), "surface": (255, 255, 253),
@@ -1484,10 +1488,153 @@ BR_THEMES = {
         "live": (139, 62, 40), "live_fill": (246, 231, 224), "live_text": (94, 36, 22),
         "radius": 2, "title_family": "serif_bold", "name_family": "sans",
     },
+    # закатное море и палуба — настроение Brawl Stars, приглушённое ради читаемости
+    "sunset": {
+        "bg": (12, 20, 34), "head": (10, 16, 28), "surface": (26, 33, 46),
+        "line": (62, 80, 102), "text": (238, 243, 250), "muted": (156, 172, 192),
+        "dim": (112, 128, 148), "brass": (247, 201, 92), "silver": (203, 214, 226),
+        "copper": (232, 150, 92), "bronze": (172, 141, 108),
+        "live": (104, 222, 156), "live_fill": (20, 46, 36), "live_text": (176, 246, 206),
+        "radius": 6, "title_family": "serif_bold", "name_family": "sans",
+        "bg_style": "sunset",
+    },
 }
 
+# можно положить свою картинку на сервер — она станет фоном «sunset»
+_BRACKET_BG_FILES = (
+    "league/assets/tournament_bg.png", "league/assets/tournament_bg.jpg",
+    "assets/tournament_bg.png", "assets/tournament_bg.jpg",
+    "tournament_bg.png", "tournament_bg.jpg",
+)
+
+
+def _mix(a, b, t: float):
+    t = max(0.0, min(1.0, t))
+    return tuple(int(a[i] + (b[i] - a[i]) * t) for i in range(3))
+
+
+def _cover(img, width: int, height: int):
+    """Вписывает картинку по принципу cover и обрезает по центру."""
+    ratio = max(width / img.width, height / img.height)
+    size = (max(width, int(img.width * ratio) + 1), max(height, int(img.height * ratio) + 1))
+    img = img.resize(size, Image.LANCZOS)
+    left = (img.width - width) // 2
+    top = (img.height - height) // 2
+    return img.crop((left, top, left + width, top + height))
+
+
+def _custom_bracket_bg(width: int, height: int):
+    """Своя картинка фона, если положить её в assets/ на сервере."""
+    for path in _BRACKET_BG_FILES:
+        if not os.path.exists(path):
+            continue
+        try:
+            photo = _cover(Image.open(path).convert("RGB"), width, height)
+            return Image.blend(photo, Image.new("RGB", (width, height), (7, 11, 20)), 0.45)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"tournament bg load failed ({path}): {e}")
+    return None
+
+
+def _sunset_bracket_bg(width: int, height: int):
+    """Закатное море с палубой: рисуем в 2× и уменьшаем — без «лесенок».
+
+    Палитра и композиция намеренно тише референса: фон уходит под сетку,
+    а не спорит с ней.
+    """
+    ss = 2
+    w, h = width * ss, height * ss
+    img = Image.new("RGB", (w, h), (10, 18, 32))
+    d = ImageDraw.Draw(img)
+    horizon = int(h * 0.56)
+
+    top = (10, 20, 38)
+    mid = (18, 46, 74)
+    glow = (34, 96, 116)
+    for y in range(horizon):
+        t = y / max(1, horizon - 1)
+        color = _mix(top, mid, t / 0.6) if t < 0.6 else _mix(mid, glow, (t - 0.6) / 0.4)
+        d.line([(0, y), (w, y)], fill=color)
+
+    cx, cy, r = int(w * 0.44), int(horizon - int(h * 0.02)), int(min(w, h) * 0.15)
+    base = glow
+    for i in range(16, 0, -1):
+        rr = int(r * (1 + i * 0.22))
+        color = _mix(base, (255, 238, 176), 0.055 * (16 - i) / 16 + 0.03)
+        d.ellipse([cx - rr, cy - rr, cx + rr, cy + rr], fill=color)
+    d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=(255, 246, 198))
+    d.ellipse([cx - int(r * 0.55), cy - int(r * 0.55), cx + int(r * 0.55), cy + int(r * 0.55)],
+              fill=(255, 251, 222))
+
+    for y in range(horizon, h):
+        t = (y - horizon) / max(1, h - horizon)
+        d.line([(0, y), (w, y)], fill=_mix((16, 52, 66), (8, 22, 34), t))
+    d.line([(0, horizon), (w, horizon)], fill=(206, 226, 210), width=max(2, ss))
+
+    # блики на воде
+    for i in range(26):
+        y = horizon + int((i + 1) * (h - horizon) / 30)
+        half = int(r * (1.5 - i / 26) * 0.9)
+        if y >= h:
+            break
+        d.line([(cx - half, y), (cx + half, y)],
+               fill=_mix((16, 52, 66), (236, 236, 190), max(0.0, 0.5 - i * 0.02)),
+               width=max(2, ss + (1 if i % 3 == 0 else 0)))
+
+    # палуба: тёмный передний план, чтобы карточки читались
+    d.polygon([(0, int(h * 0.93)), (int(w * 0.5), int(h * 0.80)),
+               (w, int(h * 0.88)), (w, h), (0, h)], fill=(20, 18, 24))
+    d.line([(0, int(h * 0.93)), (int(w * 0.5), int(h * 0.80)), (w, int(h * 0.88))],
+           fill=(58, 46, 46), width=max(2, ss * 2))
+    for i in range(7):
+        x0 = int(w * 0.06 * i)
+        d.line([(x0, h), (int(w * 0.5) + x0, int(h * 0.82))],
+               fill=(30, 27, 33), width=max(1, ss))
+
+    # мачта и ванты слева
+    d.line([(int(w * 0.06), 0), (int(w * 0.10), int(h * 0.93))], fill=(16, 22, 30), width=max(4, ss * 5))
+    for i in range(5):
+        y = int(h * (0.05 + i * 0.16))
+        d.line([(int(w * 0.06), y), (int(w * 0.24), int(h * 0.93))],
+               fill=(30, 52, 62), width=max(1, ss))
+    # пузыри на небе, как в референсе
+    for i in range(14):
+        bx = int(w * (0.08 + (i % 7) * 0.13))
+        by = int(h * (0.05 + (i // 7) * 0.09))
+        br = int(min(w, h) * 0.03)
+        d.ellipse([bx - br, by - br, bx + br, by + br], outline=(46, 84, 116), width=ss)
+        d.ellipse([bx - br + ss * 3, by - br + ss * 3, bx + br - ss * 3, by + br - ss * 3],
+                  outline=(38, 70, 98), width=ss)
+
+    # штурвал справа на горизонте
+    wx, wy, wr = int(w * 0.90), horizon - int(h * 0.02), int(min(w, h) * 0.06)
+    d.ellipse([wx - wr, wy - wr, wx + wr, wy + wr], outline=(94, 62, 52), width=max(3, ss * 3))
+    d.ellipse([wx - int(wr * 0.35), wy - int(wr * 0.35), wx + int(wr * 0.35), wy + int(wr * 0.35)],
+              outline=(94, 62, 52), width=max(2, ss * 2))
+    for k in range(8):
+        angle = k * math.pi / 4
+        x1 = wx + int(math.cos(angle) * wr * 0.3)
+        y1 = wy + int(math.sin(angle) * wr * 0.3)
+        x2 = wx + int(math.cos(angle) * wr * 1.45)
+        y2 = wy + int(math.sin(angle) * wr * 1.45)
+        d.line([(x1, y1), (x2, y2)], fill=(94, 62, 52), width=max(2, ss * 2))
+
+    img = img.resize((width, height), Image.LANCZOS)
+    # «слегка темнее»: гасим фон, чтобы сетка оставалась главной
+    return Image.blend(img, Image.new("RGB", (width, height), (6, 10, 18)), 0.38)
+
+
+def _background_for_theme(width: int, height: int):
+    style = BR_THEMES.get(BRACKET_THEME, {}).get("bg_style")
+    if not style:
+        return None
+    custom = _custom_bracket_bg(width, height)
+    if custom is not None:
+        return custom
+    return _sunset_bracket_bg(width, height)
+
 # значения по умолчанию; переключаются командой /bracket_theme
-BRACKET_THEME = "protocol"
+BRACKET_THEME = "sunset"
 BR_BG = BR_THEMES[BRACKET_THEME]["bg"]
 BR_HEAD = BR_THEMES[BRACKET_THEME]["head"]
 BR_SURFACE = BR_THEMES[BRACKET_THEME]["surface"]
@@ -1553,14 +1700,15 @@ async def cmd_bracket_theme(message: Message):
         await message.answer("Оформление сетки меняет администрация.")
         return
     rows = []
-    for name in ("protocol", "board", "ledger"):
+    for name in BR_THEME_ORDER:
         mark = "выбрано: " if name == BRACKET_THEME else ""
         rows.append((
             f"{mark}{BR_THEME_LABELS[name]} — {BR_THEME_DESCRIPTIONS[name]}",
             f"btheme:{name}",
         ))
     await message.answer(
-        "Оформление сетки. Выбери направление — сразу пришлю превью на последнем турнире.",
+        "Оформление сетки. «Закат» — фон с морем и палубой (по умолчанию), "
+        "остальные три — спокойные типографичные. После выбора пришлю превью.",
         reply_markup=simple_list_keyboard(rows),
     )
 
@@ -1650,7 +1798,18 @@ def render_bracket_image(columns, title: str, subtitle: str = "",
                      + playin_block + third_block)
         width = max(980, pad * 2 + len(columns) * box_w + (len(columns) - 1) * gap_x)
 
-        img = Image.new("RGB", (width, height), BR_BG)
+        themed_bg = _background_for_theme(width, height)
+        if themed_bg is not None:
+            img = themed_bg
+            # затемняющие полосы под шапкой и призёрами — текст поверх рисунка читается
+            overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+            od = ImageDraw.Draw(overlay)
+            od.rectangle([0, 0, width, header_h], fill=(8, 12, 20, 190))
+            if placements:
+                od.rectangle([0, header_h, width, header_h + panel_h], fill=(8, 12, 20, 170))
+            img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
+        else:
+            img = Image.new("RGB", (width, height), BR_BG)
         draw = ImageDraw.Draw(img)
         f_title = _load_font(31, BR_TITLE_FAMILY)
         f_meta = _load_font(13, BR_TITLE_FAMILY)
@@ -1674,7 +1833,8 @@ def render_bracket_image(columns, title: str, subtitle: str = "",
                 else "матчей")
 
         # шапка: заголовок слева, справа — короткий статус строчными буквами
-        draw.rectangle([0, 0, width, header_h], fill=BR_HEAD)
+        if themed_bg is None:
+            draw.rectangle([0, 0, width, header_h], fill=BR_HEAD)
         draw.rectangle([pad, 30, pad + 3, 66], fill=BR_BRASS)
         draw.text((pad + 18, 26), _fit_text(draw, title, f_title, width - pad * 2 - 190),
                   font=f_title, fill=BR_TEXT)
@@ -1691,6 +1851,8 @@ def render_bracket_image(columns, title: str, subtitle: str = "",
         # призёры: место + название, разделены волосяными линиями
         if placements:
             y = header_h
+            if themed_bg is None:
+                draw.rectangle([0, y, width, y + panel_h], fill=BR_HEAD)
             rank_color = {1: BR_BRASS, 2: BR_SILVER, 3: BR_COPPER, 4: BR_BRONZE}
             cells = placements[:4]
             cell_w = (width - pad * 2) / max(1, len(cells))
@@ -4509,7 +4671,7 @@ async def cmd_show_system_commands_guide(message: Message):
         "• /SetupBotVigarikThreads — Авто-создание топиков логов в чате и привязка к БД.\n"
         "• /reload_config — Перезагрузка ролей и топиков из config.py на лету.\n"
         "• get_id — Напишите это слово в любом топике, чтобы узнать его точный ID чата.\n"
-        "• /bracket_theme — три варианта оформления сетки турнира (Протокол / Табло / Журнал).\n\n"
+        "• /bracket_theme — оформление сетки: Закат, Протокол, Табло, Журнал.\n\n"
         "🏆 Управление сезонами пуша Основы: \n"
         "• /start_season — Запуск нового сезона (техническая фиксация).\n"
         "• /check_season — Финиш сезона, опрос Brawl Stars API и вывод отчета по штрафникам.\n\n"
