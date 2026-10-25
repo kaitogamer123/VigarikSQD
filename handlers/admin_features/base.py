@@ -104,8 +104,18 @@ TOURNAMENT_MENU_TEXTS = frozenset({
     "🎯 Запустить определение цели", "❓ Кто не определился с пушем", "📊 Список кто что пушит",
     "⚙️ Настройка игроков", "📬 Прочитать предложки", "◀️ Назад в составы",
     "🏆 Турниры", "⚙️ Топики турниров", "⚔️ Текущие турниры",
-    "🏁 Мои матчи", "📬 Заявки на результаты", TOURNAMENT_TEST_BUTTON,
+    "🏁 Мои матчи", "📬 Заявки на результаты",
 })
+
+# ИСПРАВЛЕНО: валидные ответы мастера. Охранник FSM не должен перехватывать их
+# как «кнопку меню», иначе мастер отменяется на полуслове. Раньше из-за этого
+# «🧪 Тестовый турнир» попадал в TOURNAMENT_MENU_TEXTS и отменял создание турнира.
+TOURNAMENT_WIZARD_ANSWERS = (
+    TOURNAMENT_TYPE_BUTTONS
+    | {TOURNAMENT_TEST_BUTTON}
+    | set(TOURNAMENT_FORMAT_LABELS.values())
+    | {"♾ Без лимита команд", "🔢 Ввести число команд"}
+)
 
 # Кнопки, которые после отмены мастера можно сразу открыть повторно (они в этом же модуле)
 TOURNAMENT_REDIRECT_HANDLERS = {
@@ -193,6 +203,7 @@ async def tournament_create_start(message: Message, state: FSMContext):
 
 @router.message(
     StateFilter(TournamentStates),
+    ~F.text.in_(TOURNAMENT_WIZARD_ANSWERS),
     F.text.in_(TOURNAMENT_MENU_TEXTS) | F.text.startswith("/"),
 )
 async def tournament_state_guard(message: Message, state: FSMContext):
@@ -1594,11 +1605,8 @@ def _tournament_start_text(row, participants, matches) -> str:
 
 
 async def _post_tournament_start(bot: Bot, row, participants, matches) -> tuple[list[str], list[str]]:
-    """Финальный пост с сеткой и парами в топик «Турниры» каждого клана."""
+    """Финальный пост с сеткой и парами: кланам — в топик «Турниры», тесту — в админ-чат."""
     sent, failed = [], []
-    topics = await get_tournament_topics()
-    if not topics:
-        return sent, ["топики не настроены (⚙️ Топики турниров)"]
     png = render_bracket_image(
         [s if s else "BYE" for s in _build_bracket_slots(participants, row["t_type"])],
         f"Турнир #{row['id']} · {row['t_type']} · СТАРТ"
