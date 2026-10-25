@@ -489,6 +489,11 @@ class ResultStates(StatesGroup):
     waiting_winner = State()  # кто победил (кнопки)
 
 
+class BackgroundStates(StatesGroup):
+    """Загрузка картинки-фона для сетки турнира."""
+    waiting_image = State()
+
+
 _TOURNAMENT_TABLES_READY = False
 
 
@@ -1500,10 +1505,13 @@ BR_THEMES = {
     },
 }
 
-# можно положить свою картинку на сервер — она станет фоном «sunset»
+# своя картинка на сервер: её же сохраняет команда /bracket_bg при загрузке из Telegram
+BRACKET_BG_PATH = "assets/tournament_bg.png"
+BRACKET_BG_MAX_SIDE = 2560          # больше не нужно: Telegram всё равно сжимает превью
 _BRACKET_BG_FILES = (
+    BRACKET_BG_PATH,
     "league/assets/tournament_bg.png", "league/assets/tournament_bg.jpg",
-    "assets/tournament_bg.png", "assets/tournament_bg.jpg",
+    "assets/tournament_bg.jpg",
     "tournament_bg.png", "tournament_bg.jpg",
 )
 
@@ -1625,13 +1633,54 @@ def _sunset_bracket_bg(width: int, height: int):
 
 
 def _background_for_theme(width: int, height: int):
-    style = BR_THEMES.get(BRACKET_THEME, {}).get("bg_style")
-    if not style:
-        return None
+    # своя картинка приоритетнее любой схемы: если она есть — рисуем её
     custom = _custom_bracket_bg(width, height)
     if custom is not None:
         return custom
+    style = BR_THEMES.get(BRACKET_THEME, {}).get("bg_style")
+    if not style:
+        return None
     return _sunset_bracket_bg(width, height)
+
+
+def bracket_bg_exists() -> bool:
+    return any(os.path.exists(p) for p in _BRACKET_BG_FILES)
+
+
+def remove_bracket_bg() -> bool:
+    removed = False
+    for path in _BRACKET_BG_FILES:
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+                removed = True
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"remove bracket bg failed ({path}): {e}")
+    return removed
+
+
+def save_bracket_bg_from_bytes(raw: bytes) -> tuple[bool, str]:
+    """Принимает любую картинку, проверяет, приводит к PNG и кладёт в assets/."""
+    if not PIL_AVAILABLE:
+        return False, "Pillow не установлен на сервере (pip install Pillow)"
+    try:
+        photo = Image.open(io.BytesIO(raw)).convert("RGB")
+    except Exception as e:  # noqa: BLE001
+        return False, f"не удалось прочитать изображение: {e}"
+    if photo.width < 640 or photo.height < 360:
+        return False, f"слишком маленькая картинка ({photo.width}×{photo.height}), нужно от 640×360"
+    if max(photo.size) > BRACKET_BG_MAX_SIDE:
+        ratio = BRACKET_BG_MAX_SIDE / max(photo.size)
+        photo = photo.resize((max(1, int(photo.width * ratio)),
+                              max(1, int(photo.height * ratio))), Image.LANCZOS)
+    try:
+        folder = os.path.dirname(BRACKET_BG_PATH)
+        if folder:
+            os.makedirs(folder, exist_ok=True)
+        photo.save(BRACKET_BG_PATH, format="PNG", optimize=True)
+    except Exception as e:  # noqa: BLE001
+        return False, f"не удалось сохранить файл: {e}"
+    return True, f"{photo.width}×{photo.height}"
 
 # значения по умолчанию; переключаются командой /bracket_theme
 BRACKET_THEME = "sunset"
@@ -1706,9 +1755,11 @@ async def cmd_bracket_theme(message: Message):
             f"{mark}{BR_THEME_LABELS[name]} — {BR_THEME_DESCRIPTIONS[name]}",
             f"btheme:{name}",
         ))
+    bg_note = ("сейчас стоит твоя картинка" if bracket_bg_exists() else "сейчас нарисованный закат")
     await message.answer(
         "Оформление сетки. «Закат» — фон с морем и палубой (по умолчанию), "
-        "остальные три — спокойные типографичные. После выбора пришлю превью.",
+        "остальные три — спокойные типографичные. После выбора пришлю превью.\n"
+        f"Свой фон: /bracket_bg (сейчас {bg_note}).",
         reply_markup=simple_list_keyboard(rows),
     )
 
@@ -1739,6 +1790,136 @@ async def cb_bracket_theme(call: CallbackQuery):
         )
     else:
         await call.message.answer(text + "\nПревью появится после первого турнира.")
+
+
+async def _download_bracket_bg(url: str) -> bytes:
+    """Скачивает картинку по ссылке с сервера (Reddit и т.п. отдают только с UA)."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+        "Accept": "image/avif,image/webp,image/png,image/jpeg,*/*",
+    }
+    try:
+        import aiohttp
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+            async with session.get(url, allow_redirects=True) as resp:
+                if resp.status != 200:
+                    raise RuntimeError(f"HTTP {resp.status}")
+                return await resp.read()
+    except ImportError:
+        import urllib.request
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=30) as resp:  # noqa: S310
+            return resp.read()
+
+
+@router.message(F.text.startswith("/bracket_bg"))
+async def cmd_bracket_bg(message: Message, state: FSMContext):
+    """Свой фон сетки: пришли картинку или ссылку на неё — бот сохранит её и поставит на сетку."""
+    member = await get_member(message.from_user.id)
+    if not member or not is_any_admin(member):
+        await message.answer("Фон сетки меняет администрация.")
+        return
+    raw_text = (message.text or "")
+    text = raw_text.lower()
+    if "reset" in text or "сброс" in text:
+        removed = remove_bracket_bg()
+        await message.answer(
+            "Фон сброшен. Сетка вернётся к нарисованному закату." if removed
+            else "Своего фона и так нет — стоит нарисованный закат."
+        )
+        return
+    # ссылка прямо в команде: /bracket_bg https://...
+    link = next((part for part in raw_text.split() if part.startswith(("http://", "https://"))), None)
+    if link:
+        status = await message.answer("Скачиваю картинку по ссылке…")
+        try:
+            raw = await _download_bracket_bg(link)
+        except Exception as e:  # noqa: BLE001
+            await status.edit_text(
+                f"Не смог скачать картинку: {e}\n\n"
+                "Пришли её файлом (скрепка → документ) — так надёжнее."
+            )
+            return
+        ok, info = save_bracket_bg_from_bytes(raw)
+        if not ok:
+            await status.edit_text(f"Не принял картинку: {info}")
+            return
+        await save_bracket_theme("sunset")
+        await status.edit_text(f"Готово: фон {info} сохранён, тема «Закат». Превью ниже.")
+        rows = get_tournaments(limit=1)
+        png = _render_for_row(rows[0]) if rows else None
+        if png:
+            await message.answer_photo(BufferedInputFile(png, filename="bracket_custom.png"))
+        return
+    current = ("твоя картинка " + BRACKET_BG_PATH) if bracket_bg_exists() else "нарисованный закат"
+    await state.set_state(BackgroundStates.waiting_image)
+    await message.answer(
+        "Пришли картинку для фона сетки: файлом (скрепка → документ — лучшее качество), "
+        "фото или ссылкой вида <code>/bracket_bg https://…</code>.\n\n"
+        "Telegram не сжимает документы, поэтому файл предпочтительнее фото.\n"
+        f"Сейчас стоит: {hd.quote(current)}.\n\n"
+        "Сбросить обратно на закат: /bracket_bg reset\n"
+        "Отмена: /cancel",
+        parse_mode="HTML",
+        reply_markup=result_cancel_keyboard(),
+    )
+
+
+@router.message(BackgroundStates.waiting_image, F.text.startswith("/"))
+@router.message(BackgroundStates.waiting_image, F.text == "❌ Отмена")
+async def cmd_bracket_bg_cancel(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Загрузка фона отменена.")
+
+
+async def _telegram_file_bytes(bot: Bot, file_id: str) -> bytes:
+    buf = io.BytesIO()
+    try:
+        await bot.download(file_id, destination=buf)
+    except Exception:
+        info = await bot.get_file(file_id)
+        await bot.download_file(info.file_path, destination=buf)
+    return buf.getvalue()
+
+
+@router.message(BackgroundStates.waiting_image, F.photo | F.document)
+async def cmd_bracket_bg_saved(message: Message, state: FSMContext, bot: Bot):
+    file_id = None
+    if message.photo:
+        file_id = message.photo[-1].file_id
+    elif message.document and (message.document.mime_type or "").startswith("image/"):
+        file_id = message.document.file_id
+    if not file_id:
+        await message.answer("Нужна картинка: PNG или JPG.")
+        return
+    status = await message.answer("Сохраняю фон…")
+    try:
+        raw = await _telegram_file_bytes(bot, file_id)
+    except Exception as e:  # noqa: BLE001
+        await status.edit_text(f"Не смог получить файл от Telegram: {e}")
+        return
+    ok, info = save_bracket_bg_from_bytes(raw)
+    if not ok:
+        await status.edit_text(f"Не принял картинку: {info}")
+        return
+    await state.clear()
+    await save_bracket_theme("sunset")
+    await log_admin_action(
+        bot=bot, admin_id=message.from_user.id,
+        admin_name=message.from_user.username or message.from_user.first_name or "admin",
+        action_text=f"🖼 Обновил фон сетки турнира ({info}).",
+    )
+    await status.edit_text(
+        f"Готово: фон {info} сохранён, тема переключена на «Закат».\n"
+        "Превью — ниже. Для опубликованных постов сетка обновится после следующего результата "
+        "или нажатия «🖼 Сетка»."
+    )
+    rows = get_tournaments(limit=1)
+    png = _render_for_row(rows[0]) if rows else None
+    if png:
+        await message.answer_photo(BufferedInputFile(png, filename="bracket_custom.png"))
 
 
 def render_bracket_image(columns, title: str, subtitle: str = "",
@@ -4671,7 +4852,9 @@ async def cmd_show_system_commands_guide(message: Message):
         "• /SetupBotVigarikThreads — Авто-создание топиков логов в чате и привязка к БД.\n"
         "• /reload_config — Перезагрузка ролей и топиков из config.py на лету.\n"
         "• get_id — Напишите это слово в любом топике, чтобы узнать его точный ID чата.\n"
-        "• /bracket_theme — оформление сетки: Закат, Протокол, Табло, Журнал.\n\n"
+        "• /bracket_theme — оформление сетки: Закат, Протокол, Табло, Журнал.\n"
+        "• /bracket_bg — прислать картинку (файлом/фото) или ссылку: "
+        "/bracket_bg https://… ; /bracket_bg reset — вернуть закат.\n\n"
         "🏆 Управление сезонами пуша Основы: \n"
         "• /start_season — Запуск нового сезона (техническая фиксация).\n"
         "• /check_season — Финиш сезона, опрос Brawl Stars API и вывод отчета по штрафникам.\n\n"
