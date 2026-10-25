@@ -2494,6 +2494,30 @@ def _bracket_columns_for(row, participants=None):
                 col.append(_stage_label(row, r))
         columns.append(col)
 
+    # подставляем реальных победителей play-in вместо «Победитель пары N»
+    if playin and columns:
+        playin_matches = {m["pair_index"]: m for m in get_tournament_matches(row["id"], 1)}
+        resolved_first = []
+        for slot in columns[0]:
+            text = str(slot)
+            winner = None
+            if text.startswith("Победитель пары"):
+                try:
+                    pair_no = int(text.rsplit(" ", 1)[-1]) - 1
+                except ValueError:
+                    pair_no = None
+                if pair_no is not None:
+                    winner = (playin_matches.get(pair_no) or {}).get("winner")
+            resolved_first.append(winner or slot)
+        columns[0] = resolved_first
+        # нижний блок нужен только пока в предвариловке есть незакрытые пары
+        pending_playin = any(
+            not m.get("winner") and m.get("status") not in ("bye", "solo")
+            for m in playin_matches.values()
+        )
+        if playin_matches and not pending_playin:
+            playin = []
+
     third_match = get_third_place_match(row["id"])
     # матч за 3-4 места существует только после обоих полуфиналов
     if third_match and not (third_match["side_a"] and third_match["side_b"]) \
@@ -2507,7 +2531,9 @@ def _active_column(row, playin) -> int | None:
 
     Возвращает None, когда идёт предварительный раунд: он рисуется отдельным блоком.
     """
-    has_playin = bool(playin)
+    # важно: play-in может быть уже скрыт из нижнего блока, но раунды всё ещё
+    # смещены на один — поэтому смотрим на форму турнира, а не на список пар
+    has_playin = _tournament_shape(row)[1]
     total = _final_round(row)     # включает play-in
     for r in range(1, total + 1):
         matches = get_tournament_matches(row["id"], r)
@@ -2540,8 +2566,9 @@ def _render_for_row(row, title_suffix: str = "", participants=None) -> bytes | N
         labels = ["Участники ShowDown"]
     else:
         # первая колонка = сетка, дальше по раундам.
-        # при предвариловке основная сетка начинается со 2-го раунда (round=2)
-        offset = 1 if playin else 0
+        # при предвариловке основная сетка начинается со 2-го раунда (round=2),
+        # даже если сам блок play-in уже убран с картинки
+        offset = 1 if _tournament_shape(row)[1] else 0
         labels = ["Участники"] + [
             _stage_label(row, r + offset) for r in range(1, len(columns))
         ]
