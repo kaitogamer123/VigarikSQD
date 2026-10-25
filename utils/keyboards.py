@@ -118,8 +118,9 @@ def tournament_current_list_keyboard(rows: list[dict]) -> InlineKeyboardMarkup:
     """Список активных турниров для раздела «⚔️ Текущие турниры» (Этап 4)."""
     builder = InlineKeyboardBuilder()
     for row in rows:
+        # дата турнира вместо номера — так админу проще узнать турнир
         builder.button(
-            text=f"#{row['id']} · {row['t_type']} · {row['scheduled_text'] or '—'}",
+            text=f"{row['scheduled_text'] or 'дата не задана'} · {row['t_type']}",
             callback_data=f"tour_cur:open:{row['id']}",
         )
     builder.button(text="🔄 Обновить", callback_data="tour_cur:list")
@@ -306,8 +307,11 @@ def tournaments_list_keyboard(rows: list[dict]) -> InlineKeyboardMarkup:
     """Список турниров для раздела «🏆 Турниры»."""
     builder = InlineKeyboardBuilder()
     for row in rows:
+        status = row["status"]
+        status = {"registration": "набор", "announced": "анонс", "running": "идёт",
+                  "finished": "завершён", "cancelled": "отменён"}.get(status, status)
         builder.button(
-            text=f"#{row['id']} · {row['t_type']} · {row['scheduled_text'] or '—'} · {row['status']}",
+            text=f"{row['scheduled_text'] or 'дата не задана'} · {row['t_type']} · {status}",
             callback_data=f"tour:open:{row['id']}",
         )
     builder.button(text="🔄 Обновить", callback_data="tour:list:refresh")

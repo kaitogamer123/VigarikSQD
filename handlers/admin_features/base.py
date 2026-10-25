@@ -431,16 +431,17 @@ async def tournament_confirm(call: CallbackQuery, state: FSMContext, bot: Bot):
             if is_test else
             "Дальше можно опубликовать анонс: посты в клановых топиках «Турниры» "
             "и рассылка зарегистрированным игрокам в ЛС.")
+    title = _tournament_title({"id": tournament_id, "scheduled_text": when})
     try:
         await call.message.edit_text(
             f"{summary}\n\n"
-            f"✅ <b>Турнир #{tournament_id} сохранён в базе.</b>\n{hint}",
+            f"✅ <b>{hd.quote(title)} сохранён в базе.</b>\n{hint}",
             parse_mode="HTML",
             reply_markup=after_kb,
         )
     except Exception:
         await call.message.answer(
-            f"✅ Турнир #{tournament_id} сохранён в базе.\n{hint}",
+            f"✅ {hd.quote(title)} сохранён в базе.\n{hint}",
             parse_mode="HTML",
             reply_markup=after_kb,
         )
@@ -2511,7 +2512,7 @@ def _render_for_row(row, title_suffix: str = "", participants=None) -> bytes | N
             active_playin = False
     return render_bracket_image(
         columns,
-        f"Турнир #{row['id']} · {row['t_type']}{suffix}{test_mark}",
+        f"{_tournament_title(row)} · {row['t_type']}{suffix}{test_mark}",
         "",  # серая строка-подпись убрана по просьбе
         third=third,
         solo=(row["t_type"] == TOURNAMENT_SHOWDOWN),
@@ -2524,6 +2525,27 @@ def _render_for_row(row, title_suffix: str = "", participants=None) -> bytes | N
 
 
 # ─── Тексты анонса ───────────────────────────────────────────────────────────
+
+def _tournament_date(row) -> str:
+    """Дата турнира для заголовков: «25.12.2026 19:00»."""
+    raw = str(_row_val(row, "scheduled_text", "") or "").strip()
+    if raw and raw != "—":
+        return raw
+    iso = str(_row_val(row, "scheduled_at", "") or "").strip()
+    try:
+        return datetime.strptime(iso[:16], "%Y-%m-%d %H:%M").strftime("%d.%m.%Y %H:%M")
+    except Exception:
+        return ""
+
+
+def _tournament_title(row, prefix: str = "Турнир") -> str:
+    """Название турнира = дата; номер показываем только если даты нет."""
+    date = _tournament_date(row)
+    if date:
+        return f"{prefix} {date}"
+    tid = _row_val(row, "id", "")
+    return f"{prefix} #{tid}" if tid else prefix
+
 
 def _limit_text(row) -> str:
     if row["t_type"] == TOURNAMENT_SHOWDOWN:
@@ -2552,7 +2574,7 @@ def _announcement_text(row, participants, for_clan_post: bool = True) -> str:
     fmt = TOURNAMENT_FORMAT_LABELS.get(row["t_format"], "—") if row["t_format"] else "—"
     status = TOURNAMENT_STATUS_LABEL.get(row["status"], row["status"])
     lines = [
-        "🏆 <b>ТУРНИР VI GARIK SQUAD</b>",
+        f"🏆 <b>{hd.quote(_tournament_title(row, prefix='ТУРНИР').upper())}</b>",
         "",
         f"• Тип скрима: <b>{hd.quote(str(typ))}</b>",
         f"• Формат: <b>{hd.quote(str(fmt))}</b>" if row["t_format"] else "• Формат: <b>—</b>",
@@ -2590,8 +2612,7 @@ def _announcement_caption(row) -> str:
     """Короткая подпись к картинке (лимит Telegram — 1024 символа)."""
     typ = TOURNAMENT_TYPE_LABELS.get(row["t_type"], row["t_type"])
     return (
-        f"🏆 <b>Турнир #{row['id']} — {hd.quote(str(typ))}</b>\n"
-        f"🕐 {hd.quote(str(row['scheduled_text'] or '—'))}\n"
+        f"🏆 <b>{hd.quote(_tournament_title(row))} — {hd.quote(str(typ))}</b>\n"
         f"👥 Лимит: {_limit_text(row)}"
     )
 
@@ -2692,8 +2713,8 @@ async def _dm_registered_players(bot: Bot, row) -> dict:
             try:
                 await bot.send_message(
                     int(leader_id),
-                    "🧪 <b>ТЕСТ</b> · Открыта регистрация на турнир #"
-                    f"{row['id']}\n"
+                    "🧪 <b>ТЕСТ</b> · Открыта регистрация — "
+                    f"{hd.quote(_tournament_title(row))}\n"
                     f"• Тип: {hd.quote(TOURNAMENT_TYPE_LABELS.get(row['t_type'], row['t_type']))}\n"
                     f"• Лимит: {_limit_text(row)}\n"
                     f"• Начало: {hd.quote(str(row['scheduled_text'] or '—'))}\n\n"
@@ -2734,14 +2755,13 @@ async def _dm_registered_players(bot: Bot, row) -> dict:
                 stats["with_team"] += 1
                 if int(composition["id"]) in already_ids:
                     text = (
-                        f"🏆 <b>Турнир #{row['id']}</b> — твой состав "
+                        f"🏆 <b>{hd.quote(_tournament_title(row))}</b> — твой состав "
                         f"{hd.quote(composition['name'])} [{hd.quote(composition['tag'])}] "
-                        f"уже зарегистрирован.\n"
-                        f"🕐 {hd.quote(str(row['scheduled_text'] or '—'))}"
+                        f"уже зарегистрирован."
                     )
                 else:
                     text = (
-                        f"🏆 <b>Открыта регистрация на турнир #{row['id']}</b>\n\n"
+                        f"🏆 <b>Открыта регистрация — {hd.quote(_tournament_title(row))}</b>\n\n"
                         f"• Тип: {hd.quote(TOURNAMENT_TYPE_LABELS.get(row['t_type'], row['t_type']))}\n"
                         f"• Формат: {hd.quote(TOURNAMENT_FORMAT_LABELS.get(row['t_format'], '—'))}\n"
                         f"• Лимит: {_limit_text(row)}\n"
@@ -2914,7 +2934,7 @@ async def _dm_new_pairs(bot: Bot, row, pairs, stage: str) -> int:
                     f"⚔️ <b>{hd.quote(stage)}</b> · у вас скрим {hd.quote(fmt)} против команды "
                     f"{hd.quote(str(opp['team_name']))}, спишитесь с их лидером: "
                     f"<b>{hd.quote(mention)}</b>.\n"
-                    f"• Турнир #{row['id']}",
+                    f"• {hd.quote(_tournament_title(row))}",
                     parse_mode="HTML",
                 )
                 sent += 1
@@ -2932,7 +2952,7 @@ async def _announce_round_start(bot: Bot, row, round_no: int, matches) -> None:
         return
     stage = _stage_label(row, round_no)
     text = (
-        f"🚨 <b>Старт: {hd.quote(stage)}</b> · турнир #{row['id']}\n\n"
+        f"🚨 <b>Старт: {hd.quote(stage)}</b> · {hd.quote(_tournament_title(row))}\n\n"
         + "\n".join(f"• {hd.quote(a)} 🆚 {hd.quote(b)}" for a, b in pairs)
         + "\n\nСдайте результат через «🏁 Мои матчи» или его внесёт администрация."
     )
@@ -3010,9 +3030,8 @@ def _tournament_start_text(row, participants, matches) -> str:
     lines = [
         "🚨 <b>ТУРНИР НАЧАЛСЯ!</b>",
         "",
-        f"• Турнир: <b>#{row['id']} — {hd.quote(str(typ))}</b>",
+        f"• Турнир: <b>{hd.quote(_tournament_title(row))} — {hd.quote(str(typ))}</b>",
         f"• Формат: <b>{hd.quote(str(fmt))}</b>",
-        f"• Время: <b>{hd.quote(str(row['scheduled_text'] or '—'))}</b>",
         f"• Участников: <b>{_fmt_num(len(participants))}</b>",
         "",
         "🗺 <b>Расписание пар (1-й круг)</b>",
@@ -3090,12 +3109,15 @@ async def start_tournament(bot: Bot, row) -> str:
     if not fresh:
         return f"⛔ Турнир #{tid} не найден."
     row = fresh
+    title = _tournament_title(row)
     if row["status"] in ("running", "finished", "cancelled"):
-        return f"ℹ️ Турнир #{tid} уже {TOURNAMENT_STATUS_LABEL.get(row['status'], row['status'])} — повторный старт не нужен."
+        return (f"ℹ️ {title} уже "
+                f"{TOURNAMENT_STATUS_LABEL.get(row['status'], row['status'])} — "
+                "повторный старт не нужен.")
     participants = get_tournament_participants(tid)
     if not participants:
         set_tournament_status(tid, "cancelled")
-        return f"⛔ Турнир #{tid} отменён: никто не зарегистрировался."
+        return f"⛔ {title} отменён: никто не зарегистрировался."
 
     if row["t_type"] == TOURNAMENT_SHOWDOWN and len(participants) > TOURNAMENT_SHOWDOWN_LIMIT:
         participants = participants[:TOURNAMENT_SHOWDOWN_LIMIT]
@@ -3156,10 +3178,9 @@ async def start_tournament(bot: Bot, row) -> str:
             try:
                 await bot.send_message(
                     int(p["leader_id"]),
-                    f"🚨 <b>ShowDown турнир #{tid} начался!</b>\n"
+                    f"🚨 <b>ShowDown · {hd.quote(_tournament_title(row))}</b>\n"
                     f"• Твой слот: <b>{_fmt_num(i)}</b> из {_fmt_num(len(participants))}\n"
-                    f"• Состав: {hd.quote(p['team_name'] or '—')}\n"
-                    f"• Время: {hd.quote(str(row['scheduled_text'] or '—'))}\n\n"
+                    f"• Состав: {hd.quote(p['team_name'] or '—')}\n\n"
                     f"Удачи! Скриншоты результата отправляй администрации.",
                     parse_mode="HTML",
                 )
@@ -3175,7 +3196,7 @@ async def start_tournament(bot: Bot, row) -> str:
                     if p and p["leader_id"]:
                         await bot.send_message(
                             int(p["leader_id"]),
-                            f"⚔️ <b>Турнир #{tid}: у вас автопроход (BYE)</b> в 1-м круге.\n"
+                            f"⚔️ <b>{hd.quote(_tournament_title(row))}: у вас автопроход (BYE)</b>\n"
                             f"Состав {hd.quote(p['team_name'] or '—')} сразу проходит дальше — "
                             f"ждите соперника в следующем круге.",
                             parse_mode="HTML",
@@ -3195,7 +3216,7 @@ async def start_tournament(bot: Bot, row) -> str:
                     f"⚔️ У вас скрим {hd.quote(fmt)} против команды "
                     f"{hd.quote(str(b['team_name'] or '—'))}, спишитесь с их лидером: "
                     f"<b>{hd.quote(opp_b)}</b>.\n"
-                    f"• Турнир #{tid} · {hd.quote(str(row['scheduled_text'] or '—'))}\n"
+                    f"• {hd.quote(_tournament_title(row))}\n"
                     f"• Тип: {hd.quote(TOURNAMENT_TYPE_LABELS.get(row['t_type'], row['t_type']))}",
                     parse_mode="HTML",
                 )
@@ -3210,7 +3231,7 @@ async def start_tournament(bot: Bot, row) -> str:
                     f"⚔️ У вас скрим {hd.quote(fmt)} против команды "
                     f"{hd.quote(str(a['team_name'] or '—'))}, спишитесь с их лидером: "
                     f"<b>{hd.quote(opp_a)}</b>.\n"
-                    f"• Турнир #{tid} · {hd.quote(str(row['scheduled_text'] or '—'))}\n"
+                    f"• {hd.quote(_tournament_title(row))}\n"
                     f"• Тип: {hd.quote(TOURNAMENT_TYPE_LABELS.get(row['t_type'], row['t_type']))}",
                     parse_mode="HTML",
                 )
@@ -3220,7 +3241,7 @@ async def start_tournament(bot: Bot, row) -> str:
             await asyncio.sleep(TOURNAMENT_DM_PAUSE)
 
     report = (
-        f"🚀 <b>Турнир #{tid} запущен</b>\n"
+        f"🚀 <b>{hd.quote(_tournament_title(row))} запущен</b>\n"
         f"• участников: {_fmt_num(len(participants))}\n"
         f"• пар 1-го круга: {_fmt_num(len(matches))}\n"
         f"• посты в топиках: ✅ {len(topics_sent)} / ❌ {len(topics_failed)}\n"
@@ -3315,8 +3336,8 @@ async def admin_open_current_tournaments(message: Message):
         when = r["scheduled_text"] or "—"
         soon = " ⏰" if r["scheduled_at"] and r["scheduled_at"] <= datetime.now().strftime("%Y-%m-%d %H:%M") else ""
         lines.append(
-            f"{'🧪 ' if is_test_tournament(r) else ''}#{r['id']} · {hd.quote(str(r['t_type']))} · "
-            f"{hd.quote(str(when))}{soon} · "
+            f"{'🧪 ' if is_test_tournament(r) else ''}{hd.quote(_tournament_title(r))} · "
+            f"{hd.quote(str(r['t_type']))}{soon} · "
             f"{hd.quote(TOURNAMENT_STATUS_LABEL.get(r['status'], r['status']))} · "
             f"👥 {_fmt_num(len(get_tournament_participants(r['id'])))}"
         )
@@ -3342,8 +3363,7 @@ async def admin_current_tournaments_refresh(call: CallbackQuery):
     lines = ["⚔️ <b>Текущие турниры</b>", ""]
     for r in rows:
         lines.append(
-            f"#{r['id']} · {hd.quote(str(r['t_type']))} · "
-            f"{hd.quote(str(r['scheduled_text'] or '—'))} · "
+            f"{hd.quote(_tournament_title(r))} · {hd.quote(str(r['t_type']))} · "
             f"{hd.quote(TOURNAMENT_STATUS_LABEL.get(r['status'], r['status']))} · "
             f"👥 {_fmt_num(len(get_tournament_participants(r['id'])))}"
         )
@@ -3368,7 +3388,7 @@ async def admin_current_tournament_card(call: CallbackQuery):
         auto = "\n⏰ Автозапуск по расписанию включён."
     winners = placements_text(row["id"])
     text = (
-        f"⚔️ <b>Текущий турнир #{row['id']}</b>\n"
+        f"⚔️ <b>{hd.quote(_tournament_title(row))}</b>\n"
         f"• Тип: {hd.quote(TOURNAMENT_TYPE_LABELS.get(row['t_type'], row['t_type']))}\n"
         f"• Формат: {hd.quote(TOURNAMENT_FORMAT_LABELS.get(row['t_format'], '—'))}\n"
         f"• Лимит: {_limit_text(row)}\n"
@@ -3652,9 +3672,8 @@ def _clan_key_by_chat(chat_id: int) -> str | None:
 def _bracket_status_caption(row) -> str:
     typ = TOURNAMENT_TYPE_LABELS.get(row["t_type"], row["t_type"])
     lines = [
-        f"🗺 <b>Актуальная сетка — турнир #{row['id']} ({hd.quote(str(typ))})</b>",
-        f"🕐 {hd.quote(str(row['scheduled_text'] or '—'))} · "
-        f"{hd.quote(TOURNAMENT_STATUS_LABEL.get(row['status'], row['status']))}",
+        f"🗺 <b>Сетка — {hd.quote(_tournament_title(row))} ({hd.quote(str(typ))})</b>",
+        f"Статус: {hd.quote(TOURNAMENT_STATUS_LABEL.get(row['status'], row['status']))}",
     ]
     matches = get_tournament_matches(row["id"], 1)
     third = get_third_place_match(row["id"])
@@ -3730,7 +3749,7 @@ async def admin_results_list(call: CallbackQuery):
             rows.append((f"⏳ {label}", f"tour_cur:open:{tid}"))
     rows.append(("◀️ К турниру", f"tour_cur:open:{tid}"))
     await call.message.edit_text(
-        f"✍️ <b>Внести победителей · турнир #{tid}</b>\n\n"
+        f"✍️ <b>Внести победителей · {hd.quote(_tournament_title(row))}</b>\n\n"
         "Выбери матч, затем укажи победителя. Когда все матчи круга будут закрыты, "
         "следующий круг стартует автоматически.",
         parse_mode="HTML",
@@ -3830,7 +3849,7 @@ async def admin_result_win(call: CallbackQuery, bot: Bot):
                 f"{'✅' if p['team_name'] == winner else '❌'} <b>Результат внесён администрацией</b>\n"
                 f"• {hd.quote(str(p['team_name']))}: "
                 f"{'победа, проходите дальше' if p['team_name'] == winner else 'поражение'}\n"
-                f"• Турнир #{m['tournament_id']}",
+                f"• {hd.quote(_tournament_title(row))}",
                 parse_mode="HTML",
             )
         except Exception:
@@ -3873,8 +3892,7 @@ async def admin_open_tournaments_list(message: Message):
     for r in rows:
         mark = "🧪 " if is_test_tournament(r) else ""
         lines.append(
-            f"{mark}#{r['id']} · {hd.quote(str(r['t_type']))} · "
-            f"{hd.quote(str(r['scheduled_text'] or '—'))} · "
+            f"{mark}{hd.quote(_tournament_title(r))} · {hd.quote(str(r['t_type']))} · "
             f"{hd.quote(TOURNAMENT_STATUS_LABEL.get(r['status'], r['status']))} · "
             f"👥 {len(get_tournament_participants(r['id']))}"
         )
@@ -3899,8 +3917,7 @@ async def admin_tournaments_refresh(call: CallbackQuery):
     lines = ["🏆 <b>Последние турниры</b>", ""]
     for r in rows:
         lines.append(
-            f"#{r['id']} · {hd.quote(str(r['t_type']))} · "
-            f"{hd.quote(str(r['scheduled_text'] or '—'))} · "
+            f"{hd.quote(_tournament_title(r))} · {hd.quote(str(r['t_type']))} · "
             f"{hd.quote(TOURNAMENT_STATUS_LABEL.get(r['status'], r['status']))} · "
             f"👥 {len(get_tournament_participants(r['id']))}"
         )
@@ -3920,7 +3937,7 @@ async def admin_tournament_open(call: CallbackQuery):
         return
     participants = get_tournament_participants(row["id"])
     text = (
-        f"{'🧪 ' if is_test_tournament(row) else ''}<b>Турнир #{row['id']}</b>\n"
+        f"{'🧪 ' if is_test_tournament(row) else ''}<b>{hd.quote(_tournament_title(row))}</b>\n"
         f"• Тип: {hd.quote(TOURNAMENT_TYPE_LABELS.get(row['t_type'], row['t_type']))}\n"
         f"• Формат: {hd.quote(TOURNAMENT_FORMAT_LABELS.get(row['t_format'], '—'))}\n"
         f"• Лимит: {_limit_text(row)}\n"
@@ -3974,7 +3991,7 @@ async def admin_tournament_test_tools(call: CallbackQuery, bot: Bot):
     matches = get_tournament_matches(tid, 1)
     third = get_third_place_match(tid)
     text = (
-        f"🧪 <b>Тестовый турнир #{tid}</b>\n"
+        f"🧪 <b>Тестовый · {hd.quote(_tournament_title(row))}</b>\n"
         f"• Тип: {hd.quote(TOURNAMENT_TYPE_LABELS.get(row['t_type'], row['t_type']))} · "
         f"{hd.quote(TOURNAMENT_FORMAT_LABELS.get(row['t_format'], '—'))}\n"
         f"• Лимит: {_limit_text(row)}\n"
@@ -4122,12 +4139,13 @@ async def admin_tournament_cancel_yes(call: CallbackQuery, bot: Bot):
         await call.answer("Турнир не найден", show_alert=True)
         return
     set_tournament_status(tournament_id, "cancelled")
+    cancel_title = hd.quote(_tournament_title(row))
     for p in get_tournament_participants(tournament_id):
         if p["leader_id"]:
             try:
                 await bot.send_message(
                     int(p["leader_id"]),
-                    f"🚫 Турнир #{tournament_id} отменён администрацией. "
+                    f"🚫 {cancel_title} отменён администрацией. "
                     f"Состав {hd.quote(p['team_name'] or '')} снят с участия.",
                     parse_mode="HTML",
                 )
@@ -4139,7 +4157,7 @@ async def admin_tournament_cancel_yes(call: CallbackQuery, bot: Bot):
         admin_name=call.from_user.username or call.from_user.full_name or "admin",
         action_text=f"🚫 Отменил турнир #{tournament_id}.",
     )
-    await call.message.edit_text(f"🚫 Турнир #{tournament_id} отменён.", reply_markup=None)
+    await call.message.edit_text(f"🚫 {cancel_title} отменён.", parse_mode="HTML", reply_markup=None)
     await call.answer("Турнир отменён")
 
 
@@ -4160,7 +4178,7 @@ async def admin_tournament_delete_ask(call: CallbackQuery):
     reports = count_tournament_reports(tid)
     posts = get_bracket_posts(tid)
     await call.message.edit_text(
-        f"🗑 <b>Удалить турнир #{tid}?</b>\n\n"
+        f"🗑 <b>Удалить {hd.quote(_tournament_title(row))}?</b>\n\n"
         f"• Тип: {hd.quote(str(row['t_type']))} · статус: "
         f"{hd.quote(TOURNAMENT_STATUS_LABEL.get(row['status'], row['status']))}\n"
         f"• Составов: {_fmt_num(len(participants))} · матчей: {_fmt_num(len(matches))}\n"
@@ -4230,6 +4248,7 @@ async def admin_tournament_delete_yes(call: CallbackQuery, bot: Bot):
         return
 
     # предупреждаем лидеров (уникальные id, без повторов)
+    delete_title = _tournament_title(row)
     notified: set[int] = set()
     for p in participants:
         leader_id = int(p["leader_id"] or 0)
@@ -4239,8 +4258,9 @@ async def admin_tournament_delete_yes(call: CallbackQuery, bot: Bot):
         try:
             await bot.send_message(
                 leader_id,
-                f"🗑 Турнир #{tid} удалён администрацией. "
+                f"🗑 {hd.quote(delete_title)} удалён администрацией. "
                 f"Регистрация и результаты аннулированы.",
+                parse_mode="HTML",
             )
         except Exception:
             pass
@@ -4254,7 +4274,7 @@ async def admin_tournament_delete_yes(call: CallbackQuery, bot: Bot):
         ),
     )
     await call.message.edit_text(
-        f"🗑 <b>Турнир #{tid} удалён.</b>\n\n"
+        f"🗑 <b>{hd.quote(delete_title)} удалён.</b>\n\n"
         f"• Составов удалено: {_fmt_num(len(participants))}\n"
         f"• Матчей: {_fmt_num(len(matches))} · заявок: {_fmt_num(reports)}\n"
         f"• Постов удалено: {_fmt_num(removed_posts)} из {_fmt_num(len(posts))}\n\n"
@@ -4416,7 +4436,7 @@ async def tournament_register_cb(call: CallbackQuery, bot: Bot):
     place = next((i for i, p in enumerate(participants, start=1)
                   if int(p["league_id"]) == int(composition["id"])), len(participants))
     await call.message.answer(
-        f"✅ <b>Состав зарегистрирован на турнир #{row['id']}!</b>\n"
+        f"✅ <b>Состав зарегистрирован — {hd.quote(_tournament_title(row))}.</b>\n"
         f"• {hd.quote(composition['name'])} [{hd.quote(composition['tag'])}]\n"
         f"• Позиция в сетке: <b>{_fmt_num(place)}</b> из "
         f"{_fmt_num(limit) if limit else '∞'}\n"
@@ -4490,7 +4510,7 @@ async def my_tournament_matches(message: Message, state: FSMContext):
     for item in rows:
         label = _stage_label(item["tournament"], item["round"])
         keyboard_rows.append((
-            f"#{item['tournament']['id']} {hd.quote(item['tournament']['t_type'])} · "
+            f"{hd.quote(_tournament_date(item['tournament']) or 'Турнир')} · "
             f"{hd.quote(str(item['opponent']))} · {label}",
             f"myres:{item['match']['id']}",
         ))
@@ -4613,7 +4633,7 @@ async def result_winner_chosen(call: CallbackQuery, state: FSMContext, bot: Bot)
     stage = _stage_label(row, int(m["round"]))
     admin_text = (
         f"📥 <b>Заявка на результат #{report_id}</b>\n"
-        f"🏆 Турнир #{m['tournament_id']} · {hd.quote(TOURNAMENT_TYPE_LABELS.get(row['t_type'], row['t_type']))}\n"
+        f"🏆 {hd.quote(_tournament_title(row))} · {hd.quote(TOURNAMENT_TYPE_LABELS.get(row['t_type'], row['t_type']))}\n"
         f"⚔️ Стадия: {hd.quote(stage)}\n"
         f"🆚 {hd.quote(str(m['side_a'] or '—'))} vs {hd.quote(str(m['side_b'] or '—'))}\n"
         f"👤 Сдал: {hd.quote(call.from_user.full_name)} "
@@ -4684,9 +4704,11 @@ async def admin_report_view(call: CallbackQuery):
         await call.answer("Заявка не найдена", show_alert=True)
         return
     m = get_match(int(r["match_id"]))
+    report_tournament = get_tournament(int(r["tournament_id"]))
+    report_title = _tournament_title(report_tournament or {"id": r["tournament_id"]})
     text = (
         f"📥 <b>Заявка #{r['id']}</b> · статус {hd.quote(r['status'])}\n"
-        f"🏆 Турнир #{r['tournament_id']}\n"
+        f"🏆 {hd.quote(report_title)}\n"
         f"🆚 {hd.quote(str(m['side_a'] or '—'))} vs {hd.quote(str(m['side_b'] or '—'))}\n"
         f"👤 Сдал: ID {r['reporter_id']} ({hd.quote(str(r['team_name'] or '—'))})\n"
         f"💬 Текст: {hd.quote(str(r['comment'] or '—'))}\n"
@@ -4786,7 +4808,7 @@ async def _apply_result(call: CallbackQuery, report_id: int, winner: str, status
                 int(p["leader_id"]),
                 (f"✅ <b>Результат подтверждён администрацией.</b>\n"
                  f"Состав {hd.quote(p['team_name'])} — {'победа, проходите дальше!' if won else 'поражение, вы выбыли.'}\n"
-                 f"🏆 Турнир #{m['tournament_id']}") + ("\n" + "\n".join(notes) if won else ""),
+                 f"🏆 {hd.quote(_tournament_title(row))}") + ("\n" + "\n".join(notes) if won else ""),
                 parse_mode="HTML",
             )
         except Exception:
