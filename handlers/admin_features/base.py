@@ -2090,11 +2090,10 @@ def render_bracket_image(columns, title: str, subtitle: str = "",
                 else "матча" if 2 <= live_cells % 10 <= 4 and not 12 <= live_cells % 100 <= 14
                 else "матчей")
 
-        # шапка: заголовок слева, справа — короткий статус строчными буквами
+        # шапка: только заголовок и статус, без засечки слева
         if themed_bg is None:
             draw.rectangle([0, 0, width, header_h], fill=BR_HEAD)
-        draw.rectangle([pad, 26, pad + 4, 72], fill=BR_BRASS)
-        draw.text((pad + 20, 24), _fit_text(draw, title, f_title, width - pad * 2 - 210),
+        draw.text((pad, 24), _fit_text(draw, title, f_title, width - pad * 2 - 210),
                   font=f_title, fill=(246, 242, 232))
         if live_cells:
             meta, meta_color = f"идёт {live_cells} {word}", BR_LIVE
@@ -2186,17 +2185,19 @@ def render_bracket_image(columns, title: str, subtitle: str = "",
 
                 # обводка «под бумагу»: тёплый песочный тон читается на синем небе
                 card_line = (214, 206, 188)
+                # названия команд всегда белым; статус передаёт только обводка/полоса
+                text_white = (255, 255, 255)
                 if is_live:
-                    outline, fill, color = BR_LIVE, BR_LIVE_FILL, BR_LIVE_TEXT
+                    outline, fill, color = BR_LIVE, BR_LIVE_FILL, text_white
                     live_count += 1
                 elif is_advanced:
-                    outline, fill, color = card_line, BR_SURFACE, BR_TEXT
+                    outline, fill, color = card_line, BR_SURFACE, text_white
                 elif is_waiting:
-                    outline, fill, color = card_line, BR_HEAD, BR_MUTED
+                    outline, fill, color = card_line, BR_HEAD, text_white
                 elif is_placeholder or is_bye:
-                    outline, fill, color = (176, 172, 158), BR_HEAD, BR_DIM
+                    outline, fill, color = (176, 172, 158), BR_HEAD, text_white
                 else:
-                    outline, fill, color = card_line, BR_SURFACE, BR_TEXT
+                    outline, fill, color = card_line, BR_SURFACE, text_white
 
                 # карточка полупрозрачная: фон просвечивает, но текст остаётся читаемым
                 card_alpha = 168 if is_placeholder or is_bye else 196
