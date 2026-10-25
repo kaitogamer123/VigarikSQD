@@ -727,17 +727,18 @@ def update_tournament_bracket(tournament_id: int, slots: list) -> None:
     conn.close()
 
 
-def replace_tournament_matches(tournament_id: int, matches: list[dict]) -> None:
-    """Пересоздаёт пары 1-го круга (round=1)."""
+def replace_tournament_matches(tournament_id: int, matches: list[dict],
+                               round_no: int = 1) -> None:
+    """Пересоздаёт пары указанного круга (по умолчанию 1-го)."""
     ensure_tournament_tables()
     conn = db.get_connection()
-    conn.execute("DELETE FROM tournament_matches WHERE tournament_id = ? AND round = 1",
-                 (int(tournament_id),))
+    conn.execute("DELETE FROM tournament_matches WHERE tournament_id = ? AND round = ?",
+                 (int(tournament_id), int(round_no)))
     for idx, m in enumerate(matches):
         conn.execute(
             "INSERT OR IGNORE INTO tournament_matches (tournament_id, round, pair_index, side_a, "
-            "side_b, winner, status) VALUES (?, 1, ?, ?, ?, ?, ?)",
-            (int(tournament_id), idx, m.get("side_a"), m.get("side_b"),
+            "side_b, winner, status) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (int(tournament_id), int(round_no), idx, m.get("side_a"), m.get("side_b"),
              m.get("winner"), m.get("status", "scheduled")),
         )
     conn.commit()
@@ -1148,6 +1149,73 @@ async def _test_publish_targets() -> list[tuple[int, int | None, str]]:
 
 # ─── Сетка: слоты и автопроходы/BYE ─────────────────────────────────────────
 
+def _seed_plan(names: list, t_type: str) -> dict:
+    """Схема посева БЕЗ пачки BYE в первом круге.
+
+    10 команд → не сетка на 16 с 6 автопроходами, а предварительный раунд
+    (4 команды играют 2 матча) + основная сетка на 8, куда входят 6 команд
+    напрямую и 2 победителя предвариловки.
+
+    BYE остаётся только там, где команд реально не хватает: например,
+    15 команд → сетка 16 и ровно 1 автопроход в 1/8.
+    """
+    names = [str(n) for n in (names or [])]
+    n = len(names)
+    if t_type == TOURNAMENT_SHOWDOWN:
+        return {"solo": True, "names": names, "main_size": n, "playin_pairs": [],
+                "direct": names, "total_rounds": 0}
+    if n < 2:
+        return {"solo": False, "names": names, "main_size": 2, "playin_pairs": [],
+                "direct": names, "total_rounds": 1}
+    next_pow = 1
+    while next_pow < n:
+        next_pow *= 2
+    prev_pow = next_pow // 2
+    byes = next_pow - n
+    # много «пустых» мест — лучше крошечная предвариловка, чем 6 автопроходов
+    use_playin = n >= 5 and byes > next_pow // 4
+    if use_playin:
+        main_size = prev_pow
+        playin_count = n - main_size          # столько матчей в предвариловке
+        playin_teams = names[:playin_count * 2]
+        direct = names[playin_count * 2:]
+        pairs = [(playin_teams[2 * i], playin_teams[2 * i + 1])
+                 for i in range(playin_count)]
+        return {"solo": False, "names": names, "main_size": main_size,
+                "playin_pairs": pairs, "direct": direct,
+                "total_rounds": 1 + int(math.log2(main_size))}
+    # обычная сетка, BYE раскидываем в первом круге (их тут мало)
+    slots: list = []
+    byes_left = byes
+    idx = 0
+    for name in names:
+        slots.append(name)
+        if byes_left > 0:
+            slots.append("BYE")
+            byes_left -= 1
+    while byes_left > 0:
+        slots.append("BYE")
+        byes_left -= 1
+    return {"solo": False, "names": names, "main_size": next_pow,
+            "playin_pairs": [], "direct": slots,
+            "total_rounds": int(math.log2(next_pow))}
+
+
+def _first_main_column(plan: dict) -> list:
+    """Первая колонка основной сетки: слоты предвариловки + команды без BYE."""
+    if plan.get("solo"):
+        return list(plan["names"])
+    playin = plan.get("playin_pairs") or []
+    col = []
+    for i, (_a, _b) in enumerate(playin):
+        col.append(f"Победитель пары {i + 1}")
+    col.extend(plan.get("direct") or [])
+    size = max(2, int(plan.get("main_size") or 2))
+    while len(col) < size:
+        col.append("BYE")
+    return col[:size]
+
+
 def _bracket_slots_for(t_type: str, team_limit) -> list[str]:
     """Список слотов превью-сетки под лимит (или под дефолт), с учётом BYE.
 
@@ -1254,20 +1322,24 @@ def render_bracket_image(columns, title: str, subtitle: str = "",
         columns = [list(col) for col in (columns or [])]
         if not columns:
             columns = [["Свободный слот", "Свободный слот"]]
-        if solo:
-            total_rounds = 0
-        else:
-            size = 1
-            while size < max(2, len(columns[0])):
-                size *= 2
-            columns[0] = list(columns[0]) + ["BYE"] * (size - len(columns[0]))
-            total_rounds = max(1, int(math.log2(size)))
-            while len(columns) < total_rounds + 1:
-                prev = columns[-1]
-                round_no = len(columns)
-                columns.append([f"Победитель {_round_title(total_rounds, round_no)} "
-                                f"№{i + 1}" for i in range(max(1, len(prev) // 2))])
-            columns = columns[:total_rounds + 1]
+        # колонки уже подготовлены вызывающим кодом: [участники, раунд 1, раунд 2, ...]
+        # BYE больше не раздувает первый круг: предвариловка показывается отдельной колонкой
+        solo = bool(solo) or len(columns) == 1
+        total_rounds = max(0, len(columns) - 1)
+
+        def stage_label(col_index: int) -> str:
+            if col_index <= 0:
+                return "Участники ShowDown" if solo else "Участники"
+            from_end = len(columns) - col_index   # 1 = последняя колонка = финал
+            if from_end == 1:
+                return "Финал"
+            if from_end == 2:
+                return "Полуфинал"
+            if from_end == 3:
+                return "1/4 финала"
+            if from_end == 4:
+                return "1/8 финала"
+            return f"1/{2 ** (from_end - 1)} финала"
 
         box_w, box_h, v_gap, gap_x, pad = 264, 58, 20, 66, 42
         row_h = box_h + v_gap
@@ -1310,9 +1382,7 @@ def render_bracket_image(columns, title: str, subtitle: str = "",
             col_positions.append(centers)
 
             x = pad + c * (box_w + gap_x)
-            round_label = "Участники" if c == 0 else _round_title(total_rounds, c)
-            if solo:
-                round_label = "Участники ShowDown"
+            round_label = stage_label(c)
             label_w = draw.textlength(round_label, font=f_round)
             draw.text((x + (box_w - label_w) / 2, top - 32), round_label,
                       font=f_round, fill=(120, 150, 210))
@@ -1411,21 +1481,36 @@ def _bracket_columns_for(row, participants=None):
     first = ["BYE" if (x is None or not str(x).strip() or str(x).strip().upper() == "BYE")
              else str(x).strip() for x in first]
     if solo:
-        return ([first] if first else [["Свободный слот"] * TOURNAMENT_SHOWDOWN_LIMIT]), None
-    if not first:
-        first = ["Свободный слот", "Свободный слот"]
-    size = 1
-    while size < max(2, len(first)):
-        size *= 2
-    first = (first + ["BYE"] * size)[:size]
-    total = max(1, int(math.log2(size)))
+        names = [p["team_name"] or "—" for p in participants] or first
+        return ([names] if names else [["Свободный слот"] * TOURNAMENT_SHOWDOWN_LIMIT]), None
+    names = [p["team_name"] or "—" for p in participants]
+    plan = _seed_plan(names, row["t_type"]) if names else None
+    if plan and plan["playin_pairs"]:
+        # колонка 0 — все участники, колонка 1 — предварительный раунд
+        columns = [names, [f"{a} 🆚 {b}" for a, b in plan["playin_pairs"]]]
+        total = plan["total_rounds"]           # включает предвариловку
+        start_round = 2                        # основная сетка начинается со 2-го круга
+    else:
+        first = _build_bracket_slots(participants, row["t_type"]) if participants else []
+        first = ["BYE" if (x is None or not str(x).strip()) else str(x).strip() for x in first]
+        if not first:
+            first = ["Свободный слот", "Свободный слот"]
+        size = 1
+        while size < max(2, len(first)):
+            size *= 2
+        first = (first + ["BYE"] * size)[:size]
+        columns = [first]
+        total = max(1, int(math.log2(size)))
+        start_round = 1
 
-    columns = [first]
-    for r in range(1, total + 1):
-        prev = columns[-1]
+    for r in range(start_round, total + 1):
         matches = {m["pair_index"]: m for m in get_tournament_matches(row["id"], r)}
         col = []
-        for i in range(max(1, len(prev) // 2)):
+        pairs_count = max(1, len(columns[-1]) // 2)
+        # в основной сетке после предвариловки пар становится больше
+        if matches:
+            pairs_count = max(pairs_count, max(matches) + 1)
+        for i in range(pairs_count):
             m = matches.get(i) or {}
             if m.get("winner"):
                 col.append(str(m["winner"]))
@@ -1434,7 +1519,7 @@ def _bracket_columns_for(row, participants=None):
             elif m.get("side_a") or m.get("side_b"):
                 col.append(f"{m.get('side_a') or m.get('side_b')} · ждёт соперника")
             else:
-                col.append(f"Победитель {_round_title(total, r)} №{i + 1}")
+                col.append(f"Победитель пары {i + 1}")
         columns.append(col)
     return columns, get_third_place_match(row["id"])
 
@@ -1724,28 +1809,24 @@ async def _send_preview(call: CallbackQuery, row, as_caption: bool = False):
 # ─── Этап 4: сборка сетки, автостарт, уведомления капитанам ─────────────────
 
 def _build_bracket_slots(participants, t_type: str) -> list:
-    """Слоты 1-го круга по факту регистрации. None = BYE (автопроход).
+    """Первая колонка основной сетки по факту регистрации (без пачки BYE).
 
-    BYE расставляются в шахматном порядке, чтобы «живые» команды расходились
-    по сетке и не выбивали друг друга в первом же круге.
+    10 команд → предварительный раунд на 4 команды, дальше сетка на 8:
+    слоты предвариловки + 6 команд напрямую. BYE остаются только при малом
+    числе пустых мест (например, 15 команд → 16 слотов и 1 автопроход).
     """
     names = [p["team_name"] or f"#{p['league_id']}" for p in participants]
     if t_type == TOURNAMENT_SHOWDOWN:
         return names  # соло: слот = участник
-    size = 1
-    while size < max(2, len(names)):
-        size *= 2
-    byes = size - len(names)
-    slots: list = []
-    name_idx = 0
-    for i in range(size):
-        if byes > 0 and i % 2 == 1:
-            slots.append(None)
-            byes -= 1
-        else:
-            slots.append(names[name_idx] if name_idx < len(names) else None)
-            name_idx += 1
-    return slots
+    plan = _seed_plan(names, t_type)
+    return _first_main_column(plan)
+
+
+def _bracket_plan_matches(participants, t_type: str):
+    """Матчи предварительного раунда (если нужен) и первая колонка основной сетки."""
+    names = [p["team_name"] or f"#{p['league_id']}" for p in participants]
+    plan = _seed_plan(names, t_type)
+    return plan, _first_main_column(plan)
 
 
 def _bracket_matches(slots: list, t_type: str) -> list[dict]:
@@ -1893,10 +1974,41 @@ async def start_tournament(bot: Bot, row) -> str:
     if row["t_type"] == TOURNAMENT_SHOWDOWN and len(participants) > TOURNAMENT_SHOWDOWN_LIMIT:
         participants = participants[:TOURNAMENT_SHOWDOWN_LIMIT]
 
-    slots = _build_bracket_slots(participants, row["t_type"])
-    matches = _bracket_matches(slots, row["t_type"])
-    update_tournament_bracket(tid, [s if s else "BYE" for s in slots])
-    replace_tournament_matches(tid, matches)
+    plan, first_col = _bracket_plan_matches(participants, row["t_type"])
+    if plan["solo"]:
+        matches = [{"side_a": s, "side_b": None, "winner": None, "status": "solo"}
+                   for s in plan["names"]]
+        replace_tournament_matches(tid, matches)
+        update_tournament_bracket(tid, plan["names"])
+    elif plan["playin_pairs"]:
+        # предварительный раунд: только матчи между командами, без «BYE vs BYE»
+        matches = [{"side_a": a, "side_b": b, "winner": None, "status": "scheduled"}
+                   for a, b in plan["playin_pairs"]]
+        replace_tournament_matches(tid, matches)
+        # основная сетка: команды напрямую + слоты под победителей предвариловки
+        main_col = _first_main_column(plan)
+        main_matches = []
+        i = 0
+        while i < len(main_col):
+            a = main_col[i]
+            b = main_col[i + 1] if i + 1 < len(main_col) else "BYE"
+            a = None if str(a).startswith("Победитель пары") else a
+            b = None if str(b).startswith("Победитель пары") else b
+            if a is None and b is None:
+                pass
+            elif a is None:
+                main_matches.append({"side_a": None, "side_b": b, "winner": None, "status": "scheduled"})
+            elif b is None:
+                main_matches.append({"side_a": a, "side_b": None, "winner": a, "status": "bye"})
+            else:
+                main_matches.append({"side_a": a, "side_b": b, "winner": None, "status": "scheduled"})
+            i += 2
+        replace_tournament_matches(tid, main_matches, round_no=2)
+        update_tournament_bracket(tid, main_col)
+    else:
+        matches = _bracket_matches(plan["direct"], row["t_type"])
+        replace_tournament_matches(tid, matches)
+        update_tournament_bracket(tid, first_col)
     # победители BYE-матчей сразу продвигаются в следующий круг
     _propagate_auto_advances(tid)
     set_tournament_status(tid, "running")
