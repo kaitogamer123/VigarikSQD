@@ -1505,14 +1505,24 @@ BR_THEMES = {
     },
 }
 
-# своя картинка на сервер: её же сохраняет команда /bracket_bg при загрузке из Telegram
-BRACKET_BG_PATH = "assets/tournament_bg.png"
-BRACKET_BG_MAX_SIDE = 2560          # больше не нужно: Telegram всё равно сжимает превью
+# Своя картинка на сервере: фон берётся из файла (JPG), а не рисуется.
+# Бот скачивает её сам при старте, если файла ещё нет.
+BRACKET_BG_PATH = "assets/tournament_bg.jpg"
+BRACKET_BG_MAX_SIDE = 2560
 _BRACKET_BG_FILES = (
     BRACKET_BG_PATH,
-    "league/assets/tournament_bg.png", "league/assets/tournament_bg.jpg",
-    "assets/tournament_bg.jpg",
-    "tournament_bg.png", "tournament_bg.jpg",
+    "assets/tournament_bg.png",
+    "league/assets/tournament_bg.jpg", "league/assets/tournament_bg.png",
+    "tournament_bg.jpg", "tournament_bg.png",
+)
+# Фон-картинка: основной файл лежит в Google Drive, оттуда отдаётся JPEG напрямую.
+# Порядок важен — сервер пробует ссылки сверху вниз, пока не получит настоящую картинку.
+BRACKET_BG_SOURCE_URLS = (
+    "https://drive.google.com/uc?export=download&id=1SPqvWBNj0JqfqhobyWlxg0TUwm_wve8S",
+    "https://drive.google.com/thumbnail?id=1SPqvWBNj0JqfqhobyWlxg0TUwm_wve8S&sz=w2560",
+    "https://preview.redd.it/best-background-ever-on-brawl-stars-history-v0-"
+    "rmf8mo2oztjd1.jpeg?width=1920&auto=webp&s=16dbf1e40f0603cf5a167b0bc39c79e4929c18f8",
+    "https://i.redd.it/rmf8mo2oztjd1.jpeg",
 )
 
 
@@ -1660,7 +1670,7 @@ def remove_bracket_bg() -> bool:
 
 
 def save_bracket_bg_from_bytes(raw: bytes) -> tuple[bool, str]:
-    """Принимает любую картинку, проверяет, приводит к PNG и кладёт в assets/."""
+    """Принимает любую картинку, приводит к RGB и сохраняет как JPG в assets/."""
     if not PIL_AVAILABLE:
         return False, "Pillow не установлен на сервере (pip install Pillow)"
     try:
@@ -1677,10 +1687,36 @@ def save_bracket_bg_from_bytes(raw: bytes) -> tuple[bool, str]:
         folder = os.path.dirname(BRACKET_BG_PATH)
         if folder:
             os.makedirs(folder, exist_ok=True)
-        photo.save(BRACKET_BG_PATH, format="PNG", optimize=True)
+        photo.save(BRACKET_BG_PATH, format="JPEG", quality=92, optimize=True)
     except Exception as e:  # noqa: BLE001
         return False, f"не удалось сохранить файл: {e}"
     return True, f"{photo.width}×{photo.height}"
+
+
+async def ensure_bracket_bg_file(force: bool = False) -> tuple[bool, str]:
+    """Скачивает фоновую картинку при старте, если файла нет.
+
+    force=True — перекачать заново (команда /bracket_bg fetch).
+    """
+    if bracket_bg_exists() and not force:
+        return True, "файл уже на месте"
+    if not PIL_AVAILABLE:
+        return False, "Pillow не установлен"
+    last_error = "нет доступных ссылок"
+    for url in BRACKET_BG_SOURCE_URLS:
+        try:
+            raw = await _download_bracket_bg(url)
+        except Exception as e:  # noqa: BLE001
+            last_error = f"{e}"
+            logger.info(f"bracket bg download failed: {url} — {e}")
+            continue
+        ok, info = save_bracket_bg_from_bytes(raw)
+        if ok:
+            logger.info(f"bracket bg saved from {url}: {info}")
+            return True, info
+        last_error = info
+    logger.warning(f"bracket bg not downloaded: {last_error}")
+    return False, last_error
 
 # значения по умолчанию; переключаются командой /bracket_theme
 BRACKET_THEME = "sunset"
@@ -1792,13 +1828,26 @@ async def cb_bracket_theme(call: CallbackQuery):
         await call.message.answer(text + "\nПревью появится после первого турнира.")
 
 
+def _looks_like_image(raw: bytes) -> bool:
+    """JPEG/PNG/WEBP по сигнатуре: отсекает HTML-заглушки Google и Reddit."""
+    return (
+        raw[:3] == b"\xff\xd8\xff"                                # JPEG
+        or raw[:8] == b"\x89PNG\r\n\x1a\n"                        # PNG
+        or (raw[:4] == b"RIFF" and raw[8:12] == b"WEBP")          # WEBP
+    )
+
+
 async def _download_bracket_bg(url: str) -> bytes:
     """Скачивает картинку по ссылке с сервера (Reddit и т.п. отдают только с UA)."""
     headers = {
         "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
         "Accept": "image/avif,image/webp,image/png,image/jpeg,*/*",
+        "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
+        # без Referer Reddit часто отдаёт 403 вместо картинки
+        "Referer": "https://www.reddit.com/",
     }
+    raw = b""
     try:
         import aiohttp
         timeout = aiohttp.ClientTimeout(total=30)
@@ -1806,12 +1855,15 @@ async def _download_bracket_bg(url: str) -> bytes:
             async with session.get(url, allow_redirects=True) as resp:
                 if resp.status != 200:
                     raise RuntimeError(f"HTTP {resp.status}")
-                return await resp.read()
+                raw = await resp.read()
     except ImportError:
         import urllib.request
         req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req, timeout=30) as resp:  # noqa: S310
-            return resp.read()
+            raw = resp.read()
+    if not _looks_like_image(raw):
+        raise RuntimeError("по ссылке пришёл не файл картинки (HTML-страница)")
+    return raw
 
 
 @router.message(F.text.startswith("/bracket_bg"))
@@ -1823,6 +1875,28 @@ async def cmd_bracket_bg(message: Message, state: FSMContext):
         return
     raw_text = (message.text or "")
     text = raw_text.lower()
+    if "fetch" in text or "скачай" in text:
+        status = await message.answer("Скачиваю фон с сервера…")
+        ok, info = await ensure_bracket_bg_file(force=True)
+        if not ok:
+            await status.edit_text(
+                f"Не получилось скачать автоматически: {info}\n\n"
+                "Google Drive иногда требует подтверждение для крупных файлов. "
+                "Тогда скачай одной командой на сервере:\n"
+                "<code>curl -L -o assets/tournament_bg.jpg "
+                "\"https://drive.google.com/uc?export=download&amp;id="
+                "1SPqvWBNj0JqfqhobyWlxg0TUwm_wve8S\"</code>\n"
+                "или пришли картинку боту документом.",
+                parse_mode="HTML",
+            )
+            return
+        await save_bracket_theme("sunset")
+        await status.edit_text(f"Фон сохранён как {BRACKET_BG_PATH} ({info}). Превью ниже.")
+        rows = get_tournaments(limit=1)
+        png = _render_for_row(rows[0]) if rows else None
+        if png:
+            await message.answer_photo(BufferedInputFile(png, filename="bracket_custom.jpg"))
+        return
     if "reset" in text or "сброс" in text:
         removed = remove_bracket_bg()
         await message.answer(
@@ -1860,7 +1934,8 @@ async def cmd_bracket_bg(message: Message, state: FSMContext):
         "фото или ссылкой вида <code>/bracket_bg https://…</code>.\n\n"
         "Telegram не сжимает документы, поэтому файл предпочтительнее фото.\n"
         f"Сейчас стоит: {hd.quote(current)}.\n\n"
-        "Сбросить обратно на закат: /bracket_bg reset\n"
+        "Скачать заново с сервера: /bracket_bg fetch\n"
+        "Сбросить на нарисованный закат: /bracket_bg reset\n"
         "Отмена: /cancel",
         parse_mode="HTML",
         reply_markup=result_cancel_keyboard(),
@@ -3087,6 +3162,12 @@ async def on_tournament_scheduler_start(**kwargs):
         await load_bracket_theme()
     except Exception as e:
         logger.warning(f"bracket theme load failed: {e}")
+    try:
+        # фон берём из файла; если его нет — скачиваем сами один раз при старте
+        bg_ok, bg_info = await ensure_bracket_bg_file()
+        logger.info(f"bracket background: {'ok' if bg_ok else 'fallback'} — {bg_info}")
+    except Exception as e:
+        logger.warning(f"bracket background init failed: {e}")
     try:
         asyncio.create_task(tournament_scheduler_task(bot))
         logger.info("tournament scheduler task created")
@@ -4853,8 +4934,8 @@ async def cmd_show_system_commands_guide(message: Message):
         "• /reload_config — Перезагрузка ролей и топиков из config.py на лету.\n"
         "• get_id — Напишите это слово в любом топике, чтобы узнать его точный ID чата.\n"
         "• /bracket_theme — оформление сетки: Закат, Протокол, Табло, Журнал.\n"
-        "• /bracket_bg — прислать картинку (файлом/фото) или ссылку: "
-        "/bracket_bg https://… ; /bracket_bg reset — вернуть закат.\n\n"
+        "• /bracket_bg — фон сетки: картинкой, ссылкой (/bracket_bg https://…) "
+        "или /bracket_bg fetch — скачать стандартную с сервера; reset — вернуть закат.\n\n"
         "🏆 Управление сезонами пуша Основы: \n"
         "• /start_season — Запуск нового сезона (техническая фиксация).\n"
         "• /check_season — Финиш сезона, опрос Brawl Stars API и вывод отчета по штрафникам.\n\n"
