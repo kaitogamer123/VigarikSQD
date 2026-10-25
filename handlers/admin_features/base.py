@@ -2077,32 +2077,11 @@ def render_bracket_image(columns, title: str, subtitle: str = "",
         f_slot = _load_font(18, BR_NAME_FAMILY)
         f_small = _load_font(13)
 
-        # сколько матчей реально идёт прямо сейчас (обе команды известны, итога нет)
-        live_cells = 0
-        for _c, _col in enumerate(columns):
-            if _c == 0:
-                continue
-            for _v in _col:
-                _raw = _clean_team(_v)
-                if " vs " in _raw and not _raw.endswith(("ждёт", "ждет")):
-                    live_cells += 1
-        word = ("матч" if live_cells % 10 == 1 and live_cells % 100 != 11
-                else "матча" if 2 <= live_cells % 10 <= 4 and not 12 <= live_cells % 100 <= 14
-                else "матчей")
-
-        # шапка: только заголовок и статус, без засечки слева
+        # шапка: только заголовок турнира, без статусов и подписей справа
         if themed_bg is None:
             draw.rectangle([0, 0, width, header_h], fill=BR_HEAD)
-        draw.text((pad, 24), _fit_text(draw, title, f_title, width - pad * 2 - 210),
+        draw.text((pad, 24), _fit_text(draw, title, f_title, width - pad * 2),
                   font=f_title, fill=(246, 242, 232))
-        if live_cells:
-            meta, meta_color = f"идёт {live_cells} {word}", BR_LIVE
-        elif placements:
-            meta, meta_color = "призовые места", (196, 186, 168)
-        else:
-            meta, meta_color = "сетка турнира", (196, 186, 168)
-        draw.text((width - pad - draw.textlength(meta, font=f_meta), 32),
-                  meta, font=f_meta, fill=meta_color)
 
 
         # призёры: место + название, разделены волосяными линиями
@@ -2208,17 +2187,18 @@ def render_bracket_image(columns, title: str, subtitle: str = "",
                 # наложения слоя, иначе он тускнеет под полупрозрачной заливкой.
                 card_alpha = 168 if is_placeholder or is_bye else 196
                 if is_live:
-                    # мягкое свечение вокруг карточки — акцент на матче, который идёт
-                    for grow, alpha in ((7, 26), (4, 46), (2, 70)):
+                    # очень мягкий ореол: два тонких слоя вместо трёх плотных
+                    for grow, alpha in ((4, 10), (2, 16)):
                         cdraw.rounded_rectangle(
                             [x - grow, cy - box_h / 2 - grow,
                              x + box_w + grow, cy + box_h / 2 + grow],
-                            radius=BR_RADIUS + grow, fill=(*BR_LIVE, alpha),
+                            radius=BR_RADIUS + grow,
+                            outline=(*BR_LIVE, alpha), width=2,
                         )
                 cdraw.rounded_rectangle(
                     [x, cy - box_h / 2, x + box_w, cy + box_h / 2],
                     radius=BR_RADIUS, fill=(*fill, card_alpha),
-                    outline=(*outline, 255), width=3 if is_live else 1,
+                    outline=(*outline, 255), width=2 if is_live else 1,
                 )
 
                 label = "BYE" if is_bye else raw
@@ -3853,7 +3833,7 @@ async def admin_tournament_test_tools(call: CallbackQuery, bot: Bot):
         f"(из них тестовых: {_fmt_num(count_test_participants(tid))})\n"
         f"{_participants_block(participants, 15)}\n\n"
         f"🗺 Пар 1-го круга: {_fmt_num(len(matches))}"
-        + (f"\n🥉 Матч за 3-4 места: {hd.quote(str(third['side_a'] or '—'))} 🆚 "
+        + (f"\n🥉 Матч за 3-4 места: {hd.quote(str(third['side_a'] or '—'))} �� "
            f"{hd.quote(str(third['side_b'] or '—'))}" if third and third["side_a"] else "")
         + "\n\nТестовые составы имеют лидера-тебя: все уведомления придут в твои ЛС."
     )
