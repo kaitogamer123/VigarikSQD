@@ -1362,13 +1362,27 @@ def _bracket_pairs_text(slots: list[str]) -> list[str]:
     return lines
 
 
-def _load_font(size: int):
+_FONT_FILES = {
+    "sans": ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+             "/usr/share/fonts/TTF/DejaVuSans.ttf"),
+    "bold": ("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+             "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf"),
+    # серифный DejaVu есть в дефолтном пакете fonts-dejavu на Debian/Ubuntu
+    "serif": ("/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
+              "/usr/share/fonts/TTF/DejaVuSerif.ttf"),
+    "serif_bold": ("/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf",
+                   "/usr/share/fonts/TTF/DejaVuSerif-Bold.ttf"),
+}
+
+
+def _load_font(size: int, family: str = "sans"):
     """Шрифт с поддержкой кириллицы; при отсутствии — встроенный PIL-шрифт."""
-    for path in (
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/TTF/DejaVuSans.ttf",
-    ):
+    for path in _FONT_FILES.get(family, _FONT_FILES["sans"]):
+        try:
+            return ImageFont.truetype(path, size)
+        except Exception:
+            continue
+    for path in _FONT_FILES["sans"]:
         try:
             return ImageFont.truetype(path, size)
         except Exception:
@@ -1431,19 +1445,152 @@ def _round_title(total: int, round_no: int) -> str:
     return f"1/{2 ** (total - round_no)} финала"
 
 
-# ─── Дизайн-токены сетки (спокойная типографика вместо «геймерского неона») ──
-BR_BG = (11, 13, 16)          # общий фон
-BR_HEAD = (16, 19, 24)        # шапка
-BR_SURFACE = (18, 22, 28)     # карточки
-BR_LINE = (42, 48, 58)        # коннекторы и разделители
-BR_TEXT = (230, 233, 237)
-BR_MUTED = (126, 136, 150)
-BR_DIM = (96, 105, 118)
-BR_BRASS = (208, 172, 100)    # 1 место / акцент
-BR_SILVER = (174, 182, 194)   # 2 место
-BR_COPPER = (188, 137, 92)    # 3 место
-BR_BRONZE = (140, 124, 106)   # 4 место
-BR_WIN = (88, 158, 121)       # прошедший дальше (линия/полоса)
+# ─── Оформление сетки: три направления, а не одна «геймерская» тема ──────────
+# protocol — светлый печатный протокол: бумага, тушь, серифный заголовок, острые углы
+# board    — тёмное арена-табло: графит, тонкие линии, только янтарный акцент
+# ledger   — клубный журнал: тёплый серо-зелёный, плотная вёрстка, малый радиус
+BR_THEME_LABELS = {
+    "protocol": "Протокол",
+    "board": "Табло",
+    "ledger": "Журнал",
+}
+BR_THEME_DESCRIPTIONS = {
+    "protocol": "светлый печатный бланк, серифные заголовки, острые углы",
+    "board": "тёмное табло арены, линии без рамок, янтарный акцент",
+    "ledger": "тёплый клубный журнал, плотные строки, малый радиус",
+}
+BR_THEMES = {
+    "protocol": {
+        "bg": (243, 243, 239), "head": (233, 234, 228), "surface": (255, 255, 253),
+        "line": (196, 200, 191), "text": (23, 25, 28), "muted": (100, 106, 99),
+        "dim": (151, 156, 147), "brass": (124, 96, 40), "silver": (111, 121, 130),
+        "copper": (146, 86, 52), "bronze": (122, 106, 84),
+        "live": (166, 58, 38), "live_fill": (251, 236, 231), "live_text": (110, 33, 20),
+        "radius": 0, "title_family": "serif_bold", "name_family": "serif",
+    },
+    "board": {
+        "bg": (13, 15, 17), "head": (18, 21, 24), "surface": (23, 27, 31),
+        "line": (47, 54, 60), "text": (235, 238, 240), "muted": (138, 148, 156),
+        "dim": (93, 102, 109), "brass": (201, 162, 90), "silver": (166, 176, 184),
+        "copper": (183, 124, 78), "bronze": (134, 119, 101),
+        "live": (224, 163, 62), "live_fill": (36, 30, 18), "live_text": (243, 205, 137),
+        "radius": 4, "title_family": "bold", "name_family": "sans",
+    },
+    "ledger": {
+        "bg": (228, 233, 224), "head": (216, 223, 212), "surface": (243, 246, 240),
+        "line": (178, 189, 173), "text": (27, 38, 30), "muted": (89, 103, 92),
+        "dim": (137, 150, 138), "brass": (116, 86, 34), "silver": (96, 111, 116),
+        "copper": (139, 78, 46), "bronze": (110, 95, 74),
+        "live": (139, 62, 40), "live_fill": (246, 231, 224), "live_text": (94, 36, 22),
+        "radius": 2, "title_family": "serif_bold", "name_family": "sans",
+    },
+}
+
+# значения по умолчанию; переключаются командой /bracket_theme
+BRACKET_THEME = "protocol"
+BR_BG = BR_THEMES[BRACKET_THEME]["bg"]
+BR_HEAD = BR_THEMES[BRACKET_THEME]["head"]
+BR_SURFACE = BR_THEMES[BRACKET_THEME]["surface"]
+BR_LINE = BR_THEMES[BRACKET_THEME]["line"]
+BR_TEXT = BR_THEMES[BRACKET_THEME]["text"]
+BR_MUTED = BR_THEMES[BRACKET_THEME]["muted"]
+BR_DIM = BR_THEMES[BRACKET_THEME]["dim"]
+BR_BRASS = BR_THEMES[BRACKET_THEME]["brass"]
+BR_SILVER = BR_THEMES[BRACKET_THEME]["silver"]
+BR_COPPER = BR_THEMES[BRACKET_THEME]["copper"]
+BR_BRONZE = BR_THEMES[BRACKET_THEME]["bronze"]
+BR_LIVE = BR_THEMES[BRACKET_THEME]["live"]
+BR_LIVE_FILL = BR_THEMES[BRACKET_THEME]["live_fill"]
+BR_LIVE_TEXT = BR_THEMES[BRACKET_THEME]["live_text"]
+BR_RADIUS = BR_THEMES[BRACKET_THEME]["radius"]
+BR_TITLE_FAMILY = BR_THEMES[BRACKET_THEME]["title_family"]
+BR_NAME_FAMILY = BR_THEMES[BRACKET_THEME]["name_family"]
+BRACKET_THEME_KEY = "bracket_theme"
+
+
+def apply_bracket_theme(name: str) -> bool:
+    """Переключает палитру/типографику сетки (глобальные токены читает рендер)."""
+    global BRACKET_THEME, BR_BG, BR_HEAD, BR_SURFACE, BR_LINE, BR_TEXT, BR_MUTED
+    global BR_DIM, BR_BRASS, BR_SILVER, BR_COPPER, BR_BRONZE
+    global BR_LIVE, BR_LIVE_FILL, BR_LIVE_TEXT, BR_RADIUS, BR_TITLE_FAMILY, BR_NAME_FAMILY
+    name = (name or "").strip().lower()
+    if name not in BR_THEMES:
+        return False
+    t = BR_THEMES[name]
+    BRACKET_THEME = name
+    BR_BG, BR_HEAD, BR_SURFACE = t["bg"], t["head"], t["surface"]
+    BR_LINE, BR_TEXT, BR_MUTED = t["line"], t["text"], t["muted"]
+    BR_DIM, BR_BRASS, BR_SILVER = t["dim"], t["brass"], t["silver"]
+    BR_COPPER, BR_BRONZE = t["copper"], t["bronze"]
+    BR_LIVE, BR_LIVE_FILL, BR_LIVE_TEXT = t["live"], t["live_fill"], t["live_text"]
+    BR_RADIUS, BR_TITLE_FAMILY, BR_NAME_FAMILY = (
+        t["radius"], t["title_family"], t["name_family"])
+    return True
+
+
+async def load_bracket_theme() -> None:
+    try:
+        saved = await get_setting(BRACKET_THEME_KEY)
+    except Exception:
+        saved = None
+    if saved:
+        apply_bracket_theme(str(saved))
+
+
+async def save_bracket_theme(name: str) -> None:
+    apply_bracket_theme(name)
+    try:
+        await set_setting(BRACKET_THEME_KEY, name)
+    except Exception as e:
+        logger.warning(f"bracket theme save failed: {e}")
+
+
+@router.message(F.text.startswith("/bracket_theme"))
+async def cmd_bracket_theme(message: Message):
+    """Три направления оформления сетки — чтобы выбрать, а не гадать."""
+    member = await get_member(message.from_user.id)
+    if not member or not is_any_admin(member):
+        await message.answer("Оформление сетки меняет администрация.")
+        return
+    rows = []
+    for name in ("protocol", "board", "ledger"):
+        mark = "выбрано: " if name == BRACKET_THEME else ""
+        rows.append((
+            f"{mark}{BR_THEME_LABELS[name]} — {BR_THEME_DESCRIPTIONS[name]}",
+            f"btheme:{name}",
+        ))
+    await message.answer(
+        "Оформление сетки. Выбери направление — сразу пришлю превью на последнем турнире.",
+        reply_markup=simple_list_keyboard(rows),
+    )
+
+
+@router.callback_query(F.data.startswith("btheme:"))
+async def cb_bracket_theme(call: CallbackQuery):
+    member = await get_member(call.from_user.id)
+    if not member or not is_any_admin(member):
+        await call.answer("⛔ Нет прав", show_alert=True)
+        return
+    name = call.data.split(":", 1)[1]
+    if not apply_bracket_theme(name):
+        await call.answer("Неизвестное оформление", show_alert=True)
+        return
+    await save_bracket_theme(name)
+    await call.answer("Применено")
+    text = f"{BR_THEME_LABELS[name]} — {BR_THEME_DESCRIPTIONS[name]}"
+    try:
+        await call.message.edit_text(text)
+    except Exception:
+        pass
+    rows = get_tournaments(limit=1)
+    png = _render_for_row(rows[0]) if rows else None
+    if png:
+        await call.message.answer_photo(
+            BufferedInputFile(png, filename=f"bracket_{name}.png"),
+            caption=text,
+        )
+    else:
+        await call.message.answer(text + "\nПревью появится после первого турнира.")
 
 
 def render_bracket_image(columns, title: str, subtitle: str = "",
@@ -1505,22 +1652,40 @@ def render_bracket_image(columns, title: str, subtitle: str = "",
 
         img = Image.new("RGB", (width, height), BR_BG)
         draw = ImageDraw.Draw(img)
-        f_title = _load_font(31)
-        f_meta = _load_font(13)
+        f_title = _load_font(31, BR_TITLE_FAMILY)
+        f_meta = _load_font(13, BR_TITLE_FAMILY)
         f_rank = _load_font(13)
-        f_name = _load_font(21)
+        f_name = _load_font(21, BR_NAME_FAMILY)
         f_stage = _load_font(12)
-        f_slot = _load_font(18)
+        f_slot = _load_font(18, BR_NAME_FAMILY)
         f_small = _load_font(13)
 
-        # шапка: заголовок слева, служебная метка справа, тонкая линия снизу
+        # сколько матчей реально идёт прямо сейчас (обе команды известны, итога нет)
+        live_cells = 0
+        for _c, _col in enumerate(columns):
+            if _c == 0:
+                continue
+            for _v in _col:
+                _raw = _clean_team(_v)
+                if " vs " in _raw and not _raw.endswith(("ждёт", "ждет")):
+                    live_cells += 1
+        word = ("матч" if live_cells % 10 == 1 and live_cells % 100 != 11
+                else "матча" if 2 <= live_cells % 10 <= 4 and not 12 <= live_cells % 100 <= 14
+                else "матчей")
+
+        # шапка: заголовок слева, справа — короткий статус строчными буквами
         draw.rectangle([0, 0, width, header_h], fill=BR_HEAD)
         draw.rectangle([pad, 30, pad + 3, 66], fill=BR_BRASS)
         draw.text((pad + 18, 26), _fit_text(draw, title, f_title, width - pad * 2 - 190),
                   font=f_title, fill=BR_TEXT)
-        meta = "ПОБЕДИТЕЛИ" if placements else ("СЕТКА" if not solo else "SHOWDOWN")
+        if live_cells:
+            meta, meta_color = f"идёт {live_cells} {word}", BR_LIVE
+        elif placements:
+            meta, meta_color = "призовые места", BR_MUTED
+        else:
+            meta, meta_color = "сетка турнира", BR_MUTED
         draw.text((width - pad - draw.textlength(meta, font=f_meta), 32),
-                  meta, font=f_meta, fill=BR_MUTED)
+                  meta, font=f_meta, fill=meta_color)
         draw.line([(0, header_h), (width, header_h)], fill=BR_LINE, width=1)
 
         # призёры: место + название, разделены волосяными линиями
@@ -1554,13 +1719,12 @@ def render_bracket_image(columns, title: str, subtitle: str = "",
             col_positions.append(centers)
             x = pad + c * (box_w + gap_x)
             is_active = active_col is not None and c == active_col
-            label_text = stage_label(c).upper()
+            label_text = stage_label(c)
             draw.text((x, label_y), _fit_text(draw, label_text, f_stage, box_w),
-                      font=f_stage, fill=(126, 201, 160) if is_active else BR_MUTED)
+                      font=f_stage, fill=BR_LIVE if is_active else BR_MUTED)
             if is_active:
-                # тонкая зелёная черта + подпись «текущий раунд»
                 bar_w = min(box_w, draw.textlength(label_text, font=f_stage) + 4)
-                draw.rectangle([x, label_y + 17, x + bar_w, label_y + 19], fill=BR_WIN)
+                draw.rectangle([x, label_y + 17, x + bar_w, label_y + 18], fill=BR_LIVE)
 
         # коннекторы рисуются первыми и уходят под карточки
         for c in range(1, len(columns)):
@@ -1577,47 +1741,85 @@ def render_bracket_image(columns, title: str, subtitle: str = "",
                 draw.line([(mid_x, y_cur), (x_cur, y_cur)], fill=BR_LINE, width=2)
 
         placeholder_words = ("Победитель", "Свободный слот", "Слот ", "ждёт", "?")
+        stage_words = ("1/2 финала", "1/4 финала", "1/8 финала", "1/16 финала",
+                       "Полуфинал", "Финал", "Предварительный раунд")
+        live_count = 0
         for c, col in enumerate(columns):
             x = pad + c * (box_w + gap_x)
             for i, name in enumerate(col):
                 cy = col_positions[c][i]
                 raw = _clean_team(name)
                 is_bye = raw.strip().upper() == "BYE"
-                is_placeholder = any(w in raw for w in placeholder_words) or raw.strip() in ("—", "")
-                advanced = (not is_placeholder) and (not is_bye) and c > 0
-                if is_bye:
-                    outline, fill, color = (34, 40, 48), (14, 17, 22), BR_DIM
-                elif is_placeholder:
-                    outline, fill, color = (34, 40, 48), (14, 17, 22), BR_MUTED
-                elif advanced:
-                    outline, fill, color = BR_WIN, (16, 24, 21), (207, 232, 217)
+                in_stage_name = raw.strip() in stage_words
+                is_placeholder = in_stage_name or any(w in raw for w in placeholder_words) \
+                    or raw.strip() in ("—", "")
+                is_waiting = raw.endswith("ждёт") or raw.endswith("ждет")
+                # матч в игре: обе команды известны, победитель ещё не записан
+                is_live = (not is_placeholder) and (not is_waiting) and (" vs " in raw) and c > 0
+                # прошедший дальше: имя команды оказалось в следующем раунде
+                is_advanced = (not is_placeholder) and (not is_waiting) \
+                    and (not is_live) and (not is_bye) and c > 0
+
+                if is_live:
+                    outline, fill, color = BR_LIVE, BR_LIVE_FILL, BR_LIVE_TEXT
+                    live_count += 1
+                elif is_advanced:
+                    outline, fill, color = BR_LINE, BR_SURFACE, BR_TEXT
+                elif is_waiting:
+                    outline, fill, color = BR_LINE, BR_HEAD, BR_MUTED
+                elif is_placeholder or is_bye:
+                    outline, fill, color = BR_LINE, BR_HEAD, BR_DIM
                 else:
-                    outline, fill, color = (52, 60, 72), BR_SURFACE, BR_TEXT
+                    outline, fill, color = BR_MUTED, BR_SURFACE, BR_TEXT
+
                 draw.rounded_rectangle(
                     [x, cy - box_h / 2, x + box_w, cy + box_h / 2],
-                    radius=6, fill=fill, outline=outline, width=1,
+                    radius=BR_RADIUS, fill=fill,
+                    outline=outline, width=2 if is_live else 1,
                 )
-                if advanced:
-                    draw.rectangle([x, cy - box_h / 2 + 5, x + 3, cy + box_h / 2 - 5], fill=BR_WIN)
+                if is_live or is_advanced:
+                    strip = BR_LIVE if is_live else BR_MUTED
+                    draw.rectangle([x, cy - box_h / 2 + 5, x + 3, cy + box_h / 2 - 5],
+                                   fill=strip)
+
                 label = "BYE" if is_bye else raw
-                draw.text((x + 14, cy - 11),
-                          _fit_text(draw, label, f_slot, box_w - 28),
-                          font=f_slot, fill=color)
+                if is_live:
+                    # подпись «идёт» — без капса и без легенды над сеткой
+                    tag = "идёт"
+                    tag_w = draw.textlength(tag, font=f_small) + 14
+                    tx0 = x + box_w - tag_w - 8
+                    draw.rounded_rectangle([tx0, cy - 9, tx0 + tag_w, cy + 9],
+                                           radius=max(2, BR_RADIUS),
+                                           fill=fill, outline=BR_LIVE, width=1)
+                    draw.text((tx0 + 7, cy - 6), tag, font=f_small, fill=BR_LIVE_TEXT)
+                    draw.text((x + 14, cy - 11),
+                              _fit_text(draw, label, f_slot, box_w - 28 - tag_w),
+                              font=f_slot, fill=color)
+                else:
+                    draw.text((x + 14, cy - 11),
+                              _fit_text(draw, label, f_slot, box_w - 28),
+                              font=f_slot, fill=color)
 
         # предварительный раунд
         if playin:
             y0 = bottom + 48
-            draw.text((pad, y0), "ПРЕДВАРИТЕЛЬНЫЙ РАУНД", font=f_stage,
-                      fill=(126, 201, 160) if active_playin else BR_MUTED)
+            draw.text((pad, y0), "Предварительный раунд", font=f_stage,
+                      fill=BR_LIVE if active_playin else BR_MUTED)
             if active_playin:
-                draw.rectangle([pad, y0 + 17, pad + 128, y0 + 19], fill=BR_WIN)
+                draw.rectangle([pad, y0 + 17, pad + 128, y0 + 18], fill=BR_LIVE)
             for i, (a, b) in enumerate(playin):
                 px = pad + (i % 2) * (box_w + gap_x)
                 py = y0 + 30 + (i // 2) * 26
-                draw.text((px, py),
-                          _fit_text(draw, f"{_clean_team(a)}  ·  {_clean_team(b)}",
-                                    f_slot, box_w + gap_x - 24),
-                          font=f_slot, fill=BR_TEXT)
+                pair_text = f"{_clean_team(a)} vs {_clean_team(b)}"
+                if active_playin:
+                    draw.ellipse([px, py + 7, px + 7, py + 14], fill=BR_LIVE)
+                    draw.text((px + 14, py),
+                              _fit_text(draw, pair_text, f_slot, box_w + gap_x - 38),
+                              font=f_slot, fill=BR_LIVE_TEXT)
+                else:
+                    draw.text((px, py),
+                              _fit_text(draw, pair_text, f_slot, box_w + gap_x - 24),
+                              font=f_slot, fill=BR_TEXT)
 
         # матч за 3-4 места: обычная карточка с акцентной полосой
         if third_h:
@@ -1625,10 +1827,11 @@ def render_bracket_image(columns, title: str, subtitle: str = "",
             if playin:
                 y0 = bottom + playin_block + 40
             box3_w = min(width - pad * 2, box_w * 2 + gap_x)
-            draw.rounded_rectangle([pad, y0, pad + box3_w, y0 + 92], radius=8,
+            draw.rounded_rectangle([pad, y0, pad + box3_w, y0 + 92],
+                                   radius=BR_RADIUS + 2,
                                    fill=BR_SURFACE, outline=BR_LINE, width=1)
             draw.rectangle([pad, y0 + 1, pad + 3, y0 + 91], fill=BR_COPPER)
-            draw.text((pad + 20, y0 + 14), "МАТЧ ЗА 3-4 МЕСТА",
+            draw.text((pad + 20, y0 + 14), "Матч за 3–4 места",
                       font=f_stage, fill=BR_COPPER)
             a = _clean_team(third.get("side_a") or "ждёт полуфинала")
             b = _clean_team(third.get("side_b") or "ждёт полуфинала")
@@ -2537,6 +2740,10 @@ async def on_tournament_scheduler_start(**kwargs):
     if bot is None:
         logger.warning("tournament scheduler: bot not available on startup")
         return
+    try:
+        await load_bracket_theme()
+    except Exception as e:
+        logger.warning(f"bracket theme load failed: {e}")
     try:
         asyncio.create_task(tournament_scheduler_task(bot))
         logger.info("tournament scheduler task created")
@@ -4301,7 +4508,8 @@ async def cmd_show_system_commands_guide(message: Message):
         "🛠 Развертывание и конфиг: \n"
         "• /SetupBotVigarikThreads — Авто-создание топиков логов в чате и привязка к БД.\n"
         "• /reload_config — Перезагрузка ролей и топиков из config.py на лету.\n"
-        "• get_id — Напишите это слово в любом топике, чтобы узнать его точный ID чата.\n\n"
+        "• get_id — Напишите это слово в любом топике, чтобы узнать его точный ID чата.\n"
+        "• /bracket_theme — три варианта оформления сетки турнира (Протокол / Табло / Журнал).\n\n"
         "🏆 Управление сезонами пуша Основы: \n"
         "• /start_season — Запуск нового сезона (техническая фиксация).\n"
         "• /check_season — Финиш сезона, опрос Brawl Stars API и вывод отчета по штрафникам.\n\n"
