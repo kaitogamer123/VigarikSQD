@@ -746,9 +746,15 @@ async def cmd_min_top(message: Message):
     trophies, live = await _player_trophies(member or {})
     goal = None
     for g in await get_push_goals():
-        if int(g["user_id"]) == user_id:
-            goal = g.get("goal")
-            break
+        gw = g.get("user_id")
+        if gw is None:  # старые записи без user_id — пропускаем, не падаем
+            continue
+        try:
+            if int(gw) == user_id:
+                goal = g.get("goal")
+                break
+        except (TypeError, ValueError):
+            continue
     text = _mintop_text(mins)
     text += "\n" + _mintop_progress_text(trophies, live, goal, mins, clan)
     text += "\nЛигу бот не видит — её администрация проверяет вручную. "
