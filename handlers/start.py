@@ -1,10 +1,7 @@
-"""
-Обработчик команды /start и первичная авторизация по кланам через API.
-"""
+""" Обработчик команды /start и первичная авторизация по кланам через API. """
 import logging
-
 from aiogram import Router, types, F, Bot
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import ReplyKeyboardRemove
@@ -20,11 +17,9 @@ from utils.admin_logger import bot_events_logger
 logger = bot_events_logger
 router = Router()
 
-
 class RegistrationState(StatesGroup):
     # ИСПРАВЛЕНО: Состояние choosing_clan удалено, так как API определяет клан автоматически
     entering_nick = State()
-
 
 @router.message(CommandStart(), F.chat.type == "private")
 async def cmd_start(message: types.Message, state: FSMContext, bot: Bot):
@@ -59,7 +54,6 @@ async def cmd_start(message: types.Message, state: FSMContext, bot: Bot):
     logger.info(' 🔎 Проверяю кланы...')
     clans = await get_user_clans(bot, user_id)
     logger.info(f' 📊 Найденные кланы: {clans if clans else "НИЧЕГО НЕ НАЙДЕНО"}')
-
     has_access = bool(clans)
 
     # Логируем проверку каждого клана для отладки
@@ -70,11 +64,9 @@ async def cmd_start(message: types.Message, state: FSMContext, bot: Bot):
 
     if not clans:
         logger.warning(f"❌ ДОСТУП ЗАПРЕЩЕН - {user_id} (@{username}) ни в одном чате клана")
-
         # ВСЕГДА отправляем диагностический отчёт в админ-чат (даже если это обычный юзер)
         try:
             from utils.admin_logger import log_bot_event
-
             diag_lines = [
                 f"❌ ДОСТУП ЗАПРЕЩЕН для пользователя: {user_id} @{username}",
                 f"В admins.txt: {'ДА' if user_id in INITIAL_ADMINS else 'НЕТ'}",
@@ -82,7 +74,6 @@ async def cmd_start(message: types.Message, state: FSMContext, bot: Bot):
                 "",
                 "📊 Детальная проверка по кланам:"
             ]
-
             for clan_key, chat_info in CLAN_CHATS.items():
                 try:
                     member = await bot.get_chat_member(chat_id=chat_info['chat_id'], user_id=user_id)
@@ -95,7 +86,6 @@ async def cmd_start(message: types.Message, state: FSMContext, bot: Bot):
                     logger.error(f" Ошибка в {clan_key}: {e}")
 
             diag_text = "\n".join(diag_lines)
-
             # Отправляем как WARNING чтобы увидеть в админ-топике
             await log_bot_event(
                 bot=bot,
@@ -129,7 +119,7 @@ async def cmd_start(message: types.Message, state: FSMContext, bot: Bot):
         logger.info(f"✅ Юзер уже зарегистрирован - показываю главное меню")
         await message.answer(
             f"Привет, {message.from_user.first_name}! Это главное меню бота ViGarik Squad. 🎮\n"
-            f"Вы зарегистрированы в клане: <b>{CLAN_DISPLAY.get(member['clan'], member['clan']).upper()}</b>",
+            f"Вы зарегистрированы в клане: {CLAN_DISPLAY.get(member['clan'], member['clan']).upper()} ",
             parse_mode="HTML",
             reply_markup=main_menu(member)
         )
@@ -151,8 +141,8 @@ async def cmd_start(message: types.Message, state: FSMContext, bot: Bot):
     logger.info(f"🎮 Запускаю регистрацию - прошу тег Brawl Stars")
     await message.answer(
         f"Привет, @{username or message.from_user.first_name}! Это приветственное сообщение бота ViGarik Squad. 👋\n\n"
-        f"Для верификации вашего аккаунта введите ваш <b>точный игровой тег Brawl Stars</b> "
-        f"(например, <code>#9PJYV82CC</code> или <code>9PJYV82CC</code>):",
+        f"Для верификации вашего аккаунта введите ваш точный игровой тег Brawl Stars "
+        f"(например, #9PJYV82CC или 9PJYV82CC ):",
         parse_mode="HTML",
         reply_markup=ReplyKeyboardRemove()
     )
@@ -160,3 +150,46 @@ async def cmd_start(message: types.Message, state: FSMContext, bot: Bot):
     # Сохраняем базовую роль для последующего апсерта в registration.py
     await state.update_data(role=current_role)
     await state.set_state(RegistrationState.entering_nick)
+
+
+# ─── Отключение массовых ЛС-уведомлений от бота ─────────────────────────────
+# Храним флаг в готовой таблице system_settings (vigarik.db) — миграций не нужно.
+DM_MUTE_PREFIX = "dm_mute_"
+
+
+def dm_mute_key(user_id: int) -> str:
+    return f"{DM_MUTE_PREFIX}{int(user_id)}"
+
+
+async def is_dm_muted(user_id: int) -> bool:
+    """True — пользователь отключил массовые уведомления (рассылки/анонсы турниров)."""
+    try:
+        return (await db.get_setting(dm_mute_key(user_id))) == "1"
+    except Exception:
+        return False
+
+
+@router.message(Command("notify_off"), F.chat.type == "private")
+async def cmd_notify_off(message: types.Message):
+    """Игрок отключает массовые ЛС-уведомления. Сервисные ответы остаются."""
+    await db.set_setting(dm_mute_key(message.from_user.id), "1")
+    await message.answer(
+        "🔕 Массовые уведомления отключены.\n\n"
+        "Больше не буду присылать в ЛС общие рассылки и анонсы турниров.\n"
+        "Сервисные ответы на твои действия (заявки, конфликты, результаты) остаются — "
+        "без них бот не сможет вести диалог.\n\n"
+        "Включить обратно: /notify_on",
+        parse_mode="HTML",
+    )
+    logger.info(f"🔕 {message.from_user.id} @{message.from_user.username} отключил ЛС-уведомления")
+
+
+@router.message(Command("notify_on"), F.chat.type == "private")
+async def cmd_notify_on(message: types.Message):
+    """Игрок включает массовые ЛС-уведомления обратно."""
+    await db.set_setting(dm_mute_key(message.from_user.id), "0")
+    await message.answer(
+        "🔔 Массовые уведомления снова включены. Анонсы и рассылки будут приходить в ЛС.",
+        parse_mode="HTML",
+    )
+    logger.info(f"🔔 {message.from_user.id} @{message.from_user.username} включил ЛС-уведомления")
