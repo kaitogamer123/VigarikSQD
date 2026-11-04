@@ -7,9 +7,10 @@ from typing import Any
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import LinkPreviewOptions
+from aiogram.utils.markdown import html_decoration as hd
 
 import database as db
-from config import CLAN_CHATS, CLAN_TAGS, ROSTER_TOPICS
+from config import CLAN_CHATS, CLAN_DISPLAY, CLAN_TAGS, ROSTER_TOPICS, ADMIN_CHAT_ID
 from services.api_service import get_player_profile
 from utils.formatting import format_roster
 from league.league_db import cancel_pending_departure, handle_clan_departure
@@ -17,6 +18,10 @@ from utils.clan_account_service import get_all_twinks, get_clan_twinks, update_t
 
 logger = logging.getLogger(__name__)
 NEXT_UPDATE_TIME = datetime.now() + timedelta(hours=1)
+
+# Уведомление о переходе игрока между кланами сети шлём в админ-чат один раз
+# до перезапуска процесса (иначе ежечасный цикл спамил бы один и тот же переход).
+_NOTIFIED_CLAN_MOVES: set = set()
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
@@ -223,6 +228,28 @@ async def auto_update_trophies_task(bot: Bot) -> None:
                                 f"Игрок {member.get('game_nick')} перешёл из {clan_key} "
                                 f"в {actual_network_clan}; ожидается решение администрации."
                             )
+                            # ИСПРАВЛЕНО: переход теперь уходит ещё и в чат администрации,
+                            # иначе админы видели только логи на сервере. Пишем один раз
+                            # до перезапуска (иначе ежечасный цикл спамит дубли).
+                            move_key = (int(user_id), str(clan_key), str(actual_network_clan))
+                            if move_key not in _NOTIFIED_CLAN_MOVES:
+                                _NOTIFIED_CLAN_MOVES.add(move_key)
+                                try:
+                                    nick = hd.quote(str(member.get("game_nick") or user_id))
+                                    uname = member.get("username")
+                                    mention = (f"@{hd.quote(str(uname))}" if uname
+                                               and str(uname) != "unknown" else f"ID {user_id}")
+                                    await bot.send_message(
+                                        ADMIN_CHAT_ID,
+                                        f"🔁 <b>Переход по игре:</b> {mention} ({nick}) перешёл "
+                                        f"из <b>{hd.quote(CLAN_DISPLAY.get(clan_key, clan_key))}</b> "
+                                        f"в <b>{hd.quote(CLAN_DISPLAY.get(actual_network_clan, actual_network_clan))}</b>.\n"
+                                        f"Ожидается решение администрации: при входе игрока в чат "
+                                        f"нового клана бот задаст вопрос с кнопками.",
+                                        parse_mode="HTML",
+                                    )
+                                except Exception as e:
+                                    logger.error(f"Не удалось уведомить админ-чат о переходе {user_id}: {e}")
                             continue
                         logger.info(
                             f"Игрок {member.get('game_nick')} ({tag}) вышел из {clan_key}."
