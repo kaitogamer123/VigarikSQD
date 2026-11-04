@@ -1478,11 +1478,15 @@ TOURNAMENT_STATUS_LABEL = {
 
 
 def get_active_tournaments():
-    """Активные турниры: идёт регистрация или турнир уже запущен."""
+    """Активные турниры: идёт регистрация или уже запущен.
+
+    Терпим к легаси-статусам из старой сборки (например, 'announced'):
+    прячем только финализированные/отменённые, остальное показываем.
+    """
     init_tournament_tables()
     conn = db.get_connection()
     rows = conn.execute(
-        "SELECT * FROM tournaments WHERE status IN ('registration', 'running') "
+        "SELECT * FROM tournaments WHERE status NOT IN ('finished', 'cancelled') "
         "ORDER BY starts_at, id"
     ).fetchall()
     conn.close()
