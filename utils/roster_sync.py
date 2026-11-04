@@ -228,28 +228,47 @@ async def auto_update_trophies_task(bot: Bot) -> None:
                                 f"Игрок {member.get('game_nick')} перешёл из {clan_key} "
                                 f"в {actual_network_clan}; ожидается решение администрации."
                             )
-                            # ИСПРАВЛЕНО: переход теперь уходит ещё и в чат администрации,
-                            # иначе админы видели только логи на сервере. Пишем один раз
-                            # до перезапуска (иначе ежечасный цикл спамит дубли).
+                            # ИСПРАВЛЕНО: переход теперь создаёт панель с кнопками в чате
+                            # администрации сразу, а не только после входа игрока в новый чат.
+                            # Пишем один раз до перезапуска (иначе ежечасный цикл спамит дубли).
                             move_key = (int(user_id), str(clan_key), str(actual_network_clan))
                             if move_key not in _NOTIFIED_CLAN_MOVES:
                                 _NOTIFIED_CLAN_MOVES.add(move_key)
+                                sent = False
                                 try:
-                                    nick = hd.quote(str(member.get("game_nick") or user_id))
+                                    # Ленивый импорт: clan_conflicts сам импортирует roster_sync,
+                                    # прямой module-level импорт дал бы цикл.
+                                    from aiogram.types import User as TgUser
+                                    from handlers.clan_conflicts import send_clan_conflict_prompt
                                     uname = member.get("username")
-                                    mention = (f"@{hd.quote(str(uname))}" if uname
-                                               and str(uname) != "unknown" else f"ID {user_id}")
-                                    await bot.send_message(
-                                        ADMIN_CHAT_ID,
-                                        f"🔁 <b>Переход по игре:</b> {mention} ({nick}) перешёл "
-                                        f"из <b>{hd.quote(CLAN_DISPLAY.get(clan_key, clan_key))}</b> "
-                                        f"в <b>{hd.quote(CLAN_DISPLAY.get(actual_network_clan, actual_network_clan))}</b>.\n"
-                                        f"Ожидается решение администрации: при входе игрока в чат "
-                                        f"нового клана бот задаст вопрос с кнопками.",
-                                        parse_mode="HTML",
+                                    tg_user = TgUser(
+                                        id=int(user_id),
+                                        is_bot=False,
+                                        first_name=str(member.get("game_nick") or "Игрок"),
+                                        username=(str(uname) if uname and str(uname) != "unknown" else None),
                                     )
+                                    await send_clan_conflict_prompt(bot, tg_user, member,
+                                                                    actual_network_clan)
+                                    sent = True
                                 except Exception as e:
-                                    logger.error(f"Не удалось уведомить админ-чат о переходе {user_id}: {e}")
+                                    logger.error(f"Не удалось отправить панель конфликта для {user_id}: {e}")
+                                if not sent:
+                                    # Фоллбек: хотя бы информационное сообщение
+                                    try:
+                                        nick = hd.quote(str(member.get("game_nick") or user_id))
+                                        uname = member.get("username")
+                                        mention = (f"@{hd.quote(str(uname))}" if uname
+                                                   and str(uname) != "unknown" else f"ID {user_id}")
+                                        await bot.send_message(
+                                            ADMIN_CHAT_ID,
+                                            f"🔁 <b>Переход по игре:</b> {mention} ({nick}) перешёл "
+                                            f"из <b>{hd.quote(CLAN_DISPLAY.get(clan_key, clan_key))}</b> "
+                                            f"в <b>{hd.quote(CLAN_DISPLAY.get(actual_network_clan, actual_network_clan))}</b>.\n"
+                                            f"Ожидается решение администрации.",
+                                            parse_mode="HTML",
+                                        )
+                                    except Exception as e:
+                                        logger.error(f"Не удалось уведомить админ-чат о переходе {user_id}: {e}")
                             continue
                         logger.info(
                             f"Игрок {member.get('game_nick')} ({tag}) вышел из {clan_key}."
