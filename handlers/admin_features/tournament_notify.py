@@ -7,7 +7,14 @@ from database import get_member, get_setting
 from league import league_db as db
 from .bracket import _bracket_board, _podium, _tournament_is_over
 from .bracket_image import render_bracket_image
-from .common import _is_solo_type, _is_test, _test_mark, _tg_caption, _tour_name
+from .common import (
+    TOURNAMENT_RESULT_HINT,
+    _is_solo_type,
+    _is_test,
+    _test_mark,
+    _tg_caption,
+    _tour_name,
+)
 from .tournament_db import (
     _team_row,
     get_tournament,
@@ -19,20 +26,34 @@ from .tournament_db import (
 logger = logging.getLogger(__name__)
 
 
-async def _leader_contact(leader_id: int) -> str:
-    """Контакт лидера для связи: @username, иначе ник и ID."""
+def _user_link(user_id: int, label: str) -> str:
+    """Ссылка на профиль Telegram: имя вместо голого ID."""
+    return f'<a href="tg://user?id={int(user_id)}">{hd.quote(str(label))}</a>'
+
+
+async def _leader_contact(leader_id: int, fallback_name: str = "") -> str:
+    """Контакт для связи: @username, иначе имя ссылкой на профиль.
+
+    Для тест-ботов (отрицательный ID) возвращает имя без ID — писать им всё равно
+    некуда, а «ID -900002» только путает игроков.
+    """
+    uid = int(leader_id or 0)
+    if uid <= 0:
+        return f"{hd.quote(str(fallback_name or 'бот'))} <i>(тест-бот)</i>"
     try:
-        member = await get_member(int(leader_id))
+        member = await get_member(uid)
     except Exception:
         member = None
     if member:
-        uname = member.get("username")
-        if uname and str(uname).lower() != "unknown":
-            return f"@{uname}"
-        nick = member.get("game_nick") or member.get("first_name")
+        uname = str(member.get("username") or "").strip()
+        if uname and uname.lower() != "unknown":
+            return f"@{hd.quote(uname)}"
+        nick = member.get("game_nick") or member.get("first_name") or fallback_name
         if nick:
-            return f"{hd.quote(str(nick))} (ID {leader_id})"
-    return f"ID {leader_id}"
+            return _user_link(uid, nick)
+    if fallback_name:
+        return _user_link(uid, fallback_name)
+    return _user_link(uid, f"ID {uid}")
 
 
 async def _repost_bracket(bot: Bot, tournament_id: int):
@@ -128,7 +149,8 @@ async def _notify_next_pairs(bot: Bot, tournament_id: int):
             my_team, rival_team = _team_row(mine), _team_row(rival)
             if not my_team or not rival_team or int(my_team["leader_id"] or 0) <= 0:
                 continue
-            contact = await _leader_contact(int(rival_team["leader_id"]))
+            contact = await _leader_contact(int(rival_team["leader_id"]),
+                                            str(rival_team["name"] or ""))
             try:
                 await bot.send_message(
                     int(my_team["leader_id"]),
@@ -140,7 +162,7 @@ async def _notify_next_pairs(bot: Bot, tournament_id: int):
                        f"У вас скрим <b>{fmt_label}</b> против команды "
                        f"<b>{hd.quote(str(rival_team['name']))}</b>, "
                        f"спишитесь с их лидером: {contact}\n\n")
-                    + f"После игры отправьте результат командой /result",
+                    + TOURNAMENT_RESULT_HINT,
                     parse_mode="HTML")
                 sent += 1
             except Exception:

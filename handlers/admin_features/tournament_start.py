@@ -189,7 +189,8 @@ async def start_tournament(bot: Bot, tournament_id: int, manual_by: int = 0):
             if leader_id <= 0:  # бот тестового турнира — в ЛС не пишем
                 continue
             rival_team = by_name.get(rival)
-            contact = await _leader_contact(int(rival_team["leader_id"])) if rival_team else "—"
+            contact = await _leader_contact(int(rival_team["leader_id"]),
+                                            str(rival_team["name"] or "")) if rival_team else "—"
             rival_tag = f" [{hd.quote(str(rival_team['tag']))}]" if rival_team and rival_team["tag"] else ""
             if _is_solo_type(tournament["t_type"]):
                 msg = (

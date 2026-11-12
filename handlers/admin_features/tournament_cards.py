@@ -10,6 +10,7 @@ from utils.notify_settings import TOURNAMENT_MUTE_HINT, is_muted
 from .bracket import _bracket_text
 from .bracket_image import render_bracket_image
 from .common import (
+    TOURNAMENT_RULES_TEXT,
     TOURNAMENT_TYPES,
     _is_duo,
     _is_solo_type,
@@ -54,13 +55,15 @@ def _tournament_card(tournament, teams) -> str:
     lines.append(f"• {_limit_label(t_key)}: <b>{_limit_text(limit, t_key)}</b>")
     lines.append(f"• Начало: <b>{hd.quote(str(tournament['starts_at']))}</b>")
     lines.append("")
+    lines.append("ℹ️ Пары приходят в ЛС, результат — /result (фото + счёт).")
+    lines.append("")
     unit = _limit_unit(t_key)
     if limit is None:
         lines.append(f"📋 <b>Зарегистрировано {unit}: {len(teams)}</b> (без лимита)")
     else:
         lines.append(f"📋 <b>Зарегистрировано {unit}: {len(teams)} из {int(limit)}</b>")
     if teams:
-        shown = list(teams)[:12]
+        shown = list(teams)[:10]
         for i, t in enumerate(shown, 1):
             tag = f" [{hd.quote(str(t['tag']))}]" if t["tag"] else ""
             duo = " · <i>дуо</i>" if _is_duo(t_key, t) else ""
@@ -162,6 +165,12 @@ async def _publish_tournament_posts(bot: Bot, tournament_id: int):
                     await bot.send_message(chat_id=chat_id, message_thread_id=thread_id,
                                            text=extra, parse_mode="HTML")
             save_tournament_post(tournament_id, clan_key, chat_id, thread_id, msg.message_id)
+            # Правила — отдельным сообщением: в подпись к фото они не влезают.
+            try:
+                await bot.send_message(chat_id=chat_id, message_thread_id=thread_id,
+                                       text=TOURNAMENT_RULES_TEXT, parse_mode="HTML")
+            except Exception as e:
+                logger.debug(f"Не удалось отправить правила турнира в {clan_key}: {e}")
             ok.append(clan_key)
         except Exception as e:
             logger.warning(f"Не удалось опубликовать анонс турнира в {clan_key}: {e}")
