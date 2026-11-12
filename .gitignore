@@ -4,6 +4,11 @@ server_secrets.env
 *.env
 config_local.py
 
+# 1a. Локальные скиллы/настройки агента — на сервер не нужны
+.opencode/
+.claude/
+.agents/
+
 # 2. База данных (КРИТИЧНО! Чтобы git pull не затирал данные игроков на сервере)
 *.db
 *.sqlite3
@@ -34,7 +39,8 @@ logs/
 backups/
 backup_*/
 
-# 8. Фон сетки турнира: бинарник живёт только на сервере
-assets/tournament_bg.jpg
+# 8. Фон сетки турнира: остальные варианты не коммитим, но рабочий jpg — да,
+# иначе после git reset --hard на сервере он пропадает.
 assets/tournament_bg.png
 assets/tournament_bg.jpeg
+!assets/tournament_bg.jpg
