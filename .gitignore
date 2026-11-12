@@ -47,3 +47,10 @@ backup_*/
 assets/tournament_bg.png
 assets/tournament_bg.jpeg
 !assets/tournament_bg.jpg
+
+# 9. Одноразовые скрипты, отладка и файлы-копии — в репозитории им не место
+tg_id_finder.py
+test.py
+clean_db.py
+fix_db.py
+* — копия.*

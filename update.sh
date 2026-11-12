@@ -8,7 +8,9 @@ PIP="venv/bin/pip"
 SCREEN_NAME="vigarik_bot"
 REQ_FILE="requirements.txt"
 BACKUP_DIR="$(mktemp -d /tmp/vigarik-config.XXXXXX)"
-PRESERVE_FILES=("config.py" "admins.txt" "server_secrets.env" "config_local.py")
+# config.py больше не хранит токены (они в server_secrets.env), поэтому его
+# можно безопасно обновлять из git. Локальные секреты и список админов — нет.
+PRESERVE_FILES=("admins.txt" "server_secrets.env" "config_local.py")
 
 restore_server_files() {
     for file in "${PRESERVE_FILES[@]}"; do

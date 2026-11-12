@@ -1,8 +1,10 @@
 """
 Конфигурация бота ViGarik Squad
 """
-BRAWL_API_TOKEN="***REMOVED***"
-TOKEN = "***REMOVED***"
+# Токены берутся из server_secrets.env (или переменных окружения), а не из git.
+from utils.secrets import BRAWL_API_TOKEN, TELEGRAM_TOKEN
+
+TOKEN = TELEGRAM_TOKEN
 
 # ID закрытого чата администрации для логов (пока оставляем None, бот сам его заполнит)
 LOGS_CHAT_ID = -1003900162237
