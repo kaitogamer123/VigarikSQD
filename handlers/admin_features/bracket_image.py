@@ -395,6 +395,7 @@ def _render_legacy(columns, title: str, subtitle: str = "",
         f_name = _load_font(21, BR_NAME_FAMILY)
         f_stage = _load_font(12)
         f_slot = _load_font(18, BR_NAME_FAMILY)
+        f_slot2 = _load_font(15, BR_NAME_FAMILY)
         f_small = _load_font(13)
 
         # сколько матчей реально идёт прямо сейчас (обе команды известны, итога нет)
@@ -515,22 +516,34 @@ def _render_legacy(columns, title: str, subtitle: str = "",
                                    fill=strip)
 
                 label = "BYE" if is_bye else raw
+                tag = "идёт" if is_live else ""
+                tag_w = draw.textlength(tag, font=f_small) + 14 if is_live else 0
+                avail = box_w - 28 - tag_w
+                # Оба ника не влезают в одну строку — рисуем в две, шрифтом мельче.
+                two_lines = " vs " in label and draw.textlength(label, font=f_slot) > avail
+                if two_lines:
+                    name_a, name_b = label.split(" vs ", 1)
+                    line_w = box_w - 28
+                    draw.text((x + 14, cy - 20),
+                              _fit_text(draw, name_a, f_slot2,
+                                        line_w - (tag_w + 6 if is_live else 0)),
+                              font=f_slot2, fill=color)
+                    draw.text((x + 14, cy + 2),
+                              _fit_text(draw, name_b, f_slot2, line_w),
+                              font=f_slot2, fill=color)
+                else:
+                    font = f_slot2 if draw.textlength(label, font=f_slot) > avail else f_slot
+                    draw.text((x + 14, cy - 11 if font is f_slot else cy - 9),
+                              _fit_text(draw, label, font, avail),
+                              font=font, fill=color)
                 if is_live:
                     # подпись «идёт» — без капса и без легенды над сеткой
-                    tag = "идёт"
-                    tag_w = draw.textlength(tag, font=f_small) + 14
+                    tag_y = cy - 20 if two_lines else cy - 9
                     tx0 = x + box_w - tag_w - 8
-                    draw.rounded_rectangle([tx0, cy - 9, tx0 + tag_w, cy + 9],
+                    draw.rounded_rectangle([tx0, tag_y, tx0 + tag_w, tag_y + 18],
                                            radius=max(2, BR_RADIUS),
                                            fill=fill, outline=BR_LIVE, width=1)
-                    draw.text((tx0 + 7, cy - 6), tag, font=f_small, fill=BR_LIVE_TEXT)
-                    draw.text((x + 14, cy - 11),
-                              _fit_text(draw, label, f_slot, box_w - 28 - tag_w),
-                              font=f_slot, fill=color)
-                else:
-                    draw.text((x + 14, cy - 11),
-                              _fit_text(draw, label, f_slot, box_w - 28),
-                              font=f_slot, fill=color)
+                    draw.text((tx0 + 7, tag_y + 3), tag, font=f_small, fill=BR_LIVE_TEXT)
 
         # предварительный раунд
         if playin:

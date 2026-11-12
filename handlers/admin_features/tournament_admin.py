@@ -116,8 +116,10 @@ def _tournament_admin_kb(tournament) -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton(text="🚫 Отменить турнир",
                                           callback_data=f"trnadm:cancel:{tid}")])
     if tournament["status"] == "registration":
-        add_label = "➕ Добавить игрока" if _is_solo_type(tournament["t_type"]) else "➕ Добавить состав"
-        rows.append([InlineKeyboardButton(text=add_label, callback_data=f"trnadm:addlist:{tid}:0")])
+        # 1V1 и ShowDown — соло: участники регистрируются сами, добавлять нечего.
+        if not _is_solo_type(tournament["t_type"]):
+            rows.append([InlineKeyboardButton(text="➕ Добавить состав",
+                                              callback_data=f"trnadm:addlist:{tid}:0")])
         if _is_test(tournament):
             rows.append([
                 InlineKeyboardButton(text="🤖 +1 бот", callback_data=f"trnadm:addbot:{tid}"),
@@ -676,6 +678,9 @@ async def admin_tournament_add_list(call: CallbackQuery):
     if tournament["status"] != "registration":
         await call.answer("Регистрация уже закрыта", show_alert=True)
         return
+    if _is_solo_type(tournament["t_type"]):
+        await call.answer("В 1V1 и ShowDown участники регистрируются сами", show_alert=True)
+        return
     markup, total, page = _add_list_kb(tid, tournament, int(page_s))
     if total == 0:
         await call.answer("Все доступные составы уже добавлены", show_alert=True)
@@ -702,6 +707,9 @@ async def admin_tournament_add_pick(call: CallbackQuery, bot: Bot):
     tournament = get_tournament(tid)
     if not tournament or tournament["status"] != "registration":
         await call.answer("Регистрация уже закрыта", show_alert=True)
+        return
+    if _is_solo_type(tournament["t_type"]):
+        await call.answer("В 1V1 и ShowDown участники регистрируются сами", show_alert=True)
         return
     added, msg = await _add_composition(tid, tournament, lid)
     if added:

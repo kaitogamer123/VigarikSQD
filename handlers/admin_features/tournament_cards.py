@@ -216,7 +216,7 @@ async def _broadcast_tournament_dm(bot: Bot, tournament_id: int):
                     int(creator),
                     "🧪 <b>ТЕСТОВЫЙ ТУРНИР</b>\n"
                     "(массовая рассылка в ЛС отключена, это сообщение видишь только ты)\n\n"
-                    + base_text + inline,
+                    + base_text + inline + TOURNAMENT_MUTE_HINT,
                     parse_mode="HTML", reply_markup=kb,
                 )
                 sent = 1
