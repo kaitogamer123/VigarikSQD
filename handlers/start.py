@@ -1,7 +1,7 @@
 """ Обработчик команды /start и первичная авторизация по кланам через API. """
 import logging
 from aiogram import Router, types, F, Bot
-from aiogram.filters import CommandStart, Command
+from aiogram.filters import CommandStart, Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import ReplyKeyboardRemove
@@ -10,6 +10,12 @@ import database as db
 from utils.chat_check import get_user_clans, is_chat_admin
 from config import CLAN_DISPLAY, INITIAL_ADMINS, CLAN_CHATS
 from utils.keyboards import main_menu
+from utils.notify_settings import (
+    is_muted as _nm_is_muted,
+    mute_state,
+    set_muted,
+    state_text,
+)
 
 # Используем общий файловый логгер для событий бота
 from utils.admin_logger import bot_events_logger
@@ -153,43 +159,85 @@ async def cmd_start(message: types.Message, state: FSMContext, bot: Bot):
 
 
 # ─── Отключение массовых ЛС-уведомлений от бота ─────────────────────────────
-# Храним флаг в готовой таблице system_settings (vigarik.db) — миграций не нужно.
-DM_MUTE_PREFIX = "dm_mute_"
+# Флаги живут в system_settings (vigarik.db): общий и по разделам.
+# Режимы: /notify_off (всё), /notify_off tournaments, /notify_off scrims.
+_NOTIFY_KIND_ALIASES = {
+    "tournaments": "tournaments", "tournament": "tournaments", "tour": "tournaments",
+    "турниры": "tournaments", "турнир": "tournaments", "турнирах": "tournaments",
+    "scrims": "scrims", "scrim": "scrims",
+    "скримы": "scrims", "скрим": "scrims", "скримах": "scrims",
+}
 
 
 def dm_mute_key(user_id: int) -> str:
-    return f"{DM_MUTE_PREFIX}{int(user_id)}"
+    return f"dm_mute_{int(user_id)}"
 
 
 async def is_dm_muted(user_id: int) -> bool:
     """True — пользователь отключил массовые уведомления (рассылки/анонсы турниров)."""
-    try:
-        return (await db.get_setting(dm_mute_key(user_id))) == "1"
-    except Exception:
-        return False
+    return await _nm_is_muted(user_id)
+
+
+def _parse_notify_kind(args: str | None):
+    """None — режим «всё», строка-тип — только этот раздел, '?' — непонятный аргумент."""
+    arg = str(args or "").strip().lower()
+    if not arg:
+        return None
+    return _NOTIFY_KIND_ALIASES.get(arg, "?")
+
+
+def _kind_title(kind: str | None) -> str:
+    return {None: "все уведомления", "tournaments": "турниры", "scrims": "скримы"}[kind]
 
 
 @router.message(Command("notify_off"), F.chat.type == "private")
-async def cmd_notify_off(message: types.Message):
-    """Игрок отключает массовые ЛС-уведомления. Сервисные ответы остаются."""
-    await db.set_setting(dm_mute_key(message.from_user.id), "1")
+async def cmd_notify_off(message: types.Message, command: CommandObject):
+    """Отключает ЛС-уведомления: всё, только турниры или только скримы."""
+    kind = _parse_notify_kind(command.args)
+    if kind == "?":
+        await message.answer(
+            "Не понял, что отключать. Варианты:\n"
+            "<code>/notify_off tournaments</code> — уведомления о турнирах\n"
+            "<code>/notify_off scrims</code> — уведомления о скримах\n"
+            "<code>/notify_off</code> — всё сразу",
+            parse_mode="HTML",
+        )
+        return
+    await set_muted(message.from_user.id, True, kind)
+    state = await mute_state(message.from_user.id)
     await message.answer(
-        "🔕 Массовые уведомления отключены.\n\n"
-        "Больше не буду присылать в ЛС общие рассылки и анонсы турниров.\n"
+        f"🔕 Отключил {_kind_title(kind)}.\n\n"
+        f"Сейчас:\n{state_text(state)}\n\n"
         "Сервисные ответы на твои действия (заявки, конфликты, результаты) остаются — "
         "без них бот не сможет вести диалог.\n\n"
-        "Включить обратно: /notify_on",
+        "Включить обратно: <code>/notify_on</code> "
+        "(или <code>/notify_on tournaments</code> / <code>/notify_on scrims</code>)",
         parse_mode="HTML",
     )
-    logger.info(f"🔕 {message.from_user.id} @{message.from_user.username} отключил ЛС-уведомления")
+    logger.info(f"🔕 {message.from_user.id} @{message.from_user.username} отключил: {_kind_title(kind)}")
 
 
 @router.message(Command("notify_on"), F.chat.type == "private")
-async def cmd_notify_on(message: types.Message):
-    """Игрок включает массовые ЛС-уведомления обратно."""
-    await db.set_setting(dm_mute_key(message.from_user.id), "0")
+async def cmd_notify_on(message: types.Message, command: CommandObject):
+    """Включает ЛС-уведомления обратно: всё, только турниры или только скримы."""
+    kind = _parse_notify_kind(command.args)
+    if kind == "?":
+        await message.answer(
+            "Не понял, что включать. Варианты:\n"
+            "<code>/notify_on tournaments</code> — турниры\n"
+            "<code>/notify_on scrims</code> — скримы\n"
+            "<code>/notify_on</code> — всё сразу",
+            parse_mode="HTML",
+        )
+        return
+    if kind is None:
+        for k in (None, "tournaments", "scrims"):
+            await set_muted(message.from_user.id, False, k)
+    else:
+        await set_muted(message.from_user.id, False, kind)
+    state = await mute_state(message.from_user.id)
     await message.answer(
-        "🔔 Массовые уведомления снова включены. Анонсы и рассылки будут приходить в ЛС.",
+        f"🔔 Включил: {_kind_title(kind)}.\n\nСейчас:\n{state_text(state)}",
         parse_mode="HTML",
     )
-    logger.info(f"🔔 {message.from_user.id} @{message.from_user.username} включил ЛС-уведомления")
+    logger.info(f"🔔 {message.from_user.id} @{message.from_user.username} включил: {_kind_title(kind)}")

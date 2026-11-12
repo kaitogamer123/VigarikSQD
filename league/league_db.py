@@ -4,7 +4,9 @@ import os
 import sqlite3
 from typing import Optional
 
-DB_PATH = os.path.join("league", "league.db")
+# Переопределяется переменной окружения — удобно гонять бота на тестовой БД
+# (например, наполненной tools/seed_test_data.py), не трогая боевую league.db.
+DB_PATH = os.getenv("LEAGUE_DB_PATH") or os.path.join("league", "league.db")
 DEPUTY_PERMISSIONS = ("can_review_apps", "can_invite", "can_kick", "can_toggle_open")
 
 # MMR-настройки скримов: (победа за карту, поражение за карту)
