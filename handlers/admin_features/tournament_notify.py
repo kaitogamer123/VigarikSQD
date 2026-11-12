@@ -7,7 +7,7 @@ from database import get_member, get_setting
 from league import league_db as db
 from .bracket import _bracket_board, _podium, _tournament_is_over
 from .bracket_image import render_bracket_image
-from .common import _is_test, _test_mark, _tg_caption, _tour_name
+from .common import _is_solo_type, _is_test, _test_mark, _tg_caption, _tour_name
 from .tournament_db import (
     _team_row,
     get_tournament,
@@ -112,6 +112,7 @@ async def _notify_next_pairs(bot: Bot, tournament_id: int):
     tournament = get_tournament(tournament_id)
     fmt = str(tournament["t_format"] or "BO3").upper()
     fmt_label = "Бо3" if fmt == "BO3" else ("Бо5" if fmt == "BO5" else fmt)
+    solo = _is_solo_type(tournament["t_type"])
     sent = 0
     for m in get_tournament_matches(tournament_id):
         if m["status"] != "pending" or not m["team_a_id"] or not m["team_b_id"]:
@@ -125,17 +126,21 @@ async def _notify_next_pairs(bot: Bot, tournament_id: int):
             else f"круг {m['round_no']}"
         for mine, rival in ((m["team_a_id"], m["team_b_id"]), (m["team_b_id"], m["team_a_id"])):
             my_team, rival_team = _team_row(mine), _team_row(rival)
-            if not my_team or not rival_team:
+            if not my_team or not rival_team or int(my_team["leader_id"] or 0) <= 0:
                 continue
             contact = await _leader_contact(int(rival_team["leader_id"]))
             try:
                 await bot.send_message(
                     int(my_team["leader_id"]),
                     f"⚔️ <b>Турнир {hd.quote(_tour_name(tournament))}</b> — {stage}!\n\n"
-                    f"У вас скрим <b>{fmt_label}</b> против команды "
-                    f"<b>{hd.quote(str(rival_team['name']))}</b>, "
-                    f"спишитесь с их лидером: {contact}\n\n"
-                    f"После игры отправьте результат командой /result",
+                    + (f"У вас матч <b>{fmt_label}</b> против игрока "
+                       f"<b>{hd.quote(str(rival_team['name']))}</b>, "
+                       f"свяжитесь с соперником: {contact}\n\n"
+                       if solo else
+                       f"У вас скрим <b>{fmt_label}</b> против команды "
+                       f"<b>{hd.quote(str(rival_team['name']))}</b>, "
+                       f"спишитесь с их лидером: {contact}\n\n")
+                    + f"После игры отправьте результат командой /result",
                     parse_mode="HTML")
                 sent += 1
             except Exception:

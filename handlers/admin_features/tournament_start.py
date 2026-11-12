@@ -6,7 +6,14 @@ from aiogram.utils.markdown import html_decoration as hd
 from league import league_db as db
 from .bracket import generate_first_round
 from .bracket_image import render_bracket_image
-from .common import TOURNAMENT_TYPES, _is_test, _test_mark, _tg_caption, _tour_name
+from .common import (
+    TOURNAMENT_TYPES,
+    _is_solo_type,
+    _is_test,
+    _test_mark,
+    _tg_caption,
+    _tour_name,
+)
 from .tournament_cards import _tournament_topics
 from .tournament_db import (
     _team_name,
@@ -70,7 +77,9 @@ def _final_card(tournament, teams) -> str:
     lines.append("🗓 <b>Расписание первого игрового этапа:</b>")
     lines.extend(_schedule_block(int(tournament["id"])))
     lines.append("")
-    lines.append("Лидерам отправлены контакты соперников в ЛС. Удачи!")
+    lines.append("Участникам отправлены контакты соперников в ЛС. Удачи!"
+                 if _is_solo_type(t_key) else
+                 "Лидерам отправлены контакты соперников в ЛС. Удачи!")
     return "\n".join(lines)
 
 
@@ -177,14 +186,19 @@ async def start_tournament(bot: Bot, tournament_id: int, manual_by: int = 0):
             if not team:
                 continue
             leader_id = int(team["leader_id"])
+            if leader_id <= 0:  # бот тестового турнира — в ЛС не пишем
+                continue
             rival_team = by_name.get(rival)
             contact = await _leader_contact(int(rival_team["leader_id"])) if rival_team else "—"
             rival_tag = f" [{hd.quote(str(rival_team['tag']))}]" if rival_team and rival_team["tag"] else ""
-            if tournament["t_type"] == "showdown":
+            if _is_solo_type(tournament["t_type"]):
                 msg = (
                     f"🏆 <b>Турнир {hd.quote(_tour_name(tournament))} начался!</b>\n\n"
-                    f"У вас игра против <b>{hd.quote(str(rival))}</b>{rival_tag}.\n"
-                    f"Свяжитесь с соперником: {contact}"
+                    f"У вас матч <b>{fmt_label}</b> против "
+                    f"<b>{hd.quote(str(rival))}</b>{rival_tag}.\n"
+                    f"Свяжитесь с соперником: {contact}\n\n"
+                    f"После игры отправьте результат командой /result "
+                    f"(фото + счёт)."
                 )
             else:
                 msg = (
@@ -205,15 +219,20 @@ async def start_tournament(bot: Bot, tournament_id: int, manual_by: int = 0):
     # Лидерам команд с автопроходом: вы стартуете со следующего круга
     for auto_name in auto_names:
         team = by_name.get(auto_name)
-        if not team:
+        if not team or int(team["leader_id"]) <= 0:
             continue
         try:
             await bot.send_message(
                 int(team["leader_id"]),
                 f"🏆 <b>Турнир {hd.quote(_tour_name(tournament))} начался!</b>\n\n"
-                f"⏭ Ваша команда <b>{hd.quote(auto_name)}</b> проходит "
-                f"<b>сразу в следующий круг</b> (соперника на первом этапе нет). "
-                f"Пара определится после завершения плей-ина — бот пришлёт уведомление.",
+                + (
+                    f"⏭ Ты <b>{hd.quote(auto_name)}</b> проходишь "
+                    f"<b>сразу в следующий круг</b> (соперника на первом этапе нет). "
+                    if _is_solo_type(tournament["t_type"]) else
+                    f"⏭ Ваша команда <b>{hd.quote(auto_name)}</b> проходит "
+                    f"<b>сразу в следующий круг</b> (соперника на первом этапе нет). "
+                )
+                + "Пара определится после завершения плей-ина — бот пришлёт уведомление.",
                 parse_mode="HTML",
             )
             notified += 1

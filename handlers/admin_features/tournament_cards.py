@@ -4,12 +4,15 @@ import logging
 from aiogram import Router, F, Bot
 from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.utils.markdown import html_decoration as hd
+from config import CLAN_CHATS
 from league import league_db as db
 from utils.notify_settings import TOURNAMENT_MUTE_HINT, is_muted
 from .bracket import _bracket_text
 from .bracket_image import render_bracket_image
 from .common import (
     TOURNAMENT_TYPES,
+    _is_duo,
+    _is_solo_type,
     _is_test,
     _limit_label,
     _limit_text,
@@ -44,7 +47,10 @@ def _tournament_card(tournament, teams) -> str:
     lines.append(f"• Тип: <b>{TOURNAMENT_TYPES.get(t_key, t_key)}</b>")
     if t_key != "showdown":
         lines.append(f"• Формат матча: <b>{tournament['t_format'] or '—'}</b>")
-        lines.append(f"• От команды играет: <b>{_players_per_team(t_key)}</b>")
+        if t_key == "1v1":
+            lines.append("• Играет: <b>1 игрок (соло)</b>")
+        else:
+            lines.append(f"• От команды играет: <b>{_players_per_team(t_key)}</b>")
     lines.append(f"• {_limit_label(t_key)}: <b>{_limit_text(limit, t_key)}</b>")
     lines.append(f"• Начало: <b>{hd.quote(str(tournament['starts_at']))}</b>")
     lines.append("")
@@ -57,7 +63,8 @@ def _tournament_card(tournament, teams) -> str:
         shown = list(teams)[:12]
         for i, t in enumerate(shown, 1):
             tag = f" [{hd.quote(str(t['tag']))}]" if t["tag"] else ""
-            lines.append(f"{i}. {hd.quote(str(t['name'] or 'Без названия'))}{tag}")
+            duo = " · <i>дуо</i>" if _is_duo(t_key, t) else ""
+            lines.append(f"{i}. {hd.quote(str(t['name'] or 'Без названия'))}{tag}{duo}")
         if len(teams) > len(shown):
             lines.append(f"… и ещё {len(teams) - len(shown)}")
     else:
@@ -65,6 +72,20 @@ def _tournament_card(tournament, teams) -> str:
     lines.append("")
     if t_key == "showdown":
         lines.append("Участвовать может любой игрок сети — жми кнопку ниже.")
+    elif t_key == "1v1":
+        lines.append(
+            "1V1 — соло: состав не нужен. Зарегистрироваться может любой игрок "
+            "наших кланов — главное быть зарегистрированным в боте и состоять "
+            "в клановом чате. Жми кнопку ниже."
+        )
+    elif t_key == "2v2":
+        lines.append(
+            "Регистрирует команду <b>лидер состава</b>. В состав может входить "
+            "любой участник из трёх кланов сети.\n"
+            "👥 Если в составе ровно <b>2 игрока</b> — команда помечается "
+            "<b>дуо</b> (играет только вдвоём). С тремя и более игроками "
+            "регистрация проходит без дополнительных проверок."
+        )
     else:
         lines.append(
             "Регистрирует команду <b>лидер состава</b>. В состав может входить "
@@ -177,18 +198,25 @@ async def _broadcast_tournament_dm(bot: Bot, tournament_id: int):
                 composition = db.get_user_league(int(creator))
             except Exception:
                 composition = None
-            kb = _tournament_reg_kb(tournament_id) if (
-                t_key == "showdown" or (composition and int(composition["leader_id"]) == int(creator))
-            ) else None
+            if _is_solo_type(t_key):
+                kb = _tournament_reg_kb(tournament_id)
+                inline = ("1V1 — соло: можешь зарегистрироваться сам:"
+                          if t_key == "1v1" else "Это соло-режим: можешь зарегистрироваться сам:")
+            elif composition and int(composition["leader_id"]) == int(creator):
+                kb = _tournament_reg_kb(tournament_id)
+                inline = "Ты лидер состава — можешь зарегистрировать команду:"
+            elif not composition:
+                kb = None
+                inline = no_team_text
+            else:
+                kb = None
+                inline = "Зарегистрировать команду может только лидер состава."
             try:
                 await bot.send_message(
                     int(creator),
                     "🧪 <b>ТЕСТОВЫЙ ТУРНИР</b>\n"
                     "(массовая рассылка в ЛС отключена, это сообщение видишь только ты)\n\n"
-                    + base_text
-                    + ("Ты лидер состава — можешь зарегистрировать команду:"
-                       if kb else no_team_text if not composition else
-                       "Зарегистрировать команду может только лидер состава."),
+                    + base_text + inline,
                     parse_mode="HTML", reply_markup=kb,
                 )
                 sent = 1
@@ -210,26 +238,39 @@ async def _broadcast_tournament_dm(bot: Bot, tournament_id: int):
         if await is_muted(int(user_id), "tournaments"):
             muted += 1
             continue
-        try:
-            composition = db.get_user_league(int(user_id))
-        except Exception:
-            composition = None
-        if t_key == "showdown":
-            text = base_text + "Это соло-режим: участвовать может любой игрок сети."
-            kb = _tournament_reg_kb(tournament_id)
-        elif not composition:
-            text = base_text + no_team_text
-            kb = None
-            no_team += 1
-        elif int(composition["leader_id"]) == int(user_id):
-            text = base_text + "Ты лидер состава — можешь зарегистрировать команду прямо сейчас:"
-            kb = _tournament_reg_kb(tournament_id)
+        if _is_solo_type(t_key):
+            if t_key == "1v1" and str(m.get("clan") or "") not in CLAN_CHATS:
+                text = base_text + (
+                    "1V1 — только для игроков наших кланов: нужно состоять "
+                    "в клановом чате сети (Squad / Academy / Events)."
+                )
+                kb = None
+                no_team += 1
+            else:
+                text = base_text + (
+                    "1V1 — соло: состав не нужен, зарегистрируйся сам:"
+                    if t_key == "1v1" else
+                    "Это соло-режим: участвовать может любой игрок сети."
+                )
+                kb = _tournament_reg_kb(tournament_id)
         else:
-            text = base_text + (
-                f"Твой состав: <b>{hd.quote(str(composition['name']))}</b>. "
-                "Зарегистрировать команду на турнир может только лидер состава."
-            )
-            kb = None
+            try:
+                composition = db.get_user_league(int(user_id))
+            except Exception:
+                composition = None
+            if not composition:
+                text = base_text + no_team_text
+                kb = None
+                no_team += 1
+            elif int(composition["leader_id"]) == int(user_id):
+                text = base_text + "Ты лидер состава — можешь зарегистрировать команду прямо сейчас:"
+                kb = _tournament_reg_kb(tournament_id)
+            else:
+                text = base_text + (
+                    f"Твой состав: <b>{hd.quote(str(composition['name']))}</b>. "
+                    "Зарегистрировать команду на турнир может только лидер состава."
+                )
+                kb = None
         try:
             await bot.send_message(user_id, text + TOURNAMENT_MUTE_HINT,
                                    parse_mode="HTML", reply_markup=kb)

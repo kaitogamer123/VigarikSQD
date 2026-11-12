@@ -13,11 +13,15 @@ from utils.keyboards import (
     admin_participants_keyboard, admin_scrims_keyboard,
 )
 from utils.admin_logger import log_admin_action
+from league import league_db as db
+from league.competitive_common import _normalise_scheduled
 from .common import (
     TOURNAMENT_GUARD_TEXTS,
     TOURNAMENT_STATUS_LABEL,
     TOURNAMENT_TYPES,
     _cb_is_admin,
+    _is_duo,
+    _is_solo_type,
     _is_test,
     _limit_label,
     _limit_text,
@@ -26,13 +30,15 @@ from .common import (
     _test_mark,
 )
 from .states import TournamentAdminStates
-from .tournament_cards import _refresh_tournament_posts
+from .tournament_cards import _publish_tournament_posts, _refresh_tournament_posts
 from .tournament_db import (
     _collect_tournament_for_delete,
     _drop_tournament_rows,
     _m_get,
     _pending_full_matches,
     _team_name,
+    add_tournament_team,
+    create_tournament_row,
     get_active_tournaments,
     get_tournament,
     get_tournament_posts,
@@ -82,8 +88,9 @@ def _tournament_admin_card(tournament, teams) -> str:
         for i, t in enumerate(teams, 1):
             tag = f" [{hd.quote(str(t['tag']))}]" if t["tag"] else ""
             when = str(t["registered_at"] or "")[:16]
+            duo = " · дуо" if _is_duo(t_key, t) else ""
             lines.append(
-                f"{i}. {hd.quote(str(t['name'] or 'Без названия'))}{tag} "
+                f"{i}. {hd.quote(str(t['name'] or 'Без названия'))}{tag}{duo} "
                 f"— лидер ID {t['leader_id']} · {hd.quote(when)}"
             )
     else:
@@ -94,7 +101,7 @@ def _tournament_admin_card(tournament, teams) -> str:
 def _tournament_admin_kb(tournament) -> InlineKeyboardMarkup:
     tid = int(tournament["id"])
     rows = [
-        [InlineKeyboardButton(text="✏️ Изменить лимит команд", callback_data=f"trnadm:limit:{tid}")],
+        [InlineKeyboardButton(text="✏️ Изменить лимит", callback_data=f"trnadm:limit:{tid}")],
         [InlineKeyboardButton(text="🔄 Обновить список", callback_data=f"trnadm:open:{tid}")],
         [InlineKeyboardButton(text="🔁 Обновить пост в топиках", callback_data=f"trnadm:repost:{tid}")],
     ]
@@ -108,9 +115,116 @@ def _tournament_admin_kb(tournament) -> InlineKeyboardMarkup:
                                           callback_data=f"trnadm:res:{tid}")])
         rows.append([InlineKeyboardButton(text="🚫 Отменить турнир",
                                           callback_data=f"trnadm:cancel:{tid}")])
+    if tournament["status"] == "registration":
+        add_label = "➕ Добавить игрока" if _is_solo_type(tournament["t_type"]) else "➕ Добавить состав"
+        rows.append([InlineKeyboardButton(text=add_label, callback_data=f"trnadm:addlist:{tid}:0")])
+        if _is_test(tournament):
+            rows.append([
+                InlineKeyboardButton(text="🤖 +1 бот", callback_data=f"trnadm:addbot:{tid}"),
+                InlineKeyboardButton(text="🤖 Заполнить до лимита", callback_data=f"trnadm:fillbots:{tid}"),
+            ])
+    if tournament["status"] in ("cancelled", "finished"):
+        rows.append([InlineKeyboardButton(text="🔄 Пересоздать турнир",
+                                          callback_data=f"trnadm:recreate:{tid}")])
     rows.append([InlineKeyboardButton(text="🗑 Удалить турнир", callback_data=f"trnadm:del:{tid}")])
     rows.append([InlineKeyboardButton(text="◀️ К списку турниров", callback_data="trnadm:list")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+ADD_PAGE_SIZE = 8
+BOT_TAG = "BOT"
+
+
+def _available_leagues(tid: int, tournament):
+    """Составы, которых ещё нет в турнире (для ручной записи модератором)."""
+    teams = get_tournament_teams(tid)
+    used_leagues = {int(t["league_id"]) for t in teams if t["league_id"]}
+    used_leaders = {int(t["leader_id"]) for t in teams}
+    result = []
+    for league in db.get_verified_leagues():
+        if _is_solo_type(tournament["t_type"]):
+            if int(league["leader_id"]) in used_leaders:
+                continue
+        elif int(league["id"]) in used_leagues:
+            continue
+        result.append(league)
+    return result
+
+
+def _add_list_kb(tid: int, tournament, page: int = 0):
+    """Клавиатура «Добавить состав/игрока» с постраничным списком."""
+    leagues = _available_leagues(tid, tournament)
+    pages = max(1, (len(leagues) + ADD_PAGE_SIZE - 1) // ADD_PAGE_SIZE)
+    page = max(0, min(int(page or 0), pages - 1))
+    builder = InlineKeyboardBuilder()
+    for league in leagues[page * ADD_PAGE_SIZE:(page + 1) * ADD_PAGE_SIZE]:
+        title = f"{league['name']} [{league['tag']}]"
+        builder.button(text=title[:60], callback_data=f"trnadm:addpick:{tid}:{league['id']}")
+    builder.adjust(1)
+    rows = list(builder.as_markup().inline_keyboard)
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀️ Назад", callback_data=f"trnadm:addlist:{tid}:{page - 1}"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton(text="Далее ▶️", callback_data=f"trnadm:addlist:{tid}:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text="◀️ К турниру", callback_data=f"trnadm:open:{tid}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows), len(leagues), page
+
+
+async def _add_composition(tid: int, tournament, league_id: int):
+    """Записывает состав (или его лидера как соло-игрока) на турнир вручную."""
+    league = db.get_league(int(league_id))
+    if not league:
+        return False, "Состав не найден"
+    teams = get_tournament_teams(tid)
+    limit = tournament["team_limit"]
+    if limit is not None and len(teams) >= int(limit):
+        return False, "Все места уже заняты"
+    if _is_solo_type(tournament["t_type"]):
+        leader_id = int(league["leader_id"])
+        if any(int(t["leader_id"]) == leader_id for t in teams):
+            return False, "Этот игрок уже в списке"
+        member = await get_member(leader_id) or {}
+        name = member.get("game_nick") or member.get("username") or str(league["name"])
+        tag = member.get("player_tag") or str(league["tag"] or "")
+        added = add_tournament_team(tid, None, leader_id, name, tag)
+        target = f"игрок «{name}»"
+    else:
+        if any(t["league_id"] and int(t["league_id"]) == int(league["id"]) for t in teams):
+            return False, "Этот состав уже в списке"
+        added = add_tournament_team(tid, int(league["id"]), int(league["leader_id"]),
+                                    league["name"], league["tag"])
+        target = f"состав «{league['name']}»"
+    if not added:
+        return False, "Не удалось добавить (возможно, уже в списке)"
+    return True, f"✅ Добавлен {target}"
+
+
+def _add_bots(tid: int, tournament, count: int) -> int:
+    """Добавляет тестовых ботов. Возвращает, сколько реально добавлено."""
+    teams = get_tournament_teams(tid)
+    limit = tournament["team_limit"]
+    if limit is not None:
+        free = int(limit) - len(teams)
+        if free <= 0:
+            return 0
+        count = min(count, free)
+    count = max(0, min(count, 32))
+    used_names = {str(t["name"]) for t in teams}
+    used_leaders = {int(t["leader_id"]) for t in teams}
+    added = 0
+    idx = 1
+    while added < count and idx <= 200:
+        name = f"Бот {idx}"
+        leader_id = -(900000 + idx)
+        idx += 1
+        if name in used_names or leader_id in used_leaders:
+            continue
+        if add_tournament_team(tid, None, leader_id, name, BOT_TAG):
+            added += 1
+    return added
 
 
 @router.message(F.text == "📋 Текущие турниры")
@@ -149,11 +263,12 @@ async def admin_tournaments_list(call: CallbackQuery):
 
 
 @router.callback_query(F.data.startswith("trnadm:open:"))
-async def admin_tournament_open(call: CallbackQuery):
+async def admin_tournament_open(call: CallbackQuery, state: FSMContext):
     """Карточка турнира: параметры + актуальный список поданных составов."""
     if not await _cb_is_admin(call.from_user.id):
         await call.answer("⛔ Нет прав", show_alert=True)
         return
+    await state.clear()  # выходим из «пересоздания» при возврате к карточке
     tid = int(call.data.rsplit(":", 1)[-1])
     tournament = get_tournament(tid)
     if not tournament:
@@ -542,3 +657,208 @@ async def admin_match_set_winner(call: CallbackQuery, bot: Bot):
             [InlineKeyboardButton(text="◀️ К карточке турнира", callback_data=f"trnadm:open:{tid}")],
         ]))
     await call.answer("Итог записан")
+
+
+# ─── Ручная запись участников, боты и пересоздание турнира ────────────────────
+
+@router.callback_query(F.data.startswith("trnadm:addlist:"))
+async def admin_tournament_add_list(call: CallbackQuery):
+    """Список составов/игроков, которых модератор может записать вручную."""
+    if not await _cb_is_admin(call.from_user.id):
+        await call.answer("⛔ Нет прав", show_alert=True)
+        return
+    _, _, tid_s, page_s = call.data.split(":")
+    tid = int(tid_s)
+    tournament = get_tournament(tid)
+    if not tournament:
+        await call.answer("Турнир не найден", show_alert=True)
+        return
+    if tournament["status"] != "registration":
+        await call.answer("Регистрация уже закрыта", show_alert=True)
+        return
+    markup, total, page = _add_list_kb(tid, tournament, int(page_s))
+    if total == 0:
+        await call.answer("Все доступные составы уже добавлены", show_alert=True)
+        return
+    what = "игрока" if _is_solo_type(tournament["t_type"]) else "состав"
+    await call.message.edit_text(
+        f"➕ <b>Добавить {what} на турнир #{tid}</b>\n\n"
+        f"Доступно: <b>{total}</b> (стр. {page + 1}).\n"
+        f"Нажми на {what} — он сразу попадёт в список участников, "
+        f"без уведомлений в ЛС.",
+        parse_mode="HTML", reply_markup=markup,
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("trnadm:addpick:"))
+async def admin_tournament_add_pick(call: CallbackQuery, bot: Bot):
+    """Модератор выбирает состав из списка — записываем на турнир."""
+    if not await _cb_is_admin(call.from_user.id):
+        await call.answer("⛔ Нет прав", show_alert=True)
+        return
+    _, _, tid_s, lid_s = call.data.split(":")
+    tid, lid = int(tid_s), int(lid_s)
+    tournament = get_tournament(tid)
+    if not tournament or tournament["status"] != "registration":
+        await call.answer("Регистрация уже закрыта", show_alert=True)
+        return
+    added, msg = await _add_composition(tid, tournament, lid)
+    if added:
+        await _refresh_tournament_posts(bot, tid)
+    await call.answer(msg, show_alert=not added)
+    markup, total, page = _add_list_kb(tid, tournament, 0)
+    if total:
+        what = "игрока" if _is_solo_type(tournament["t_type"]) else "состав"
+        await call.message.edit_text(
+            f"{msg}\n\n➕ <b>Добавить {what} на турнир #{tid}</b>\n\n"
+            f"Осталось доступно: <b>{total}</b>. Нажми на следующего {what}.",
+            parse_mode="HTML", reply_markup=markup,
+        )
+    else:
+        teams = get_tournament_teams(tid)
+        await call.message.edit_text(
+            f"{msg}\n\n" + _tournament_admin_card(tournament, teams),
+            parse_mode="HTML", reply_markup=_tournament_admin_kb(tournament),
+        )
+
+
+@router.callback_query(F.data.startswith("trnadm:addbot:"))
+async def admin_tournament_add_bot(call: CallbackQuery, bot: Bot):
+    """Добавляет одного бота в тестовый турнир."""
+    if not await _cb_is_admin(call.from_user.id):
+        await call.answer("⛔ Нет прав", show_alert=True)
+        return
+    tid = int(call.data.rsplit(":", 1)[-1])
+    tournament = get_tournament(tid)
+    if not tournament:
+        await call.answer("Турнир не найден", show_alert=True)
+        return
+    if not _is_test(tournament):
+        await call.answer("Боты доступны только в тестовых турнирах", show_alert=True)
+        return
+    if tournament["status"] != "registration":
+        await call.answer("Регистрация уже закрыта", show_alert=True)
+        return
+    added = _add_bots(tid, tournament, 1)
+    if not added:
+        await call.answer("Свободных мест нет — подними лимит", show_alert=True)
+        return
+    await _refresh_tournament_posts(bot, tid)
+    teams = get_tournament_teams(tid)
+    await call.message.edit_text(
+        _tournament_admin_card(tournament, teams),
+        parse_mode="HTML", reply_markup=_tournament_admin_kb(tournament))
+    await call.answer(f"🤖 Добавлен бот (всего участников: {len(teams)})")
+
+
+@router.callback_query(F.data.startswith("trnadm:fillbots:"))
+async def admin_tournament_fill_bots(call: CallbackQuery, bot: Bot):
+    """Заполняет тестовый турнир ботами до лимита."""
+    if not await _cb_is_admin(call.from_user.id):
+        await call.answer("⛔ Нет прав", show_alert=True)
+        return
+    tid = int(call.data.rsplit(":", 1)[-1])
+    tournament = get_tournament(tid)
+    if not tournament:
+        await call.answer("Турнир не найден", show_alert=True)
+        return
+    if not _is_test(tournament):
+        await call.answer("Боты доступны только в тестовых турнирах", show_alert=True)
+        return
+    if tournament["status"] != "registration":
+        await call.answer("Регистрация уже закрыта", show_alert=True)
+        return
+    if tournament["team_limit"] is None:
+        await call.answer("Сначала задай лимит турнира", show_alert=True)
+        return
+    added = _add_bots(tid, tournament, 32)
+    if not added:
+        await call.answer("Свободных мест нет", show_alert=True)
+        return
+    await _refresh_tournament_posts(bot, tid)
+    teams = get_tournament_teams(tid)
+    await call.message.edit_text(
+        _tournament_admin_card(tournament, teams),
+        parse_mode="HTML", reply_markup=_tournament_admin_kb(tournament))
+    await call.answer(f"🤖 Добавлено ботов: {added} (всего участников: {len(teams)})")
+
+
+@router.callback_query(F.data.startswith("trnadm:recreate:"))
+async def admin_tournament_recreate_ask(call: CallbackQuery, state: FSMContext):
+    """Пересоздание закрытого турнира с переносом всех участников."""
+    if not await _cb_is_admin(call.from_user.id):
+        await call.answer("⛔ Нет прав", show_alert=True)
+        return
+    tid = int(call.data.rsplit(":", 1)[-1])
+    tournament = get_tournament(tid)
+    if not tournament:
+        await call.answer("Турнир не найден", show_alert=True)
+        return
+    if tournament["status"] not in ("cancelled", "finished"):
+        await call.answer("Пересоздать можно только завершённый или отменённый турнир",
+                          show_alert=True)
+        return
+    teams = get_tournament_teams(tid)
+    await state.set_state(TournamentAdminStates.waiting_recreate_datetime)
+    await state.update_data(recreate_from=tid)
+    await call.message.edit_text(
+        f"🔄 <b>Пересоздание турнира #{tid}</b>\n\n"
+        f"Тип: <b>{TOURNAMENT_TYPES.get(tournament['t_type'], tournament['t_type'])}</b>, "
+        f"зарегистрировано: <b>{len(teams)}</b>.\n"
+        f"Все участники перенесутся автоматически — в ЛС никому писать не будем.\n\n"
+        "🗓 Напиши новую дату и время начала, например: <code>25.12 19:00</code>.\n"
+        "Для отмены отправь /cancel.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="◀️ К турниру", callback_data=f"trnadm:open:{tid}"),
+        ]]),
+    )
+    await call.answer()
+
+
+@router.message(TournamentAdminStates.waiting_recreate_datetime,
+                F.text.startswith("/") | F.text.in_(TOURNAMENT_GUARD_TEXTS))
+async def admin_tournament_recreate_guard(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("❌ Пересоздание турнира отменено.", reply_markup=admin_scrims_keyboard())
+
+
+@router.message(TournamentAdminStates.waiting_recreate_datetime)
+async def admin_tournament_recreate_save(message: Message, state: FSMContext, bot: Bot):
+    """Создаёт новый турнир с теми же настройками и участниками (без ЛС)."""
+    data = await state.get_data()
+    old_id = int(data.get("recreate_from") or 0)
+    old = get_tournament(old_id)
+    if not old:
+        await state.clear()
+        await message.answer("❌ Исходный турнир не найден.", reply_markup=admin_scrims_keyboard())
+        return
+    scheduled = _normalise_scheduled(message.text or "")
+    if not scheduled:
+        await message.answer(
+            "❌ Неверный формат даты. Введи так: <code>25.12 19:00</code> "
+            "или <code>25.12.2026 19:00</code>.\nДля отмены отправь /cancel.",
+            parse_mode="HTML")
+        return
+    new_id = create_tournament_row(
+        old["t_type"], old["t_format"], old["team_limit"], scheduled,
+        old["created_by"], is_test=int(old["is_test"] or 0))
+    copied = 0
+    for t in get_tournament_teams(old_id):
+        if add_tournament_team(new_id, t["league_id"], int(t["leader_id"]),
+                               t["name"], t["tag"]):
+            copied += 1
+    await state.clear()
+    ok, failed = await _publish_tournament_posts(bot, new_id)
+    await message.answer(
+        f"✅ <b>Турнир #{new_id} пересоздан</b>\n\n"
+        f"Перенесено участников: <b>{copied}</b>.\n"
+        f"Анонс опубликован в топиках: <b>{len(ok)}</b>. "
+        f"В ЛС никому не писали — регистрация уже перенесена.",
+        parse_mode="HTML", reply_markup=admin_scrims_keyboard())
+    await log_admin_action(
+        bot=bot, admin_id=message.from_user.id,
+        admin_name=message.from_user.username or message.from_user.first_name or "admin",
+        action_text=f"🔄 Пересоздал турнир #{old_id} как #{new_id}, перенёс участников: {copied}.",
+    )

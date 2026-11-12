@@ -34,16 +34,25 @@ TOURNAMENT_GUARD_TEXTS = frozenset({
 })
 
 
+# Соло-режимы: участник регистрируется сам, без состава.
+SOLO_TYPES = ("showdown", "1v1")
+
+
+def _is_solo_type(t_type: str) -> bool:
+    """True — турнир соло (1V1 и ShowDown): играет сам игрок, а не состав."""
+    return str(t_type or "").lower() in SOLO_TYPES
+
+
 def _limit_unit(t_type: str, plural: bool = True) -> str:
-    """Единица лимита: в ShowDown играют соло-игроки, в остальных типах — команды."""
-    if t_type == "showdown":
-        return "игроков" if plural else "игроков"
+    """Единица лимита: в соло-режимах считаются игроки, в остальных — команды."""
+    if _is_solo_type(t_type):
+        return "игроков"
     return "команд" if plural else "команды"
 
 
 def _limit_label(t_type: str) -> str:
-    """Заголовок шага: «Лимит команд» или «Лимит игроков» (ShowDown)."""
-    return "Лимит игроков" if t_type == "showdown" else "Лимит команд"
+    """Заголовок лимита: «Лимит игроков» для соло-турниров, иначе «Лимит команд»."""
+    return "Лимит игроков" if _is_solo_type(t_type) else "Лимит команд"
 
 
 def _limit_text(limit, t_type: str = "") -> str:
@@ -56,6 +65,26 @@ def _limit_text(limit, t_type: str = "") -> str:
 def _players_per_team(t_type: str) -> int:
     """Сколько игроков от команды реально выходит на карту."""
     return {"1v1": 1, "2v2": 2, "3v3": 3}.get(t_type, 1)
+
+
+def _team_size(team) -> int:
+    """Сколько занятых игроков в составе команды (0 — если состава нет)."""
+    try:
+        league_id = team["league_id"]
+    except Exception:
+        return 0
+    if not league_id:
+        return 0
+    try:
+        from league import league_db as db
+        return int(db.count_occupied_members(int(league_id)))
+    except Exception:
+        return 0
+
+
+def _is_duo(t_type: str, team) -> bool:
+    """2V2-состав ровно из двух игроков — команда играет дуо."""
+    return t_type == "2v2" and _team_size(team) == 2
 
 
 def _is_test(tournament) -> bool:

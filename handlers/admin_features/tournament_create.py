@@ -19,6 +19,7 @@ from .common import (
     TOURNAMENT_GUARD_TEXTS,
     TOURNAMENT_TYPES,
     _cb_is_admin,
+    _is_solo_type,
     _limit_label,
     _limit_text,
     _limit_unit,
@@ -83,7 +84,9 @@ def _tournament_summary(data: dict) -> str:
         lines.append("• Формат матча: не применяется (ShowDown)")
     limit = data.get("t_limit")
     lines.append(f"• {_limit_label(t_key)}: <b>{_limit_text(limit, t_key)}</b>")
-    if t_key != "showdown":
+    if t_key == "1v1":
+        lines.append("• Играет: <b>1 игрок (соло, без состава)</b>")
+    elif t_key != "showdown":
         per_team = _players_per_team(t_key)
         note = f"• От каждой команды на карту выходит по {per_team} игрока"
         if limit is not None:
@@ -97,13 +100,19 @@ async def _ask_tournament_limit(call: CallbackQuery, state: FSMContext, back_to:
     data = await state.get_data()
     t_key = data.get("t_type") or ""
     per_team = _players_per_team(t_key)
+    if _is_solo_type(t_key):
+        limit_q = "Хотите ли вы задать лимит <b>игроков</b> на турнир?"
+        limit_note = ("ℹ️ Лимит считается в <b>игроках</b>: каждый участник "
+                      "регистрируется сам, состав не нужен.")
+    else:
+        limit_q = "Хотите ли вы задать лимит <b>команд</b> на турнир?"
+        limit_note = (f"ℹ️ Лимит считается в <b>командах (составах)</b>, а не в игроках: "
+                      f"в составе числится до 4 человек, а на карту от команды выходит {per_team}.")
     await state.set_state(TournamentStates.choosing_limit)
     await call.message.edit_text(
         f"👥 <b>Шаг 3. {_limit_label(t_key)}</b>\n\n"
-        f"Хотите ли вы задать лимит <b>команд</b> на турнир?\n"
-        f"Можно ввести число или оставить турнир без лимита.\n\n"
-        f"ℹ️ Лимит считается в <b>командах (составах)</b>, а не в игроках: "
-        f"в составе числится до 4 человек, а на карту от команды выходит {per_team}.",
+        f"{limit_q}\n"
+        f"Можно ввести число или оставить турнир без лимита.\n\n{limit_note}",
         parse_mode="HTML",
         reply_markup=_tournament_limit_kb(back_to),
     )
@@ -135,7 +144,8 @@ async def tournament_create_start(message: Message, state: FSMContext):
     await message.answer(
         "🏆 <b>Создание турнира</b>\n\n"
         "⚔️ <b>Шаг 1. Какой тип скрима вы хотите выбрать?</b>\n\n"
-        "ℹ️ Для 1V1 / 2V2 / 3V3 лимит задаётся в <b>командах (составах)</b>, не в игроках.\n"
+        "ℹ️ 1V1 и ShowDown — соло: лимит задаётся в <b>игроках</b>. "
+        "Для 2V2 / 3V3 — в <b>командах (составах)</b>.\n"
         f"ℹ️ При выборе <b>ShowDown</b> лимит автоматически фиксируется "
         f"на <b>{SHOWDOWN_LIMIT} игроках</b>.",
         parse_mode="HTML",
@@ -316,7 +326,8 @@ async def tournament_back(call: CallbackQuery, state: FSMContext):
         await call.message.edit_text(
             "🏆 <b>Создание турнира</b>\n\n"
             "⚔️ <b>Шаг 1. Какой тип скрима вы хотите выбрать?</b>\n\n"
-            "ℹ️ Для 1V1 / 2V2 / 3V3 лимит задаётся в <b>командах (составах)</b>, не в игроках.\n"
+            "ℹ️ 1V1 и ShowDown — соло: лимит задаётся в <b>игроках</b>. "
+        "Для 2V2 / 3V3 — в <b>командах (составах)</b>.\n"
             f"ℹ️ При выборе <b>ShowDown</b> лимит автоматически фиксируется "
             f"на <b>{SHOWDOWN_LIMIT} игроках</b>.",
             parse_mode="HTML",
@@ -328,7 +339,7 @@ async def tournament_back(call: CallbackQuery, state: FSMContext):
         await state.set_state(TournamentStates.choosing_format)
         await call.message.edit_text(
             f"Тип турнира: <b>{TOURNAMENT_TYPES.get(t_key, t_key)}</b>\n\n"
-            "🎮 <b>Шаг 2. Какой тип скрима будет между команд?</b>",
+            "🎮 <b>Шаг 2. Какой формат матча?</b>",
             parse_mode="HTML",
             reply_markup=_tournament_format_kb(),
         )

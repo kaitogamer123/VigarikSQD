@@ -31,3 +31,4 @@ class TournamentResultStates(StatesGroup):
 
 class TournamentAdminStates(StatesGroup):
     waiting_new_limit = State()
+    waiting_recreate_datetime = State()  # новая дата при пересоздании турнира

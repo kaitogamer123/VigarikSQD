@@ -244,7 +244,7 @@ async def _apply_confirmed_result(bot: Bot, tournament_id: int, match,
                    f"«{hd.quote(win_name)}»."),
     ):
         row = _team_row(team_id)
-        if row:
+        if row and int(row["leader_id"] or 0) > 0:
             try:
                 await bot.send_message(int(row["leader_id"]), text, parse_mode="HTML")
             except Exception:
