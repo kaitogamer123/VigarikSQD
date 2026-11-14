@@ -42,6 +42,11 @@ BRAWL_API_TOKEN = (
 )
 
 
+def get_secret(name: str, default: str = "") -> str:
+    """Значение из server_secrets.env или переменной окружения."""
+    return _FILE_SECRETS.get(name, "") or os.getenv(name, "").strip() or default
+
+
 def require_telegram_token() -> str:
     if not TELEGRAM_TOKEN:
         raise RuntimeError(

@@ -1,6 +1,8 @@
 """Работа с БД турниров: таблицы, команды, матчи."""
 import logging
+import random
 from datetime import datetime
+from config import is_hidden_tester
 from league import league_db as db
 
 logger = logging.getLogger(__name__)
@@ -29,6 +31,7 @@ _MIGRATE_COLUMNS = {
         "name": "TEXT DEFAULT ''",
         "tag": "TEXT DEFAULT ''",
         "registered_at": "DATETIME",
+        "seed": "INTEGER",
     },
     "tournament_matches": {
         "tournament_id": "INTEGER",
@@ -82,7 +85,7 @@ def init_tournament_tables() -> None:
         "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
     required = {
         "tournaments": {"t_type", "t_format", "team_limit", "starts_at", "status"},
-        "tournament_teams": {"tournament_id", "league_id", "leader_id", "name", "tag"},
+        "tournament_teams": {"tournament_id", "league_id", "leader_id", "name", "tag", "seed"},
         "tournament_matches": {"tournament_id", "round_no", "slot_no", "bracket",
                                "team_a_id", "team_b_id", "winner_team_id"},
         "tournament_results": {"match_id", "tournament_id", "reporter_id", "status"},
@@ -118,6 +121,7 @@ def init_tournament_tables() -> None:
             leader_id INTEGER NOT NULL,
             name TEXT DEFAULT '',
             tag TEXT DEFAULT '',
+            seed INTEGER,
             registered_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (tournament_id) REFERENCES tournaments(id) ON DELETE CASCADE
         );
@@ -209,15 +213,87 @@ def get_tournament_teams(tournament_id: int):
     init_tournament_tables()
     conn = db.get_connection()
     rows = conn.execute(
-        "SELECT * FROM tournament_teams WHERE tournament_id = ? ORDER BY registered_at, id",
+        "SELECT * FROM tournament_teams WHERE tournament_id = ? "
+        "ORDER BY (seed IS NULL) ASC, seed ASC, registered_at, id",
         (tournament_id,),
     ).fetchall()
     conn.close()
     return rows
 
 
+def _shuffle_layout(n: int):
+    """Пары первого круга и число автопроходов по правилам _bracket_layout.
+
+    Возвращает (positions, autos): positions — пары индексов в списке участников.
+    """
+    if n < 2:
+        return [], 0
+    size = 1
+    while size < n:
+        size *= 2
+    autos = size - n
+    if autos == 0:
+        return [(2 * j, 2 * j + 1) for j in range(size // 2)], 0
+    playin = n - size // 2
+    return [(autos + 2 * j, autos + 2 * j + 1) for j in range(playin)], autos
+
+
+def shuffle_tournament_teams(tournament_id: int) -> dict:
+    """Случайно перемешивает участников и сохраняет жеребьёвку в seed."""
+    teams = list(get_tournament_teams(tournament_id))
+    n = len(teams)
+    if n < 2:
+        return {}
+
+    ids = [int(t["id"]) for t in teams]
+    names = [str(t["name"] or "Команда") for t in teams]
+    positions, autos = _shuffle_layout(n)
+    current_pairs = {frozenset((ids[a], ids[b])) for a, b in positions}
+    current_autos = set(ids[:autos])
+    best = None
+    best_key = None
+
+    for _ in range(25):
+        candidate = ids[:]
+        random.shuffle(candidate)
+        if candidate == ids:
+            continue
+        cand_pairs = {frozenset((candidate[a], candidate[b])) for a, b in positions}
+        matched_pairs = len(current_pairs & cand_pairs)
+        same_autos = len(current_autos & set(candidate[:autos]))
+        same_positions = sum(1 for i, team_id in enumerate(candidate) if team_id == ids[i])
+        key = (matched_pairs, same_autos, same_positions)
+        if best_key is None or key < best_key:
+            best_key = key
+            best = candidate
+
+    if best is None:
+        # Крайний случай (например, 2 участника): любой отличный от текущего.
+        best = ids[:]
+        random.shuffle(best)
+        if best == ids:
+            best = ids[1:] + ids[:1]
+
+    conn = db.get_connection()
+    try:
+        for index, team_id in enumerate(best, 1):
+            conn.execute("UPDATE tournament_teams SET seed = ? WHERE id = ?",
+                         (index, int(team_id)))
+        conn.commit()
+    finally:
+        conn.close()
+
+    name_by_id = dict(zip(ids, names))
+    pairs = [(name_by_id[best[a]], name_by_id[best[b]]) for a, b in positions]
+    autos_names = [name_by_id[team_id] for team_id in best[:autos]]
+    return {"count": n, "pairs": pairs, "autos": autos_names}
+
+
 def add_tournament_team(tournament_id, league_id, leader_id, name, tag) -> bool:
     """Регистрирует команду (или соло-игрока в ShowDown). False — если уже зарегистрирован."""
+    # Скрытый тестер не должен светиться в турнирных списках своим ником.
+    if is_hidden_tester(leader_id):
+        name, tag = "🧪 Тест", "TEST"
     init_tournament_tables()
     conn = db.get_connection()
     try:

@@ -123,9 +123,18 @@ async def cmd_start(message: types.Message, state: FSMContext, bot: Bot):
 
     if member and member.get("registered") == 1:
         logger.info(f"✅ Юзер уже зарегистрирован - показываю главное меню")
+        if int(member.get("hidden") or 0) == 1:
+            await message.answer(
+                "Привет! Тестовый доступ активирован. 🧪\n"
+                "Ты не отображаешься в списках участников и можешь тестировать функции бота.",
+                reply_markup=main_menu(member)
+            )
+            return
+        clan_key = member["clan"]
+        clan_name = CLAN_DISPLAY.get(clan_key, clan_key or "не указан")
         await message.answer(
             f"Привет, {message.from_user.first_name}! Это главное меню бота ViGarik Squad. 🎮\n"
-            f"Вы зарегистрированы в клане: {CLAN_DISPLAY.get(member['clan'], member['clan']).upper()} ",
+            f"Вы зарегистрированы в клане: {str(clan_name).upper()} ",
             parse_mode="HTML",
             reply_markup=main_menu(member)
         )

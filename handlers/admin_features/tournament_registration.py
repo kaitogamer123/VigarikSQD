@@ -3,7 +3,7 @@ import logging
 from aiogram import Router, F, Bot
 from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.utils.markdown import html_decoration as hd
-from config import CLAN_CHATS
+from config import CLAN_CHATS, is_hidden_tester
 from database import get_member, get_setting
 from league import league_db as db
 from utils.chat_check import get_user_clans
@@ -21,6 +21,8 @@ async def _in_clan_chat(bot: Bot, user_id: int, member) -> bool:
     Живая проверка через Telegram, а если бот не видит чаты — запасной вариант
     по клану из профиля (он проставляется при регистрации в боте).
     """
+    if is_hidden_tester(user_id):
+        return True
     try:
         if await get_user_clans(bot, user_id):
             return True
@@ -82,7 +84,7 @@ async def tournament_register(call: CallbackQuery, bot: Bot):
             await call.answer("Регистрирует команду только лидер состава", show_alert=True)
             return
         need_players = _players_per_team(tournament["t_type"])
-        if need_players > 1:
+        if need_players > 1 and not is_hidden_tester(call.from_user.id):
             try:
                 members_cnt = len(db.get_league_members(int(composition["id"]), occupied_only=True))
             except Exception:

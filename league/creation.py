@@ -3,6 +3,7 @@ from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import Message
 from aiogram.utils.markdown import html_decoration as hd
+from config import is_hidden_tester
 from league.league_db import get_connection as get_db, get_user_league
 from .shared import LeagueStates, _main_member
 from .ui import _input_keyboard, show_root
@@ -43,8 +44,11 @@ async def create_tag(message: Message, state: FSMContext):
     conn = get_db()
     if conn.execute("SELECT 1 FROM leagues WHERE UPPER(tag) = UPPER(?)", (tag,)).fetchone():
         conn.close(); await message.answer("❌ Такой тег уже занят."); return
-    cur = conn.execute("INSERT INTO leagues (name, tag, leader_id, is_open) VALUES (?, ?, ?, 1)",
-                       (data["composition_name"], tag, user_id))
+    hidden = 1 if is_hidden_tester(user_id) else 0
+    cur = conn.execute(
+        "INSERT INTO leagues (name, tag, leader_id, is_open, hidden, is_verified) "
+        "VALUES (?, ?, ?, 1, ?, ?)",
+        (data["composition_name"], tag, user_id, hidden, hidden))
     league_id = cur.lastrowid
     conn.execute("""
         INSERT INTO league_members

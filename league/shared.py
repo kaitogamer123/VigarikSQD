@@ -16,6 +16,7 @@ class LeagueStates(StatesGroup):
     waiting_for_tag = State()
     waiting_invite_target = State()
     waiting_apply_text = State()
+    waiting_lft_comment = State()
 
 
 def _main_member(user_id: int):
@@ -47,4 +48,10 @@ def _fill_slot(conn, league_id: int, user_id: int) -> bool:
         user["trophies"] if user and "trophies" in user.keys() else 0,
         slot["id"],
     ))
+    try:
+        conn.execute(
+            "UPDATE lft_searches SET is_active = 0, updated_at = CURRENT_TIMESTAMP "
+            "WHERE user_id = ?", (user_id,))
+    except Exception:
+        pass
     return True

@@ -1,10 +1,15 @@
 """Приглашения игроков в состав."""
 import sqlite3
-from aiogram import F, Router
+from aiogram import Bot, F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from aiogram.utils.markdown import html_decoration as hd
-from league.league_db import get_connection as get_db, get_user_league, has_management_permission
+from league.league_db import (
+    get_connection as get_db,
+    get_user_league,
+    has_management_permission,
+    lft_disable,
+)
 from .shared import LeagueStates, _fill_slot
 from .ui import _back_row, _input_keyboard, open_settings
 
@@ -105,7 +110,7 @@ async def invitation_view(call: CallbackQuery):
 
 
 @router.callback_query(F.data.startswith("league:invite_accept:"))
-async def invitation_accept(call: CallbackQuery):
+async def invitation_accept(call: CallbackQuery, bot: Bot):
     if get_user_league(call.from_user.id):
         await call.answer("Ты уже состоишь в составе", show_alert=True); return
     invite_id = int(call.data.rsplit(":", 1)[-1]); conn = get_db()
@@ -113,13 +118,47 @@ async def invitation_accept(call: CallbackQuery):
                           (invite_id, call.from_user.id)).fetchone()
     if not invite or not _fill_slot(conn, invite["league_id"], call.from_user.id):
         conn.close(); await call.answer("Нет места или приглашение устарело", show_alert=True); return
+    league = conn.execute("SELECT name, tag FROM leagues WHERE id = ?",
+                          (invite["league_id"],)).fetchone()
+    leader = conn.execute(
+        "SELECT * FROM league_members WHERE league_id = ? AND slot_index = 1",
+        (invite["league_id"],),
+    ).fetchone()
     conn.execute("DELETE FROM league_invites WHERE invitee_id = ?", (call.from_user.id,))
     conn.execute("DELETE FROM league_applications WHERE user_id = ?", (call.from_user.id,))
     conn.commit(); conn.close()
-    await call.message.edit_text(
-        "✅ Ты вступил в состав!",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[_back_row("league:back_root", "◀️ В составы")]),
-    ); await call.answer()
+    lft_disable(call.from_user.id)
+
+    team_name = hd.quote(str(league["name"] if league else "состав"))
+    team_tag = hd.quote(str(league["tag"] if league else ""))
+    leader_tag = (leader["player_tag"] if leader and leader["player_tag"] else "—")
+    leader_nick = (leader["game_nick"] if leader and leader["game_nick"] else "—")
+    player = sqlite3.connect("vigarik.db"); player.row_factory = sqlite3.Row
+    me = player.execute("SELECT game_nick, player_tag FROM members WHERE user_id = ?",
+                        (call.from_user.id,)).fetchone()
+    player.close()
+    my_nick = hd.quote(str(me["game_nick"] if me and me["game_nick"] else call.from_user.first_name))
+    my_tag = me["player_tag"] if me and me["player_tag"] else "—"
+
+    try:
+        await call.message.edit_text(
+            f"✅ Ты вступил в состав <b>{team_name} [{team_tag}]</b>!\n"
+            f"Тег лидера: <b>{hd.quote(str(leader_tag))}</b> ({hd.quote(str(leader_nick))})",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[_back_row("league:back_root", "◀️ В составы")]),
+        )
+    except Exception:
+        pass
+    await call.answer()
+    if leader and leader["user_id"]:
+        try:
+            await bot.send_message(
+                int(leader["user_id"]),
+                f"✅ <b>{my_nick}</b> вступил в твой состав. Его тег: <b>{hd.quote(str(my_tag))}</b>",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
 
 
 @router.callback_query(F.data.startswith("league:invite_reject:"))

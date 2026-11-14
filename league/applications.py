@@ -1,10 +1,15 @@
 """Заявки на вступление в состав."""
 import sqlite3
-from aiogram import F, Router
+from aiogram import Bot, F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from aiogram.utils.markdown import html_decoration as hd
-from league.league_db import get_connection as get_db, get_user_league, has_management_permission
+from league.league_db import (
+    get_connection as get_db,
+    get_user_league,
+    has_management_permission,
+    lft_disable,
+)
 from .shared import LeagueStates, _fill_slot
 from .ui import _back_row, _input_keyboard, show_root
 
@@ -136,7 +141,7 @@ async def app_detail(call: CallbackQuery):
 
 
 @router.callback_query(F.data.startswith("league:accept:"))
-async def app_accept(call: CallbackQuery):
+async def app_accept(call: CallbackQuery, bot: Bot):
     if not has_management_permission(call.from_user.id, "can_review_apps"):
         await call.answer("Нет права", show_alert=True); return
     app_id = int(call.data.rsplit(":", 1)[-1]); conn = get_db()
@@ -144,13 +149,52 @@ async def app_accept(call: CallbackQuery):
     composition = get_user_league(call.from_user.id)
     if not app or not composition or app["league_id"] != composition["id"] or not _fill_slot(conn, app["league_id"], app["user_id"]):
         conn.close(); await call.answer("Нет места, игрок уже вступил или заявка устарела", show_alert=True); return
+    leader = conn.execute(
+        "SELECT * FROM league_members WHERE league_id = ? AND slot_index = 1",
+        (app["league_id"],),
+    ).fetchone()
     conn.execute("DELETE FROM league_applications WHERE user_id = ?", (app["user_id"],))
     conn.execute("DELETE FROM league_invites WHERE invitee_id = ?", (app["user_id"],))
     conn.commit(); conn.close()
-    await call.message.edit_text(
-        "✅ Игрок принят в состав!",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[_back_row("comp:back:apps", "◀️ К заявкам")]),
-    ); await call.answer()
+    lft_disable(app["user_id"])
+
+    player = sqlite3.connect("vigarik.db"); player.row_factory = sqlite3.Row
+    me = player.execute("SELECT game_nick, player_tag FROM members WHERE user_id = ?",
+                        (app["user_id"],)).fetchone()
+    player.close()
+    my_nick = hd.quote(str(me["game_nick"] if me and me["game_nick"] else app["user_id"]))
+    my_tag = me["player_tag"] if me and me["player_tag"] else "—"
+    team_name = hd.quote(str(composition["name"]))
+    team_tag = hd.quote(str(composition["tag"]))
+    leader_tag = (leader["player_tag"] if leader and leader["player_tag"] else "—")
+    leader_nick = (leader["game_nick"] if leader and leader["game_nick"] else "—")
+
+    try:
+        await call.message.edit_text(
+            "✅ Игрок принят в состав!",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[_back_row("comp:back:apps", "◀️ К заявкам")]),
+        )
+    except Exception:
+        pass
+    await call.answer()
+    try:
+        await bot.send_message(
+            int(app["user_id"]),
+            f"✅ Ты вступил в состав <b>{team_name} [{team_tag}]</b>!\n"
+            f"Тег лидера: <b>{hd.quote(str(leader_tag))}</b> ({hd.quote(str(leader_nick))})",
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+    if leader and leader["user_id"]:
+        try:
+            await bot.send_message(
+                int(leader["user_id"]),
+                f"✅ <b>{my_nick}</b> вступил в твой состав. Его тег: <b>{hd.quote(str(my_tag))}</b>",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
 
 
 @router.callback_query(F.data.startswith("league:reject:"))

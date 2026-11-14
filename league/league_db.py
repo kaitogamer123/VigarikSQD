@@ -1,8 +1,12 @@
 """SQLite-слой системы составов (историческое имя модуля league сохранено)."""
+import asyncio
 import json
+import logging
 import os
 import sqlite3
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 # Переопределяется переменной окружения — удобно гонять бота на тестовой БД
 # (например, наполненной tools/seed_test_data.py), не трогая боевую league.db.
@@ -108,7 +112,17 @@ def init_league_db():
             mmr_opponent INTEGER,
             completed_at DATETIME
         );
+        CREATE TABLE IF NOT EXISTS lft_searches (
+            user_id     INTEGER PRIMARY KEY,
+            comment     TEXT DEFAULT '',
+            is_active   INTEGER DEFAULT 1,
+            created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
+            expires_at  DATETIME NOT NULL
+        );
         CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_invite ON league_invites (league_id, invitee_id);
+        CREATE INDEX IF NOT EXISTS idx_lft_active
+            ON lft_searches (is_active, expires_at, updated_at);
         CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_league_member
             ON league_members (league_id, user_id) WHERE user_id IS NOT NULL;
         CREATE INDEX IF NOT EXISTS idx_deputies_order ON league_deputies (league_id, appointed_at, id);
@@ -123,6 +137,10 @@ def init_league_db():
         cur.execute("ALTER TABLE leagues ADD COLUMN is_verified INTEGER DEFAULT 0")
     if "mmr" not in _columns(conn, "leagues"):
         cur.execute("ALTER TABLE leagues ADD COLUMN mmr INTEGER DEFAULT 0")
+    if "notify_lft" not in _columns(conn, "leagues"):
+        cur.execute("ALTER TABLE leagues ADD COLUMN notify_lft INTEGER DEFAULT 1")
+    if "hidden" not in _columns(conn, "leagues"):
+        cur.execute("ALTER TABLE leagues ADD COLUMN hidden INTEGER DEFAULT 0")
     cur.execute(
         "CREATE INDEX IF NOT EXISTS idx_league_members_joined "
         "ON league_members (league_id, joined_at, id)"
@@ -357,6 +375,7 @@ def handle_clan_departure(user_id: int, reason: str = "telegram", old_clan: str 
     Обычный участник удаляется сразу. Для лидера создаётся ожидание на 24 часа;
     повторные сигналы не продлевают первоначальный срок.
     """
+    lft_disable(user_id)
     composition = get_user_league(user_id)
     if not composition:
         return {"action": "none"}
@@ -399,12 +418,14 @@ def get_verified_leagues(exclude_id: int = None):
     conn = get_connection()
     if exclude_id:
         rows = conn.execute(
-            "SELECT * FROM leagues WHERE is_verified = 1 AND id != ? ORDER BY mmr DESC, name",
+            "SELECT * FROM leagues WHERE is_verified = 1 AND COALESCE(hidden, 0) = 0 "
+            "AND id != ? ORDER BY mmr DESC, name",
             (exclude_id,),
         ).fetchall()
     else:
         rows = conn.execute(
-            "SELECT * FROM leagues WHERE is_verified = 1 ORDER BY mmr DESC, name"
+            "SELECT * FROM leagues WHERE is_verified = 1 AND COALESCE(hidden, 0) = 0 "
+            "ORDER BY mmr DESC, name"
         ).fetchall()
     conn.close()
     return rows
@@ -781,6 +802,217 @@ def get_recent_completed(limit: int = 10):
     ).fetchall()
     conn.close()
     return rows
+
+
+# ─── Поиск команды (LFT) ────────────────────────────────────────────────────
+
+def lft_get(user_id: int):
+    conn = get_connection()
+    row = conn.execute("SELECT * FROM lft_searches WHERE user_id = ?", (int(user_id),)).fetchone()
+    conn.close()
+    return row
+
+
+def lft_set_active(user_id: int, active: bool, days: int = 7) -> bool:
+    """Включает/выключает поиск. Включение создаёт или перезапускает анкету."""
+    conn = get_connection()
+    if active:
+        cur = conn.execute(
+            """INSERT INTO lft_searches
+                   (user_id, comment, is_active, created_at, updated_at, expires_at)
+               VALUES (?, '', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP,
+                       datetime('now', ?))
+               ON CONFLICT(user_id) DO UPDATE SET
+                   is_active = 1,
+                   updated_at = CURRENT_TIMESTAMP,
+                   expires_at = datetime('now', ?)""",
+            (int(user_id), f"+{int(days)} days", f"+{int(days)} days"),
+        )
+    else:
+        cur = conn.execute(
+            "UPDATE lft_searches SET is_active = 0, updated_at = CURRENT_TIMESTAMP "
+            "WHERE user_id = ?",
+            (int(user_id),),
+        )
+    conn.commit()
+    changed = cur.rowcount > 0
+    conn.close()
+    return changed
+
+
+def lft_is_active(user_id: int) -> bool:
+    """True, если анкета активна и ещё не истекла."""
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT 1 FROM lft_searches WHERE user_id = ? AND is_active = 1 "
+        "AND datetime(expires_at) > datetime('now')",
+        (int(user_id),),
+    ).fetchone()
+    conn.close()
+    return bool(row)
+
+
+def lft_disable(user_id: int) -> None:
+    """Снимает статус поиска (вступление в состав, выход из клана и т.п.)."""
+    conn = get_connection()
+    conn.execute(
+        "UPDATE lft_searches SET is_active = 0, updated_at = CURRENT_TIMESTAMP "
+        "WHERE user_id = ?",
+        (int(user_id),),
+    )
+    conn.commit()
+    conn.close()
+
+
+def lft_touch(user_id: int, days: int = 7) -> None:
+    """Продлевает анкету и снова делает её активной."""
+    conn = get_connection()
+    conn.execute(
+        "UPDATE lft_searches SET is_active = 1, updated_at = CURRENT_TIMESTAMP, "
+        "expires_at = datetime('now', ?) WHERE user_id = ?",
+        (f"+{int(days)} days", int(user_id)),
+    )
+    conn.commit()
+    conn.close()
+
+
+def lft_set_comment(user_id: int, comment: str) -> None:
+    conn = get_connection()
+    conn.execute(
+        "UPDATE lft_searches SET comment = ?, updated_at = CURRENT_TIMESTAMP "
+        "WHERE user_id = ?",
+        (str(comment or "")[:200], int(user_id)),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _lft_attach_members(conn) -> None:
+    try:
+        conn.execute("ATTACH DATABASE 'vigarik.db' AS vg")
+    except Exception:
+        pass
+
+
+def lft_list(page: int = 0, per_page: int = 10) -> list:
+    """Активные анкеты с данными игрока из members, свежие сверху."""
+    page = max(0, int(page or 0))
+    conn = get_connection()
+    _lft_attach_members(conn)
+    try:
+        rows = conn.execute(
+            """SELECT s.user_id, s.comment, s.is_active, s.created_at,
+                      s.updated_at, s.expires_at,
+                      m.game_nick, m.player_tag, m.trophies, m.clan
+               FROM lft_searches s
+               LEFT JOIN vg.members m ON m.user_id = s.user_id
+               WHERE s.is_active = 1 AND datetime(s.expires_at) > datetime('now')
+                 AND m.registered = 1 AND TRIM(COALESCE(m.clan, '')) <> ''
+               ORDER BY datetime(s.updated_at) DESC, s.user_id
+               LIMIT ? OFFSET ?""",
+            (int(per_page), page * int(per_page)),
+        ).fetchall()
+    except Exception as e:
+        logger.error(f"lft_list: не удалось прочитать members: {e}")
+        rows = conn.execute(
+            """SELECT s.user_id, s.comment, s.is_active, s.created_at,
+                      s.updated_at, s.expires_at,
+                      NULL AS game_nick, NULL AS player_tag, NULL AS trophies, NULL AS clan
+               FROM lft_searches s
+               WHERE s.is_active = 1 AND datetime(s.expires_at) > datetime('now')
+               ORDER BY datetime(s.updated_at) DESC, s.user_id
+               LIMIT ? OFFSET ?""",
+            (int(per_page), page * int(per_page)),
+        ).fetchall()
+    conn.close()
+    return rows
+
+
+def lft_count() -> int:
+    conn = get_connection()
+    _lft_attach_members(conn)
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) c FROM lft_searches s "
+            "JOIN vg.members m ON m.user_id = s.user_id "
+            "WHERE s.is_active = 1 AND datetime(s.expires_at) > datetime('now') "
+            "AND m.registered = 1 AND TRIM(COALESCE(m.clan, '')) <> '' "
+            "AND COALESCE(m.hidden, 0) = 0"
+        ).fetchone()
+    except Exception:
+        row = conn.execute(
+            "SELECT COUNT(*) c FROM lft_searches "
+            "WHERE is_active = 1 AND datetime(expires_at) > datetime('now')"
+        ).fetchone()
+    conn.close()
+    return int(row["c"]) if row else 0
+
+
+def lft_leaders_with_free_slot() -> list:
+    """Лидеры составов с включённым тумблером и хотя бы одним свободным слотом."""
+    conn = get_connection()
+    rows = conn.execute(
+        """SELECT l.* FROM leagues l
+           WHERE COALESCE(l.notify_lft, 1) = 1
+             AND COALESCE(l.hidden, 0) = 0
+             AND EXISTS (SELECT 1 FROM league_members m
+                         WHERE m.league_id = l.id AND m.user_id IS NULL)
+           ORDER BY l.id"""
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+async def lft_expire_stale(bot) -> int:
+    """Скрывает истёкшие анкеты и уведомляет владельцев. Возвращает их число."""
+    conn = get_connection()
+    # Автоснятие: игрок вышел из клана или перестал быть зарегистрированным.
+    _lft_attach_members(conn)
+    try:
+        conn.execute(
+            "UPDATE lft_searches SET is_active = 0, updated_at = CURRENT_TIMESTAMP "
+            "WHERE is_active = 1 AND user_id IN ("
+            "  SELECT s.user_id FROM lft_searches s "
+            "  LEFT JOIN vg.members m ON m.user_id = s.user_id "
+            "  WHERE s.is_active = 1 AND (m.user_id IS NULL OR m.registered != 1 "
+            "        OR TRIM(COALESCE(m.clan, '')) = '')"
+            ")"
+        )
+        conn.commit()
+    except Exception as e:
+        logger.info(f"LFT: не удалось проверить клан/регистрацию: {e}")
+    rows = conn.execute(
+        "SELECT user_id FROM lft_searches "
+        "WHERE is_active = 1 AND datetime(expires_at) <= datetime('now')"
+    ).fetchall()
+    if rows:
+        conn.execute(
+            "UPDATE lft_searches SET is_active = 0, updated_at = CURRENT_TIMESTAMP "
+            "WHERE is_active = 1 AND datetime(expires_at) <= datetime('now')"
+        )
+        conn.commit()
+    conn.close()
+
+    if not rows:
+        return 0
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🔁 Разместить ещё на 7 дней", callback_data="lft:extend"),
+    ]])
+    for row in rows:
+        try:
+            await bot.send_message(
+                int(row["user_id"]),
+                "⏳ <b>Твоя анкета в поиске команды скрыта.</b>\n\n"
+                "Разместить ещё на 7 дней?",
+                parse_mode="HTML",
+                reply_markup=kb,
+            )
+        except Exception as e:
+            logger.info(f"LFT: не удалось уведомить {row['user_id']} об истечении: {e}")
+        await asyncio.sleep(0.05)
+    return len(rows)
 
 
 init_league_db()

@@ -20,14 +20,8 @@ async def all_compositions_callback(call: CallbackQuery, state: FSMContext):
     await _send_all(call.message, edit=True); await call.answer()
 
 
-@router.callback_query(F.data.startswith("league:info:"))
-async def composition_info(call: CallbackQuery):
-    league_id = int(call.data.rsplit(":", 1)[-1])
-    conn = get_db(); composition = conn.execute("SELECT * FROM leagues WHERE id = ?", (league_id,)).fetchone()
-    members = get_league_members(league_id)
-    conn.close()
-    if not composition:
-        await call.answer("Состав не найден", show_alert=True); return
+def composition_card_text(composition, members) -> str:
+    """Карточка состава — общая для «🌍 Все составы» и приглашений из поиска."""
     verified = _row_verified(composition)
     mmr = _row_mmr(composition)
     status_line = f"🟠 Верифицирован · {mmr}MMR🌟" if verified else "⚪ Не верифицирован"
@@ -41,8 +35,19 @@ async def composition_info(call: CallbackQuery):
             "🛡 Заместитель" if member["role"] == "заместитель" else "👤 Участник"
         )
         lines.append(f"{member['slot_index']}. {hd.quote(member['game_nick'] or 'Игрок')} — {role}")
+    return "\n".join(lines)
+
+
+@router.callback_query(F.data.startswith("league:info:"))
+async def composition_info(call: CallbackQuery):
+    league_id = int(call.data.rsplit(":", 1)[-1])
+    conn = get_db(); composition = conn.execute("SELECT * FROM leagues WHERE id = ?", (league_id,)).fetchone()
+    members = get_league_members(league_id)
+    conn.close()
+    if not composition:
+        await call.answer("Состав не найден", show_alert=True); return
     buttons = [[InlineKeyboardButton(text="◀️ Ко всем составам", callback_data="league:all_list")]]
     if not get_user_league(call.from_user.id) and composition["is_open"]:
         buttons.insert(0, [InlineKeyboardButton(text="📝 Подать заявку", callback_data=f"league:apply_send:{league_id}")])
-    await call.message.edit_text("\n".join(lines), parse_mode="HTML",
+    await call.message.edit_text(composition_card_text(composition, members), parse_mode="HTML",
                                  reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)); await call.answer()

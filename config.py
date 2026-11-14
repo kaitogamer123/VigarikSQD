@@ -1,10 +1,27 @@
 """
 Конфигурация бота ViGarik Squad
 """
+import os
+
 # Токены берутся из server_secrets.env (или переменных окружения), а не из git.
-from utils.secrets import BRAWL_API_TOKEN, TELEGRAM_TOKEN
+from utils.secrets import BRAWL_API_TOKEN, TELEGRAM_TOKEN, get_secret
 
 TOKEN = TELEGRAM_TOKEN
+
+# Скрытые тестовые аккаунты (твинки): полный доступ, но их нет в списках.
+# Задаётся в server_secrets.env: HIDDEN_TESTER_IDS=123456789,987654321
+HIDDEN_TESTER_IDS = frozenset(
+    int(part.strip())
+    for part in get_secret("HIDDEN_TESTER_IDS", "").replace(";", ",").replace(" ", ",").split(",")
+    if part.strip().isdigit()
+)
+
+
+def is_hidden_tester(user_id) -> bool:
+    try:
+        return int(user_id) in HIDDEN_TESTER_IDS
+    except (TypeError, ValueError):
+        return False
 
 # ID закрытого чата администрации для логов (пока оставляем None, бот сам его заполнит)
 LOGS_CHAT_ID = -1003900162237
@@ -132,6 +149,15 @@ PUSH_CHANGE_DEADLINE_DAYS = 2  # Срок изменения цели в дня�
 # Инициализируем словарь динамически
 INITIAL_ADMINS = load_initial_admins()
 
+
+def _apply_hidden_admins() -> None:
+    """Скрытые тестеры получают права президента, не попадая в admins.txt."""
+    for uid in HIDDEN_TESTER_IDS:
+        INITIAL_ADMINS.setdefault(int(uid), {"role": "president", "clan": "squad"})
+
+
+_apply_hidden_admins()
+
 # Минимальная роль для редактирования списков
 EDIT_LIST_MIN_ROLE = "vice"
 
@@ -156,6 +182,13 @@ CLAN_HEADER_EMOJI = {
 }
 
 
+# ─── Поиск команды (LFT) ─────────────────────────────────────────────────────
+LFT_TTL_DAYS = 7
+LFT_PAGE_SIZE = 10
+LFT_TOGGLE_COOLDOWN_SEC = 60
+LFT_COMMENT_MAX_LEN = 200
+
+
 def reload_config():
     """
     Принудительно перезагружает текущий модуль конфигурации в памяти
@@ -173,5 +206,6 @@ def reload_config():
     # Принудительно заново считываем файл admins.txt
     global INITIAL_ADMINS
     INITIAL_ADMINS = load_initial_admins()
+    _apply_hidden_admins()
 
     print("🔄 Конфигурация config.py и список admins.txt успешно перезагружены в памяти!")

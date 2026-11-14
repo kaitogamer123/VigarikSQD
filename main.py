@@ -36,6 +36,7 @@ from handlers.chat_events import router as chat_router
 from handlers.clan_conflicts import router as clan_conflicts_router
 from handlers.clan_list import router as clan_list_router
 from league.handlers import router as league_router
+from league.league_db import lft_expire_stale
 from league.competitive import router as competitive_router
 from league.competitive import scrim_watchdog_task
 from game_database import init_game_db
@@ -199,6 +200,7 @@ async def main():
     asyncio.create_task(auto_collect_stats_task(bot))
     asyncio.create_task(composition_departure_monitor_task(bot))
     asyncio.create_task(scrim_watchdog_task(bot))
+    asyncio.create_task(lft_watchdog_task(bot))
 
     # getUpdates is incompatible with an active Telegram webhook. Keep any
     # queued updates when switching this bot back to polling.
@@ -211,6 +213,19 @@ async def main():
     # start_polling invokes @dp.startup automatically; don't initialize twice.
     logging.info("Starting bot polling.")
     await dp.start_polling(bot)
+
+
+async def lft_watchdog_task(bot: Bot) -> None:
+    """Раз в час прячет истёкшие анкеты поиска команды."""
+    await asyncio.sleep(60)
+    while True:
+        try:
+            hidden = await lft_expire_stale(bot)
+            if hidden:
+                logging.info(f"LFT: скрыто истёкших анкет — {hidden}")
+        except Exception as e:
+            logging.error(f"LFT watchdog error: {e}")
+        await asyncio.sleep(3600)
 
 
 if __name__ == "__main__":

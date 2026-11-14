@@ -12,7 +12,7 @@ from aiogram.types import (
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.utils.markdown import html_decoration as hd
 from database import get_member
-from league.league_db import get_connection as get_db, get_user_league
+from league.league_db import get_connection as get_db, get_user_league, lft_get
 from utils.keyboards import main_menu
 from .shared import LeagueStates
 
@@ -52,13 +52,24 @@ def _reply(rows):
     )
 
 
+def _lft_active(user_id: int) -> bool:
+    try:
+        row = lft_get(int(user_id))
+        return bool(row and int(row["is_active"] or 0) == 1)
+    except Exception:
+        return False
+
+
 def _root_keyboard(composition, user_id: int):
     if not composition:
+        lft_row = f"⏹ Остановить поиск" if _lft_active(user_id) else "🔎 Я ищу команду"
         return _reply([
             ["🌍 Все составы"],
             ["📝 Подать заявку в состав"],
             ["📩 Мои заявки", "📥 Приглашения в состав"],
             ["➕ Создать состав"],
+            [lft_row],
+            ["👀 Игроки в поиске"],
             ["◀️ Назад в главное меню"],
         ])
     is_leader = int(composition["leader_id"]) == int(user_id)
@@ -67,6 +78,7 @@ def _root_keyboard(composition, user_id: int):
         second = "🏆 Лиги" if _row_verified(composition) else "🛡 Верифицировать состав"
         rows = [["🌍 Все составы", second], ["⚙️ Настройка состава"]]
         rows.append(["📋 Заявки в состав"])
+        rows.append(["👀 Игроки в поиске"])
         rows.append(["📜 История матчей"])
         rows.append(["◀️ Назад в главное меню"])
         return _reply(rows)
@@ -74,12 +86,14 @@ def _root_keyboard(composition, user_id: int):
         rows = [["🌍 Все составы"], ["⚙️ Настройка состава"]]
         if is_leader or composition["can_review_apps"]:
             rows.append(["📋 Заявки в состав"])
+        rows.append(["👀 Игроки в поиске"])
         rows.append(["📜 История матчей"])
         rows.append(["◀️ Назад в главное меню"])
         return _reply(rows)
     return _reply([
         ["🌍 Все составы"],
         ["👥 Участники состава", "🚪 Выйти из состава"],
+        ["👀 Игроки в поиске"],
         ["📜 История матчей"],
         ["◀️ Назад в главное меню"],
     ])
@@ -87,6 +101,10 @@ def _root_keyboard(composition, user_id: int):
 
 def _settings_keyboard(composition, user_id: int):
     is_leader = int(composition["leader_id"]) == int(user_id)
+    try:
+        notify_on = int(composition["notify_lft"] if composition["notify_lft"] is not None else 1)
+    except (IndexError, KeyError, TypeError, ValueError):
+        notify_on = 1
     rows = [
         ["👥 Участники состава"] + (
             ["🔒 Закрыть набор / Открыть набор"]
@@ -95,6 +113,8 @@ def _settings_keyboard(composition, user_id: int):
         ["👑 Передать лидерство", "🛡 Управление заместителями"] if is_leader else [],
         (["🚪 Выгнать участника"] if is_leader or composition["can_kick"] else [])
         + (["➕ Пригласить игрока"] if is_leader or composition["can_invite"] else []),
+        ([f"🔔 Уведомления о поиске: {'Вкл' if notify_on else 'Выкл'}"]
+         if is_leader else []),
         ["🚪 Выйти из состава"] + (["💥 Распустить состав"] if is_leader else []),
         ["◀️ Назад в составы"],
     ]
@@ -217,6 +237,7 @@ async def _send_all(message: Message, edit: bool = False):
             SELECT l.*, (SELECT COUNT(*) FROM league_members m
             WHERE m.league_id = l.id AND m.user_id IS NOT NULL) AS count_members
             FROM leagues l
+            WHERE COALESCE(l.hidden, 0) = 0
             ORDER BY COALESCE(l.is_verified, l.verified, 0) DESC,
                      COALESCE(l.mmr, 0) DESC, l.id DESC
         """).fetchall()
@@ -224,7 +245,8 @@ async def _send_all(message: Message, edit: bool = False):
         rows = conn.execute("""
             SELECT l.*, (SELECT COUNT(*) FROM league_members m
             WHERE m.league_id = l.id AND m.user_id IS NOT NULL) AS count_members
-            FROM leagues l ORDER BY count_members DESC, l.id DESC
+            FROM leagues l WHERE COALESCE(l.hidden, 0) = 0
+            ORDER BY count_members DESC, l.id DESC
         """).fetchall()
     conn.close()
     builder = InlineKeyboardBuilder()

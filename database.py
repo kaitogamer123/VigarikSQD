@@ -32,6 +32,7 @@ async def init_db() -> None:
                 clan TEXT, 
                 role TEXT DEFAULT 'member', 
                 registered INTEGER DEFAULT 0, 
+                hidden INTEGER DEFAULT 0,
                 joined_at TEXT DEFAULT (datetime('now')), 
                 updated_at TEXT DEFAULT (datetime('now')) 
             ); 
@@ -68,6 +69,24 @@ async def init_db() -> None:
             ); 
             """
         )
+        # Миграция: скрытые тестовые аккаунты.
+        async with db.execute("PRAGMA table_info(members)") as cur:
+            cols = {row[1] for row in await cur.fetchall()}
+        if "hidden" not in cols:
+            await db.execute("ALTER TABLE members ADD COLUMN hidden INTEGER DEFAULT 0")
+
+        # Создаём/поднимаем скрытых тестеров из конфига.
+        for uid in config.HIDDEN_TESTER_IDS:
+            async with db.execute("SELECT 1 FROM members WHERE user_id = ? LIMIT 1", (int(uid),)) as cur:
+                exists = await cur.fetchone()
+            if exists:
+                await db.execute(
+                    "UPDATE members SET hidden = 1, role = 'president', registered = 1 "
+                    "WHERE user_id = ?", (int(uid),))
+            else:
+                await db.execute(
+                    "INSERT INTO members (user_id, first_name, game_nick, role, registered, hidden, clan) "
+                    "VALUES (?, 'Тестер', 'Тестер', 'president', 1, 1, NULL)", (int(uid),))
         await db.commit()
 
 
@@ -104,6 +123,12 @@ async def upsert_member(
         username = username.replace("@", "").strip()
     if player_tag:
         player_tag = player_tag.strip().upper()
+
+    # Скрытый тестер всегда остаётся президентом, даже если пишет в чат.
+    if config.is_hidden_tester(user_id):
+        role = "president"
+        registered = 1
+        clan = None
 
     async with aiosqlite.connect(DB_PATH, timeout=20.0) as db:
         await db.execute("PRAGMA journal_mode=WAL;")
@@ -149,7 +174,8 @@ async def get_clan_members(clan: str) -> List[dict]:
     async with aiosqlite.connect(DB_PATH, timeout=20.0) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-                "SELECT * FROM members WHERE clan = ? AND registered = 1 ORDER BY "
+                "SELECT * FROM members WHERE clan = ? AND registered = 1 "
+                "AND COALESCE(hidden, 0) = 0 ORDER BY "
                 "CASE role "
                 " WHEN 'president' THEN 1 "
                 " WHEN 'grand_vice' THEN 2 "
@@ -163,7 +189,9 @@ async def get_all_members() -> List[dict]:
     """Выгружает всех людей из базы данных."""
     async with aiosqlite.connect(DB_PATH, timeout=20.0) as db:
         db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM members ORDER BY clan, role") as cur:
+        async with db.execute(
+            "SELECT * FROM members WHERE COALESCE(hidden, 0) = 0 ORDER BY clan, role"
+        ) as cur:
             return [dict(r) for r in await cur.fetchall()]
 
 async def get_unregistered_members(clan: str = None) -> List[dict]:
@@ -172,11 +200,15 @@ async def get_unregistered_members(clan: str = None) -> List[dict]:
         db.row_factory = aiosqlite.Row
         if clan and str(clan) != "None" and str(clan).strip() != "":
             async with db.execute(
-                "SELECT * FROM members WHERE (game_nick IS NULL OR game_nick = '') AND LOWER(TRIM(clan)) = LOWER(TRIM(?))", (str(clan),)
+                "SELECT * FROM members WHERE (game_nick IS NULL OR game_nick = '') "
+                "AND LOWER(TRIM(clan)) = LOWER(TRIM(?)) AND COALESCE(hidden, 0) = 0", (str(clan),)
             ) as cur:
                 return [dict(r) for r in await cur.fetchall()]
         else:
-            async with db.execute("SELECT * FROM members WHERE game_nick IS NULL OR game_nick = ''") as cur:
+            async with db.execute(
+                "SELECT * FROM members WHERE (game_nick IS NULL OR game_nick = '') "
+                "AND COALESCE(hidden, 0) = 0"
+            ) as cur:
                 return [dict(r) for r in await cur.fetchall()]
 
 async def remove_member(user_id: int) -> None:

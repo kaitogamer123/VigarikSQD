@@ -11,6 +11,7 @@ from .applications import router as applications_router
 from .invitations import router as invitations_router
 from .roster import router as roster_router
 from .deputies import router as deputies_router
+from .search import router as search_router
 
 init_league_db()
 
@@ -23,6 +24,7 @@ router.include_routers(
     invitations_router,
     roster_router,
     deputies_router,
+    search_router,
 )
 
 __all__ = ["router", "show_root", "LeagueStates"]

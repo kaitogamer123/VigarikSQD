@@ -45,6 +45,7 @@ from .tournament_db import (
     get_tournament_teams,
     set_tournament_limit,
     set_tournament_status,
+    shuffle_tournament_teams,
 )
 from .tournament_notify import _repost_bracket
 from .tournament_results import _apply_confirmed_result
@@ -106,6 +107,9 @@ def _tournament_admin_kb(tournament) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🔁 Обновить пост в топиках", callback_data=f"trnadm:repost:{tid}")],
     ]
     if tournament["status"] == "registration":
+        if len(get_tournament_teams(tid)) >= 2:
+            rows.append([InlineKeyboardButton(text="🔀 Перемешать участников",
+                                              callback_data=f"trnadm:shuffle:{tid}")])
         rows.append([InlineKeyboardButton(text="▶️ Запустить турнир сейчас",
                                           callback_data=f"trnadm:start:{tid}")])
         rows.append([InlineKeyboardButton(text="🚫 Отменить турнир",
@@ -790,6 +794,57 @@ async def admin_tournament_fill_bots(call: CallbackQuery, bot: Bot):
         _tournament_admin_card(tournament, teams),
         parse_mode="HTML", reply_markup=_tournament_admin_kb(tournament))
     await call.answer(f"🤖 Добавлено ботов: {added} (всего участников: {len(teams)})")
+
+
+@router.callback_query(F.data.startswith("trnadm:shuffle:"))
+async def admin_tournament_shuffle(call: CallbackQuery, bot: Bot):
+    """Ручная жеребьёвка: перемешивает участников и показывает предпросмотр пар."""
+    if not await _cb_is_admin(call.from_user.id):
+        await call.answer("⛔ Нет прав", show_alert=True)
+        return
+    tid = int(call.data.rsplit(":", 1)[-1])
+    tournament = get_tournament(tid)
+    if not tournament:
+        await call.answer("Турнир не найден", show_alert=True)
+        return
+    if tournament["status"] != "registration":
+        await call.answer("⛔ Перемешивать можно только до старта турнира.", show_alert=True)
+        return
+    if len(get_tournament_teams(tid)) < 2:
+        await call.answer("😔 Нечего перемешивать: участников меньше двух.", show_alert=True)
+        return
+    result = shuffle_tournament_teams(tid)
+    if not result:
+        await call.answer("😔 Нечего перемешивать: участников меньше двух.", show_alert=True)
+        return
+
+    await _refresh_tournament_posts(bot, tid)
+    teams = get_tournament_teams(tid)
+    try:
+        await call.message.edit_text(
+            _tournament_admin_card(tournament, teams),
+            parse_mode="HTML", reply_markup=_tournament_admin_kb(tournament))
+    except Exception:
+        pass
+
+    lines = [f"🔀 <b>Жеребьёвка турнира #{tid}</b>", ""]
+    if result["pairs"]:
+        lines.append("<b>Пары первого круга:</b>")
+        for i, (name_a, name_b) in enumerate(result["pairs"], 1):
+            lines.append(f"{i}. {hd.quote(name_a)} 🆚 {hd.quote(name_b)}")
+    if result["autos"]:
+        lines.append("")
+        lines.append("⏭ <b>Автопроходы:</b> " +
+                     ", ".join(hd.quote(name) for name in result["autos"]))
+    lines.append("")
+    lines.append("ℹ️ После добавления новых участников перемешай ещё раз.")
+    await call.message.answer("\n".join(lines), parse_mode="HTML")
+    await call.answer("✅ Порядок участников перемешан случайно. Ещё раз — будет новый вариант.")
+    await log_admin_action(
+        bot=bot, admin_id=call.from_user.id,
+        admin_name=call.from_user.username or call.from_user.first_name or "admin",
+        action_text=f"🔀 Перемешал участников турнира #{tid} ({result['count']} участников).",
+    )
 
 
 @router.callback_query(F.data.startswith("trnadm:recreate:"))

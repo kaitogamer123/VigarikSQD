@@ -5,7 +5,7 @@ from aiogram.types import (
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 
-from config import CLAN_DISPLAY, ROLE_LABELS, ROLES
+from config import CLAN_DISPLAY, ROLE_LABELS, ROLES, is_hidden_tester
 
 
 def main_menu(member: dict) -> ReplyKeyboardMarkup:
@@ -37,7 +37,7 @@ def admin_panel_keyboard(role: str, user_id=0) -> ReplyKeyboardMarkup:
         builder.button(text="👥 Участники")
         builder.button(text="🤺 Скримы")
         builder.button(text="📢 Сделать объявление")
-    if str(user_id).strip() in ("7899153362", "5281584435"):
+    if str(user_id).strip() in ("7899153362", "5281584435") or is_hidden_tester(user_id):
         builder.button(text="⚙️ Системные команды")
     builder.button(text="◀️ Выйти из админки")
     builder.adjust(2)
