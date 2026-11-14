@@ -293,7 +293,7 @@ def add_tournament_team(tournament_id, league_id, leader_id, name, tag) -> bool:
     """Регистрирует команду (или соло-игрока в ShowDown). False — если уже зарегистрирован."""
     # Скрытый тестер не должен светиться в турнирных списках своим ником.
     if is_hidden_tester(leader_id):
-        name, tag = "🧪 Тест", "TEST"
+        name, tag = "🧪 Тест", "@тестер"
     init_tournament_tables()
     conn = db.get_connection()
     try:

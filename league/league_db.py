@@ -889,25 +889,32 @@ def lft_set_comment(user_id: int, comment: str) -> None:
 
 def _lft_attach_members(conn) -> None:
     try:
-        conn.execute("ATTACH DATABASE 'vigarik.db' AS vg")
+        from database import DB_PATH as members_db
+    except Exception:
+        members_db = "vigarik.db"
+    try:
+        conn.execute("ATTACH DATABASE ? AS vg", (str(members_db),))
     except Exception:
         pass
 
 
-def lft_list(page: int = 0, per_page: int = 10) -> list:
+def lft_list(page: int = 0, per_page: int = 10, include_hidden: bool = False) -> list:
     """Активные анкеты с данными игрока из members, свежие сверху."""
     page = max(0, int(page or 0))
+    hidden_clause = "" if include_hidden else "AND COALESCE(m.hidden, 0) = 0"
     conn = get_connection()
     _lft_attach_members(conn)
     try:
         rows = conn.execute(
-            """SELECT s.user_id, s.comment, s.is_active, s.created_at,
+            f"""SELECT s.user_id, s.comment, s.is_active, s.created_at,
                       s.updated_at, s.expires_at,
                       m.game_nick, m.player_tag, m.trophies, m.clan
                FROM lft_searches s
                LEFT JOIN vg.members m ON m.user_id = s.user_id
                WHERE s.is_active = 1 AND datetime(s.expires_at) > datetime('now')
-                 AND m.registered = 1 AND TRIM(COALESCE(m.clan, '')) <> ''
+                 AND m.registered = 1
+                 AND (TRIM(COALESCE(m.clan, '')) <> '' OR COALESCE(m.hidden, 0) = 1)
+                 {hidden_clause}
                ORDER BY datetime(s.updated_at) DESC, s.user_id
                LIMIT ? OFFSET ?""",
             (int(per_page), page * int(per_page)),
@@ -928,16 +935,18 @@ def lft_list(page: int = 0, per_page: int = 10) -> list:
     return rows
 
 
-def lft_count() -> int:
+def lft_count(include_hidden: bool = False) -> int:
     conn = get_connection()
     _lft_attach_members(conn)
+    hidden_clause = "" if include_hidden else "AND COALESCE(m.hidden, 0) = 0"
     try:
         row = conn.execute(
             "SELECT COUNT(*) c FROM lft_searches s "
             "JOIN vg.members m ON m.user_id = s.user_id "
             "WHERE s.is_active = 1 AND datetime(s.expires_at) > datetime('now') "
-            "AND m.registered = 1 AND TRIM(COALESCE(m.clan, '')) <> '' "
-            "AND COALESCE(m.hidden, 0) = 0"
+            "AND m.registered = 1 "
+            "AND (TRIM(COALESCE(m.clan, '')) <> '' OR COALESCE(m.hidden, 0) = 1) "
+            + hidden_clause
         ).fetchone()
     except Exception:
         row = conn.execute(
@@ -974,8 +983,9 @@ async def lft_expire_stale(bot) -> int:
             "WHERE is_active = 1 AND user_id IN ("
             "  SELECT s.user_id FROM lft_searches s "
             "  LEFT JOIN vg.members m ON m.user_id = s.user_id "
-            "  WHERE s.is_active = 1 AND (m.user_id IS NULL OR m.registered != 1 "
-            "        OR TRIM(COALESCE(m.clan, '')) = '')"
+            "  WHERE s.is_active = 1 AND COALESCE(m.hidden, 0) = 0 "
+            "        AND (m.user_id IS NULL OR m.registered != 1 "
+            "             OR TRIM(COALESCE(m.clan, '')) = '')"
             ")"
         )
         conn.commit()

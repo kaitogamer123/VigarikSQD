@@ -4,6 +4,7 @@ from aiogram import Bot, F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from aiogram.utils.markdown import html_decoration as hd
+from config import is_hidden_tester
 from league.league_db import (
     get_connection as get_db,
     get_user_league,
@@ -138,7 +139,8 @@ async def invitation_accept(call: CallbackQuery, bot: Bot):
                         (call.from_user.id,)).fetchone()
     player.close()
     my_nick = hd.quote(str(me["game_nick"] if me and me["game_nick"] else call.from_user.first_name))
-    my_tag = me["player_tag"] if me and me["player_tag"] else "—"
+    my_tag = "@тестер" if is_hidden_tester(call.from_user.id) else (
+        me["player_tag"] if me and me["player_tag"] else "—")
 
     try:
         await call.message.edit_text(

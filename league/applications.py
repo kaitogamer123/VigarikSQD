@@ -4,6 +4,7 @@ from aiogram import Bot, F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from aiogram.utils.markdown import html_decoration as hd
+from config import is_hidden_tester
 from league.league_db import (
     get_connection as get_db,
     get_user_league,
@@ -163,7 +164,8 @@ async def app_accept(call: CallbackQuery, bot: Bot):
                         (app["user_id"],)).fetchone()
     player.close()
     my_nick = hd.quote(str(me["game_nick"] if me and me["game_nick"] else app["user_id"]))
-    my_tag = me["player_tag"] if me and me["player_tag"] else "—"
+    my_tag = "@тестер" if is_hidden_tester(app["user_id"]) else (
+        me["player_tag"] if me and me["player_tag"] else "—")
     team_name = hd.quote(str(composition["name"]))
     team_tag = hd.quote(str(composition["tag"]))
     leader_tag = (leader["player_tag"] if leader and leader["player_tag"] else "—")

@@ -11,6 +11,7 @@ from aiogram.types import (
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.utils.markdown import html_decoration as hd
+from config import is_hidden_tester
 from database import get_member
 from league.league_db import get_connection as get_db, get_user_league, lft_get
 from utils.keyboards import main_menu
@@ -230,22 +231,24 @@ async def open_settings(message: Message):
 
 
 # ─── Все составы / заявки ────────────────────────────────────────────────────
-async def _send_all(message: Message, edit: bool = False):
+async def _send_all(message: Message, edit: bool = False, viewer_id: int = None):
+    viewer_id = int(viewer_id or getattr(message.from_user, "id", 0) or 0)
+    hidden_where = "" if is_hidden_tester(viewer_id) else "WHERE COALESCE(l.hidden, 0) = 0"
     conn = get_db()
     try:
-        rows = conn.execute("""
+        rows = conn.execute(f"""
             SELECT l.*, (SELECT COUNT(*) FROM league_members m
             WHERE m.league_id = l.id AND m.user_id IS NOT NULL) AS count_members
             FROM leagues l
-            WHERE COALESCE(l.hidden, 0) = 0
+            {hidden_where}
             ORDER BY COALESCE(l.is_verified, l.verified, 0) DESC,
                      COALESCE(l.mmr, 0) DESC, l.id DESC
         """).fetchall()
     except Exception:
-        rows = conn.execute("""
+        rows = conn.execute(f"""
             SELECT l.*, (SELECT COUNT(*) FROM league_members m
             WHERE m.league_id = l.id AND m.user_id IS NOT NULL) AS count_members
-            FROM leagues l WHERE COALESCE(l.hidden, 0) = 0
+            FROM leagues l {hidden_where}
             ORDER BY count_members DESC, l.id DESC
         """).fetchall()
     conn.close()

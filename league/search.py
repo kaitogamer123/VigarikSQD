@@ -17,6 +17,7 @@ from config import (
     LFT_PAGE_SIZE,
     LFT_TOGGLE_COOLDOWN_SEC,
     LFT_TTL_DAYS,
+    is_hidden_tester,
 )
 from database import get_member
 from league.league_db import (
@@ -84,7 +85,8 @@ def _cooldown_left(user_id: int) -> int:
 
 def _card_text(user_id: int, lft_row, member) -> str:
     nick = (member or {}).get("game_nick") or (member or {}).get("first_name") or "Игрок"
-    tag = (member or {}).get("player_tag") or "—"
+    hidden = is_hidden_tester(user_id) or int((member or {}).get("hidden") or 0) == 1
+    tag = "@тестер" if hidden else ((member or {}).get("player_tag") or "—")
     trophies = int((member or {}).get("trophies") or 0)
     lines = [
         "🔎 <b>Игрок в поиске</b>",
@@ -188,7 +190,7 @@ async def _send_status(message: Message, user_id: int) -> None:
                          parse_mode="HTML", reply_markup=_own_kb())
 
 
-def _list_kb(page: int, rows) -> InlineKeyboardMarkup:
+def _list_kb(page: int, rows, viewer_id: int = 0) -> InlineKeyboardMarkup:
     buttons = []
     for row in rows:
         nick = row["game_nick"] or "Игрок"
@@ -197,7 +199,7 @@ def _list_kb(page: int, rows) -> InlineKeyboardMarkup:
             text=f"🔎 {nick} · {clan}"[:60],
             callback_data=f"lft:card:{int(row['user_id'])}",
         )])
-    total = lft_count()
+    total = lft_count(is_hidden_tester(viewer_id))
     pages = max(1, (total + LFT_PAGE_SIZE - 1) // LFT_PAGE_SIZE)
     nav = []
     if page > 0:
@@ -217,13 +219,16 @@ def _list_text(page: int, total: int) -> str:
     return f"🔎 <b>Игроки в поиске</b> (стр. {page + 1}/{pages})\n\nВыбери игрока:"
 
 
-async def _show_list(message: Message, page: int = 0, edit: bool = False) -> None:
-    total = lft_count()
+async def _show_list(message: Message, page: int = 0, edit: bool = False,
+                     viewer_id: int = None) -> None:
+    viewer_id = int(viewer_id or getattr(message.from_user, "id", 0) or 0)
+    include_hidden = is_hidden_tester(viewer_id)
+    total = lft_count(include_hidden)
     pages = max(1, (total + LFT_PAGE_SIZE - 1) // LFT_PAGE_SIZE)
     page = min(max(0, int(page or 0)), pages - 1)
-    rows = lft_list(page, LFT_PAGE_SIZE)
+    rows = lft_list(page, LFT_PAGE_SIZE, include_hidden)
     text = _list_text(page, total)
-    kb = _list_kb(page, rows) if total else InlineKeyboardMarkup(inline_keyboard=[[
+    kb = _list_kb(page, rows, viewer_id) if total else InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="◀️ В составы", callback_data="league:back_root"),
     ]])
     if edit:
@@ -398,16 +403,18 @@ async def lft_players(message: Message):
 @router.callback_query(F.data.startswith("lft:list:"))
 async def lft_list_callback(call: CallbackQuery):
     page = int(call.data.rsplit(":", 1)[-1])
+    include_hidden = is_hidden_tester(call.from_user.id)
     try:
-        await _show_list(call.message, page, edit=True)
+        await _show_list(call.message, page, edit=True, viewer_id=call.from_user.id)
     except Exception:
-        total = lft_count()
+        total = lft_count(include_hidden)
         pages = max(1, (total + LFT_PAGE_SIZE - 1) // LFT_PAGE_SIZE)
         page = min(max(0, page), pages - 1)
         try:
             await call.bot.send_message(
                 call.from_user.id, _list_text(page, total), parse_mode="HTML",
-                reply_markup=_list_kb(page, lft_list(page, LFT_PAGE_SIZE)))
+                reply_markup=_list_kb(page, lft_list(page, LFT_PAGE_SIZE, include_hidden),
+                                      call.from_user.id))
         except Exception:
             pass
     await call.answer()

@@ -17,7 +17,7 @@ async def all_compositions(message: Message):
 @router.callback_query(F.data == "league:all_list")
 async def all_compositions_callback(call: CallbackQuery, state: FSMContext):
     await state.clear()
-    await _send_all(call.message, edit=True); await call.answer()
+    await _send_all(call.message, edit=True, viewer_id=call.from_user.id); await call.answer()
 
 
 def composition_card_text(composition, members) -> str:
