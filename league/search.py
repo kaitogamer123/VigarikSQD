@@ -20,6 +20,7 @@ from config import (
     is_hidden_tester,
 )
 from database import get_member
+from utils.permissions import is_top_admin
 from league.league_db import (
     get_connection,
     get_league,
@@ -190,7 +191,7 @@ async def _send_status(message: Message, user_id: int) -> None:
                          parse_mode="HTML", reply_markup=_own_kb())
 
 
-def _list_kb(page: int, rows, viewer_id: int = 0) -> InlineKeyboardMarkup:
+def _list_kb(page: int, rows, include_hidden: bool = False) -> InlineKeyboardMarkup:
     buttons = []
     for row in rows:
         nick = row["game_nick"] or "Игрок"
@@ -199,7 +200,7 @@ def _list_kb(page: int, rows, viewer_id: int = 0) -> InlineKeyboardMarkup:
             text=f"🔎 {nick} · {clan}"[:60],
             callback_data=f"lft:card:{int(row['user_id'])}",
         )])
-    total = lft_count(is_hidden_tester(viewer_id))
+    total = lft_count(include_hidden)
     pages = max(1, (total + LFT_PAGE_SIZE - 1) // LFT_PAGE_SIZE)
     nav = []
     if page > 0:
@@ -222,13 +223,14 @@ def _list_text(page: int, total: int) -> str:
 async def _show_list(message: Message, page: int = 0, edit: bool = False,
                      viewer_id: int = None) -> None:
     viewer_id = int(viewer_id or getattr(message.from_user, "id", 0) or 0)
-    include_hidden = is_hidden_tester(viewer_id)
+    viewer = await get_member(viewer_id)
+    include_hidden = is_hidden_tester(viewer_id) or bool(viewer and is_top_admin(viewer))
     total = lft_count(include_hidden)
     pages = max(1, (total + LFT_PAGE_SIZE - 1) // LFT_PAGE_SIZE)
     page = min(max(0, int(page or 0)), pages - 1)
     rows = lft_list(page, LFT_PAGE_SIZE, include_hidden)
     text = _list_text(page, total)
-    kb = _list_kb(page, rows, viewer_id) if total else InlineKeyboardMarkup(inline_keyboard=[[
+    kb = _list_kb(page, rows, include_hidden) if total else InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="◀️ В составы", callback_data="league:back_root"),
     ]])
     if edit:
@@ -403,7 +405,8 @@ async def lft_players(message: Message):
 @router.callback_query(F.data.startswith("lft:list:"))
 async def lft_list_callback(call: CallbackQuery):
     page = int(call.data.rsplit(":", 1)[-1])
-    include_hidden = is_hidden_tester(call.from_user.id)
+    viewer = await get_member(call.from_user.id)
+    include_hidden = is_hidden_tester(call.from_user.id) or bool(viewer and is_top_admin(viewer))
     try:
         await _show_list(call.message, page, edit=True, viewer_id=call.from_user.id)
     except Exception:
@@ -414,7 +417,7 @@ async def lft_list_callback(call: CallbackQuery):
             await call.bot.send_message(
                 call.from_user.id, _list_text(page, total), parse_mode="HTML",
                 reply_markup=_list_kb(page, lft_list(page, LFT_PAGE_SIZE, include_hidden),
-                                      call.from_user.id))
+                                      include_hidden))
         except Exception:
             pass
     await call.answer()

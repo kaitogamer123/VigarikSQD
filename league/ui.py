@@ -11,7 +11,7 @@ from aiogram.types import (
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.utils.markdown import html_decoration as hd
-from config import is_hidden_tester
+from config import INITIAL_ADMINS, is_hidden_tester
 from database import get_member
 from league.league_db import get_connection as get_db, get_user_league, lft_get
 from utils.keyboards import main_menu
@@ -63,38 +63,37 @@ def _lft_active(user_id: int) -> bool:
 
 def _root_keyboard(composition, user_id: int):
     if not composition:
-        lft_row = f"⏹ Остановить поиск" if _lft_active(user_id) else "🔎 Я ищу команду"
+        lft_row = "⏹ Остановить поиск" if _lft_active(user_id) else "🔎 Я ищу команду"
         return _reply([
-            ["🌍 Все составы"],
-            ["📝 Подать заявку в состав"],
+            ["🌍 Все составы", "📝 Подать заявку в состав"],
             ["📩 Мои заявки", "📥 Приглашения в состав"],
-            ["➕ Создать состав"],
+            ["➕ Создать состав", "👀 Игроки в поиске"],
             [lft_row],
-            ["👀 Игроки в поиске"],
             ["◀️ Назад в главное меню"],
         ])
     is_leader = int(composition["leader_id"]) == int(user_id)
     is_deputy = bool(composition["is_deputy"])
     if is_leader:
         second = "🏆 Лиги" if _row_verified(composition) else "🛡 Верифицировать состав"
-        rows = [["🌍 Все составы", second], ["⚙️ Настройка состава"]]
-        rows.append(["📋 Заявки в состав"])
-        rows.append(["👀 Игроки в поиске"])
-        rows.append(["📜 История матчей"])
-        rows.append(["◀️ Назад в главное меню"])
-        return _reply(rows)
+        return _reply([
+            ["🌍 Все составы", second],
+            ["⚙️ Настройка состава", "📋 Заявки в состав"],
+            ["👀 Игроки в поиске", "📜 История матчей"],
+            ["◀️ Назад в главное меню"],
+        ])
     if is_deputy:
-        rows = [["🌍 Все составы"], ["⚙️ Настройка состава"]]
-        if is_leader or composition["can_review_apps"]:
-            rows.append(["📋 Заявки в состав"])
-        rows.append(["👀 Игроки в поиске"])
-        rows.append(["📜 История матчей"])
-        rows.append(["◀️ Назад в главное меню"])
-        return _reply(rows)
+        first = ["👀 Игроки в поиске"]
+        if composition["can_review_apps"]:
+            first.insert(0, "📋 Заявки в состав")
+        return _reply([
+            ["🌍 Все составы", "⚙️ Настройка состава"],
+            first,
+            ["📜 История матчей"],
+            ["◀️ Назад в главное меню"],
+        ])
     return _reply([
-        ["🌍 Все составы"],
-        ["👥 Участники состава", "🚪 Выйти из состава"],
-        ["👀 Игроки в поиске"],
+        ["🌍 Все составы", "👥 Участники состава"],
+        ["👀 Игроки в поиске", "🚪 Выйти из состава"],
         ["📜 История матчей"],
         ["◀️ Назад в главное меню"],
     ])
@@ -233,7 +232,9 @@ async def open_settings(message: Message):
 # ─── Все составы / заявки ────────────────────────────────────────────────────
 async def _send_all(message: Message, edit: bool = False, viewer_id: int = None):
     viewer_id = int(viewer_id or getattr(message.from_user, "id", 0) or 0)
-    hidden_where = "" if is_hidden_tester(viewer_id) else "WHERE COALESCE(l.hidden, 0) = 0"
+    role = str((INITIAL_ADMINS.get(viewer_id) or {}).get("role", ""))
+    sees_hidden = is_hidden_tester(viewer_id) or role in ("president", "grand_vice")
+    hidden_where = "" if sees_hidden else "WHERE COALESCE(l.hidden, 0) = 0"
     conn = get_db()
     try:
         rows = conn.execute(f"""
