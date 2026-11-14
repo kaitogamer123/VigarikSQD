@@ -21,7 +21,19 @@ router = Router()
 async def apply_start(call: CallbackQuery, state: FSMContext):
     if get_user_league(call.from_user.id):
         await call.answer("Ты уже состоишь в составе", show_alert=True); return
-    await state.update_data(target_league_id=int(call.data.rsplit(":", 1)[-1]))
+    league_id = int(call.data.rsplit(":", 1)[-1])
+    conn = get_db()
+    league = conn.execute("SELECT is_open FROM leagues WHERE id = ?", (league_id,)).fetchone()
+    free = conn.execute(
+        "SELECT 1 FROM league_members WHERE league_id = ? AND user_id IS NULL LIMIT 1",
+        (league_id,),
+    ).fetchone()
+    conn.close()
+    if not league or not int(league["is_open"] or 0):
+        await call.answer("Набор в этот состав закрыт", show_alert=True); return
+    if not free:
+        await call.answer("В составе нет свободных мест", show_alert=True); return
+    await state.update_data(target_league_id=league_id)
     await state.set_state(LeagueStates.waiting_apply_text)
     await call.message.answer(
         "Напиши коротко, почему хочешь вступить в этот состав:",
@@ -35,6 +47,18 @@ async def apply_text(message: Message, state: FSMContext):
     if not reason:
         await message.answer("❌ Текст заявки не может быть пустым."); return
     conn = get_db()
+    league = conn.execute("SELECT is_open FROM leagues WHERE id = ?",
+                          (data.get("target_league_id"),)).fetchone()
+    free = conn.execute(
+        "SELECT 1 FROM league_members WHERE league_id = ? AND user_id IS NULL LIMIT 1",
+        (data.get("target_league_id"),),
+    ).fetchone()
+    if not league or not int(league["is_open"] or 0) or not free:
+        conn.close()
+        await state.clear()
+        await message.answer("❌ Набор в этот состав уже закрыт или мест нет.")
+        await show_root(message, state)
+        return
     exists = conn.execute("SELECT 1 FROM league_applications WHERE league_id = ? AND user_id = ?",
                           (data.get("target_league_id"), message.from_user.id)).fetchone()
     if not exists:

@@ -155,6 +155,15 @@ def init_league_db():
         UPDATE league_members SET role = 'участник'
         WHERE slot_index != 1 AND user_id IS NOT NULL AND role NOT IN ('участник', 'заместитель')
     """)
+    # Полные составы закрыты для набора: чистим старые заявки/приглашения.
+    full = [int(r["league_id"]) for r in cur.execute(
+        "SELECT league_id FROM league_members GROUP BY league_id "
+        "HAVING SUM(CASE WHEN user_id IS NULL THEN 1 ELSE 0 END) = 0"
+    ).fetchall()]
+    for league_id in full:
+        cur.execute("UPDATE leagues SET is_open = 0 WHERE id = ?", (league_id,))
+        cur.execute("DELETE FROM league_applications WHERE league_id = ?", (league_id,))
+        cur.execute("DELETE FROM league_invites WHERE league_id = ?", (league_id,))
     conn.commit()
     conn.close()
 

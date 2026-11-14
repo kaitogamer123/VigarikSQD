@@ -54,4 +54,19 @@ def _fill_slot(conn, league_id: int, user_id: int) -> bool:
             "WHERE user_id = ?", (user_id,))
     except Exception:
         pass
+
+    # Игрок вступил — его прежние заявки/приглашения больше не нужны.
+    conn.execute("DELETE FROM league_applications WHERE user_id = ?", (user_id,))
+    conn.execute("DELETE FROM league_invites WHERE invitee_id = ?", (user_id,))
+
+    # Состав стал полным: закрываем набор и убираем входящие заявки
+    # и исходящие приглашения этого состава.
+    free = conn.execute(
+        "SELECT COUNT(*) c FROM league_members WHERE league_id = ? AND user_id IS NULL",
+        (league_id,),
+    ).fetchone()["c"]
+    if int(free) == 0:
+        conn.execute("UPDATE leagues SET is_open = 0 WHERE id = ?", (league_id,))
+        conn.execute("DELETE FROM league_applications WHERE league_id = ?", (league_id,))
+        conn.execute("DELETE FROM league_invites WHERE league_id = ?", (league_id,))
     return True

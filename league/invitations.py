@@ -50,6 +50,16 @@ async def invite_target(message: Message, state: FSMContext):
     conn = get_db()
     if conn.execute("SELECT 1 FROM league_members WHERE user_id = ?", (user["user_id"],)).fetchone():
         conn.close(); await message.answer("❌ Игрок уже состоит в составе."); return
+    free = conn.execute(
+        "SELECT 1 FROM league_members WHERE league_id = ? AND user_id IS NULL LIMIT 1",
+        (composition["id"],),
+    ).fetchone()
+    if not free:
+        conn.close()
+        await message.answer("❌ В составе нет свободных мест — приглашение не отправлено.")
+        await state.clear()
+        await open_settings(message)
+        return
     try:
         conn.execute("INSERT INTO league_invites (league_id, inviter_id, invitee_id) VALUES (?, ?, ?)",
                      (composition["id"], message.from_user.id, user["user_id"])); conn.commit()
