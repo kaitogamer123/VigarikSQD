@@ -7,12 +7,13 @@
 import asyncio
 import json
 import logging
+import sqlite3
 from datetime import datetime
 
 from aiogram import Bot
 from aiogram.utils.markdown import html_decoration as hd
 
-from database import get_all_members, get_push_goals, get_setting, set_setting
+from database import DB_PATH, get_all_members, get_push_goals, get_setting, set_setting
 from services.api_service import get_player_profile
 
 logger = logging.getLogger(__name__)
@@ -52,6 +53,90 @@ PUSH_NORMS_BY_CLAN = {
 # Обратная совместимость: старый импорт PUSH_NORMS = нормы основы
 PUSH_NORMS = PUSH_NORMS_BY_CLAN["squad"]
 
+# Переопределения норм из админки (system_settings.push_norms_overrides).
+PUSH_NORMS_SETTING = "push_norms_overrides"
+_NORMS_CACHE = None
+
+
+def _load_norms_overrides() -> dict:
+    """Читает переопределения коэффициентов/лиг из vigarik.db (с кэшем)."""
+    global _NORMS_CACHE
+    if _NORMS_CACHE is not None:
+        return _NORMS_CACHE
+    data = {}
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=20.0)
+        row = conn.execute(
+            "SELECT value FROM system_settings WHERE key = ?",
+            (PUSH_NORMS_SETTING,),
+        ).fetchone()
+        conn.close()
+        if row and row[0]:
+            parsed = json.loads(row[0])
+            if isinstance(parsed, dict):
+                data = parsed
+    except Exception as e:
+        logger.warning(f"Не удалось прочитать переопределения норм пуша: {e}")
+    _NORMS_CACHE = data
+    return data
+
+
+def get_norms(clan: str = "squad") -> dict:
+    """Нормы клана с учётом изменений, сохранённых через админку."""
+    base = dict(PUSH_NORMS_BY_CLAN.get(clan, PUSH_NORMS))
+    overrides = _load_norms_overrides().get(clan) or {}
+    if not isinstance(overrides, dict):
+        overrides = {}
+    for key in base:
+        value = overrides.get(key)
+        if not isinstance(value, (list, tuple)) or len(value) != 2:
+            continue
+        try:
+            coef = float(value[0])
+            league = str(value[1]).strip()
+        except (TypeError, ValueError):
+            continue
+        if coef > 0 and league:
+            base[key] = (coef, league)
+    return base
+
+
+def _invalidate_norms_cache() -> None:
+    global _NORMS_CACHE
+    _NORMS_CACHE = None
+
+
+async def set_push_norm(clan: str, key: str, coef: float, league: str) -> None:
+    """Сохраняет одну норму клана в БД и сбрасывает кэш."""
+    raw = await get_setting(PUSH_NORMS_SETTING)
+    data = {}
+    try:
+        parsed = json.loads(raw) if raw else {}
+        if isinstance(parsed, dict):
+            data = parsed
+    except Exception:
+        data = {}
+    if not isinstance(data.get(clan), dict):
+        data[clan] = {}
+    data[clan][key] = [float(coef), str(league).strip()]
+    await set_setting(PUSH_NORMS_SETTING, json.dumps(data, ensure_ascii=False))
+    _invalidate_norms_cache()
+
+
+async def reset_push_norms(clan: str) -> None:
+    """Возвращает нормы клана к значениям из кода."""
+    raw = await get_setting(PUSH_NORMS_SETTING)
+    data = {}
+    try:
+        parsed = json.loads(raw) if raw else {}
+        if isinstance(parsed, dict):
+            data = parsed
+    except Exception:
+        data = {}
+    data.pop(clan, None)
+    await set_setting(PUSH_NORMS_SETTING, json.dumps(data, ensure_ascii=False))
+    _invalidate_norms_cache()
+
 GOAL_LABELS = {"trophies": "🏆 Трофеи", "league": "🏅 Лига"}
 
 # Ключ в system_settings (vigarik.db), где лежит снимок стартовых трофеев сезона.
@@ -87,7 +172,7 @@ def squad_registered(members: list[dict]) -> list[dict]:
 
 def calc_push_minimums(squad_members: list[dict], clan: str = "squad") -> dict:
     """Считает все трофейные нормы от ТОП-1 участника клана (X)."""
-    norms = PUSH_NORMS_BY_CLAN.get(clan, PUSH_NORMS)
+    norms = get_norms(clan)
     top = max(squad_members or [], key=lambda m: _safe_int(m.get("trophies")), default=None)
     x = _safe_int(top.get("trophies")) if top else 0
     result = {
@@ -200,7 +285,7 @@ async def check_season_results(bot: Bot, clan: str = "squad") -> str:
     if not members:
         return "📭 В этом клане сейчас нет зарегистрированных игроков."
 
-    norms = PUSH_NORMS_BY_CLAN.get(clan, PUSH_NORMS)
+    norms = get_norms(clan)
     mins = calc_push_minimums(members, clan)
     x = mins["top_trophies"]
     clan_title = clan.upper()

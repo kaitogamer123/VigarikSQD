@@ -9,16 +9,16 @@ from aiogram.utils.markdown import html_decoration as hd
 
 import config
 from database import get_all_members, get_push_goals, clear_old_push_data
-from utils.formatting import PUSH_GOAL_TEXTS, PUSH_GOAL_TEXT
+from utils.formatting import build_push_goal_text
 from utils.keyboards import push_goal_keyboard
-from .control import record_season_start_trophies, PUSH_CLANS
+from .control import record_season_start_trophies, PUSH_CLANS, get_norms
 
 logger = logging.getLogger(__name__)
 
 
 def _clan_text(clan: str) -> str:
-    """Текст анкеты цели по клану (fallback — текст основы)."""
-    return PUSH_GOAL_TEXTS.get(clan, PUSH_GOAL_TEXT)
+    """Текст анкеты цели по клану с актуальными нормами."""
+    return build_push_goal_text(clan, get_norms(clan))
 
 
 async def launch_push_vote(bot: Bot) -> dict:

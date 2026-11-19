@@ -8,13 +8,15 @@ import aiosqlite
 from aiogram import Router, F, Bot
 from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.utils.markdown import html_decoration as hd
 
 import config
 from database import DB_PATH, get_all_members, get_member, get_push_goals, save_push_goal
 from services.api_service import get_player_profile
 from utils.permissions import can_launch_push_goal, get_admin_rights_from_file, is_any_admin
-from utils.formatting import PUSH_GOAL_TEXTS, PUSH_GOAL_TEXT
+from utils.formatting import PUSH_GOAL_TEXTS, PUSH_GOAL_TEXT, build_push_goal_text
 from utils.keyboards import (
     launch_push_confirm_keyboard, push_goal_keyboard, confirm_push_goal_keyboard,
     change_push_goal_keyboard, notify_undecided_keyboard, confirm_notify_keyboard,
@@ -26,8 +28,9 @@ from .services import (
 )
 from .control import (
     GOAL_LABELS, PUSH_NORMS, PUSH_NORMS_BY_CLAN, PUSH_CLANS,
-    check_season_results, fmt_num, get_push_minimums,
-    get_season_start, season_start_trophies, start_new_push_season,
+    check_season_results, fmt_num, get_norms, get_push_minimums,
+    get_season_start, reset_push_norms, season_start_trophies,
+    set_push_norm, start_new_push_season,
 )
 
 logger = logging.getLogger(__name__)
@@ -54,6 +57,18 @@ PLAYERS_SETTINGS_TEXT = (
 # Защита от двойного нажатия «Да, запустить»: вторая рассылка стёрла бы выборы.
 _launch_lock = asyncio.Lock()
 
+# Редактирование минималок из админки.
+NORM_LABELS = {
+    "trophies_main": "🏆 Трофеи + лига",
+    "trophies_alt": "🏆 Трофеи без лиги",
+    "league_main": "🏅 Лига + кубки",
+    "league_alt": "🏅 Лига без кубков",
+}
+
+
+class PushNormStates(StatesGroup):
+    waiting_value = State()
+
 
 # ─── helpers ─────────────────────────────────────────────────────────────────
 
@@ -76,7 +91,7 @@ def _can_manage_push(member) -> bool:
 
 
 def _norms(clan: str) -> dict:
-    return PUSH_NORMS_BY_CLAN.get(clan, PUSH_NORMS)
+    return get_norms(clan)
 
 
 def _target_hint(clan: str, goal: str, mins: dict) -> str:
@@ -307,7 +322,7 @@ async def start_push_goal(message: Message):
 
     # Если игрок еще не голосовал — показываем анкету его клана
     if not user_vote:
-        await message.answer(PUSH_GOAL_TEXTS.get(clan, PUSH_GOAL_TEXT),
+        await message.answer(build_push_goal_text(clan, _norms(clan)),
                              parse_mode="HTML", reply_markup=push_goal_keyboard())
         return
 
@@ -393,7 +408,7 @@ async def confirm_goal(call: CallbackQuery):
 async def back_to_goal(call: CallbackQuery):
     member = await get_member(call.from_user.id)
     clan = _clan_of(member) if _is_push_player(member) else "squad"
-    await call.message.edit_text(PUSH_GOAL_TEXTS.get(clan, PUSH_GOAL_TEXT),
+    await call.message.edit_text(build_push_goal_text(clan, _norms(clan)),
                                  parse_mode="HTML", reply_markup=push_goal_keyboard())
     await call.answer()
 
@@ -728,6 +743,181 @@ async def show_push_targets_list(message: Message):
     await _answer_long(message, "\n\n━━━━━━━\n\n".join(sections), parse_mode="HTML")
 
 
+# ─── 5b. РЕДАКТИРОВАНИЕ МИНИМАЛОК ───
+
+def _norm_value_text(norms: dict, key: str) -> str:
+    coef, league = norms.get(key, (0, "—"))
+    return f"÷{float(coef):g} · {league}"
+
+
+def _norm_card(clan: str, mins: dict) -> str:
+    norms = _norms(clan)
+    title = CLAN_SHORT.get(clan, clan)
+    lines = [
+        f"📏 <b>Минималки пуш-сезона ({title})</b>",
+        f"👑 ТОП-1: {hd.quote(str(mins['top_nick']))} — {fmt_num(mins['top_trophies'])} 🏆",
+        "",
+    ]
+    for key, label in NORM_LABELS.items():
+        lines.append(f"• {label}: <b>{_norm_value_text(norms, key)}</b>")
+    lines += [
+        "",
+        f"Порог трофеев = ТОП-1 ÷ коэффициент. Сейчас, например, "
+        f"трофеи: {fmt_num(mins['trophies_main'])} / {fmt_num(mins['trophies_alt'])}.",
+        "Нажми на норму, чтобы изменить коэффициент и лигу.",
+    ]
+    return "\n".join(lines)
+
+
+def _norm_card_kb(clan: str) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=label, callback_data=f"push_norms:edit:{clan}:{key}")]
+        for key, label in NORM_LABELS.items()
+    ]
+    rows.append([InlineKeyboardButton(text="♻️ Вернуть стандартные",
+                                      callback_data=f"push_norms:reset:{clan}")])
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="push_norms:back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _can_edit_norms(user_id: int) -> bool:
+    if int(user_id) in OWNER_IDS:
+        return True
+    member = await get_member(user_id)
+    return _can_manage_push(member)
+
+
+@router.message(F.text == "📏 Минималки")
+async def open_push_norms(message: Message):
+    if not await _can_edit_norms(message.from_user.id):
+        await message.answer("⛔ Нет прав на изменение минималок.")
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Основа", callback_data="push_norms:clan:squad")],
+        [InlineKeyboardButton(text="Академия", callback_data="push_norms:clan:academy")],
+    ])
+    await message.answer("📏 Какой клан настраиваем?", reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("push_norms:clan:"))
+async def push_norms_open(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    if not await _can_edit_norms(call.from_user.id):
+        await call.answer("⛔ Нет прав", show_alert=True)
+        return
+    clan = call.data.rsplit(":", 1)[-1]
+    if clan not in PUSH_CLANS:
+        await call.answer("Неизвестный клан", show_alert=True)
+        return
+    mins = await get_push_minimums(clan)
+    await call.message.edit_text(_norm_card(clan, mins), parse_mode="HTML",
+                                 reply_markup=_norm_card_kb(clan))
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("push_norms:edit:"))
+async def push_norms_edit(call: CallbackQuery, state: FSMContext):
+    if not await _can_edit_norms(call.from_user.id):
+        await call.answer("⛔ Нет прав", show_alert=True)
+        return
+    try:
+        _, _, clan, key = call.data.split(":")
+    except ValueError:
+        await call.answer("Некорректная кнопка", show_alert=True)
+        return
+    if clan not in PUSH_CLANS or key not in NORM_LABELS:
+        await call.answer("Неизвестная норма", show_alert=True)
+        return
+    norms = _norms(clan)
+    await state.set_state(PushNormStates.waiting_value)
+    await state.update_data(norm_clan=clan, norm_key=key)
+    await call.message.edit_text(
+        f"✏️ <b>{NORM_LABELS[key]}</b> ({CLAN_SHORT.get(clan, clan)})\n\n"
+        f"Сейчас: <b>{_norm_value_text(norms, key)}</b>\n\n"
+        "Отправь новое значение в формате:\n"
+        "<code>коэффициент|лига</code>\n"
+        "Например: <code>1.45|Лега 3</code>\n\n"
+        "Для отмены — /cancel.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="◀️ Отмена", callback_data=f"push_norms:clan:{clan}"),
+        ]]),
+    )
+    await call.answer()
+
+
+@router.message(PushNormStates.waiting_value, F.text.startswith("/"))
+async def push_norms_guard(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("❌ Изменение минималки отменено.",
+                         reply_markup=admin_push_keyboard())
+
+
+@router.message(PushNormStates.waiting_value)
+async def push_norms_save(message: Message, state: FSMContext):
+    data = await state.get_data()
+    clan = data.get("norm_clan") or "squad"
+    key = data.get("norm_key")
+    if clan not in PUSH_CLANS or key not in NORM_LABELS:
+        await state.clear()
+        await message.answer("❌ Что-то пошло не так, начни заново.",
+                             reply_markup=admin_push_keyboard())
+        return
+    raw = (message.text or "").strip()
+    if "|" not in raw:
+        await message.answer("❌ Нужен формат <code>коэффициент|лига</code>, "
+                             "например <code>1.45|Лега 3</code>.", parse_mode="HTML")
+        return
+    coef_raw, league = raw.split("|", 1)
+    try:
+        coef = float(coef_raw.strip().replace(",", "."))
+    except ValueError:
+        await message.answer("❌ Коэффициент должен быть числом, например 1.45.")
+        return
+    league = league.strip()
+    if coef <= 1 or coef > 5:
+        await message.answer("❌ Коэффициент должен быть больше 1 и не больше 5.")
+        return
+    if not league or len(league) > 30:
+        await message.answer("❌ Лига должна быть непустой строкой до 30 символов.")
+        return
+    await set_push_norm(clan, key, coef, league)
+    await state.clear()
+    mins = await get_push_minimums(clan)
+    await message.answer(_norm_card(clan, mins), parse_mode="HTML",
+                         reply_markup=_norm_card_kb(clan))
+    await message.answer("✅ Минималка обновлена.", reply_markup=admin_push_keyboard())
+
+
+@router.callback_query(F.data.startswith("push_norms:reset:"))
+async def push_norms_reset(call: CallbackQuery):
+    if not await _can_edit_norms(call.from_user.id):
+        await call.answer("⛔ Нет прав", show_alert=True)
+        return
+    clan = call.data.rsplit(":", 1)[-1]
+    if clan not in PUSH_CLANS:
+        await call.answer("Неизвестный клан", show_alert=True)
+        return
+    await reset_push_norms(clan)
+    mins = await get_push_minimums(clan)
+    await call.message.edit_text(_norm_card(clan, mins), parse_mode="HTML",
+                                 reply_markup=_norm_card_kb(clan))
+    await call.answer("♻️ Вернул стандартные значения")
+
+
+@router.callback_query(F.data == "push_norms:back")
+async def push_norms_back(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    try:
+        await call.message.edit_text("📏 Настройка минималок закрыта.")
+    except Exception:
+        pass
+    await call.message.answer(
+        "📂 Управление пуш-сезоном\n\nВыбери действие:",
+        reply_markup=admin_push_keyboard())
+    await call.answer()
+
+
 # ─── 6. МИНИМАЛКИ НА ТЕКУЩИЙ МОМЕНТ ───
 
 @router.message(Command("MinTop", "mintop", ignore_case=True))
@@ -793,5 +983,6 @@ async def cmd_check_season(message: Message, bot: Bot):
         parse_mode="HTML",
     )
     for clan in PUSH_CLANS:
+
         report = await check_season_results(bot, clan)
         await _answer_long(message, report, parse_mode="HTML")

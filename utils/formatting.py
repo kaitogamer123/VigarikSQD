@@ -172,3 +172,71 @@ PUSH_GOAL_TEXTS = {
 
 # Обратная совместимость: старый импорт PUSH_GOAL_TEXT = текст основы
 PUSH_GOAL_TEXT = PUSH_GOAL_TEXTS["squad"]
+
+
+PUSH_GOAL_TEMPLATES = {
+    "squad": """🎯 Определи свою цель на этот сезон!
+
+🏆 Вариант 1 — Пуш трофеев:
+• Цель: трофеи ÷ {trophies_main_coef} от топ-1 участника клана
+(трофеи топ-1 участника делим на коэффициент, в данном случае {trophies_main_coef}, и получаем, сколько нужно аппнуть за сезон; так для всех вариантов снизу, где есть коэффициенты трофеев)
+• Лига: минимум {trophies_main_league}
+• Если не хочешь пушить лигу — пуш трофеев ÷ {trophies_alt_coef} + ранг минимум {trophies_alt_league}
+
+🏅 Вариант 2 — Пуш лиги:
+• Цель: минимум {league_main_league} к концу сезона
+• Трофеи ÷ {league_main_coef} от топ-1 участника клана
+• Если не хочешь пушить кубки — минимум {league_alt_league} + трофеи ÷ {league_alt_coef}
+
+📏 Минималки в цифрах на сегодня — команда /MinTop
+⏱ Изменить решение можно в течение 2 дней после выбора.
+Выбери свой вариант 👇
+(под сообщением две кнопки: «🏆 Трофеи» и «🏅 Лига»)
+Если не проголосуешь — оценивать будем по другой схеме.""",
+    "academy": """🎯 Определи свою цель на этот сезон! (Академия)
+
+🏆 Вариант 1 — Пуш трофеев:
+• Цель: трофеи ÷ {trophies_main_coef} от топ-1 участника клана
+(трофеи топ-1 участника делим на коэффициент, в данном случае {trophies_main_coef}, и получаем, сколько нужно аппнуть за сезон; так для всех вариантов снизу, где есть коэффициенты трофеев)
+• Лига: минимум {trophies_main_league}
+• Если не хочешь пушить лигу — пуш трофеев ÷ {trophies_alt_coef} + ранг минимум {trophies_alt_league}
+
+🏅 Вариант 2 — Пуш лиги:
+• Цель: минимум {league_main_league} к концу сезона
+• Трофеи ÷ {league_main_coef} от топ-1 участника клана
+• Если не хочешь пушить кубки — минимум {league_alt_league} + трофеи ÷ {league_alt_coef}
+
+📏 Минималки в цифрах на сегодня — команда /MinTop
+⏱ Изменить решение можно в течение 2 дней после выбора.
+Выбери свой вариант 👇
+(под сообщением две кнопки: «🏆 Трофеи» и «🏅 Лига»)
+Если не проголосуешь — оценивать будем по другой схеме.""",
+}
+
+
+def build_push_goal_text(clan: str, norms: dict) -> str:
+    """Анкета цели с актуальными коэффициентами и лигами (редактируются в админке)."""
+    template = PUSH_GOAL_TEMPLATES.get(clan, PUSH_GOAL_TEMPLATES["squad"])
+
+    def coef(key: str) -> str:
+        try:
+            return f"{float(norms[key][0]):g}"
+        except Exception:
+            return "—"
+
+    def league(key: str) -> str:
+        try:
+            return str(norms[key][1])
+        except Exception:
+            return "—"
+
+    return template.format(
+        trophies_main_coef=coef("trophies_main"),
+        trophies_main_league=league("trophies_main"),
+        trophies_alt_coef=coef("trophies_alt"),
+        trophies_alt_league=league("trophies_alt"),
+        league_main_coef=coef("league_main"),
+        league_main_league=league("league_main"),
+        league_alt_coef=coef("league_alt"),
+        league_alt_league=league("league_alt"),
+    )
