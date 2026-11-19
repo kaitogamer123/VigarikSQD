@@ -303,7 +303,8 @@ async def get_push_goals() -> list[dict]:
     async with aiosqlite.connect(DB_PATH, timeout=20.0) as db:
         db.row_factory = aiosqlite.Row
         query = """ 
-            SELECT m.user_id, m.username, m.game_nick, m.clan, m.trophies, p.goal 
+            SELECT m.user_id, m.username, m.game_nick, m.clan, m.trophies,
+                   p.goal, p.chosen_at, p.season_id
             FROM push_goals p 
             LEFT JOIN members m ON p.user_id = m.user_id
         """
