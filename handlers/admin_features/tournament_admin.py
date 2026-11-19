@@ -1,12 +1,15 @@
 """Админское управление турнирами."""
 import asyncio
+import json
 import logging
 from aiogram import Router, F, Bot
+from aiogram.filters import Command
+from config import CLAN_CHATS
 from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.utils.markdown import html_decoration as hd
 from aiogram.fsm.context import FSMContext
-from database import get_member, get_setting
+from database import get_member, get_setting, set_setting
 from utils.permissions import is_any_admin, has_role
 from utils.keyboards import (
     main_menu, admin_panel_keyboard, admin_push_keyboard, admin_members_keyboard,
@@ -794,6 +797,38 @@ async def admin_tournament_fill_bots(call: CallbackQuery, bot: Bot):
         _tournament_admin_card(tournament, teams),
         parse_mode="HTML", reply_markup=_tournament_admin_kb(tournament))
     await call.answer(f"🤖 Добавлено ботов: {added} (всего участников: {len(teams)})")
+
+
+@router.message(Command("set_tournament_topic"))
+async def cmd_set_tournament_topic(message: Message):
+    """Запоминает текущий топик как топик турниров для его клана."""
+    member = await get_member(message.from_user.id)
+    if not member or not is_any_admin(member):
+        await message.answer("⛔ Доступ только для администрации.")
+        return
+    thread_id = message.message_thread_id
+    if not thread_id:
+        await message.answer("❌ Отправь команду прямо в топике «Турниры» нужного клана.")
+        return
+    clan = None
+    for key, info in (CLAN_CHATS or {}).items():
+        try:
+            if int(info.get("chat_id")) == int(message.chat.id):
+                clan = key
+                break
+        except Exception:
+            continue
+    if not clan:
+        await message.answer("❌ Этот чат не привязан к клану сети.")
+        return
+    target = {"chat_id": int(message.chat.id), "thread_id": int(thread_id)}
+    await set_setting(f"tournament_topic_{clan}", json.dumps(target))
+    await message.answer(
+        f"✅ Топик турниров для «{clan}» сохранён.\n"
+        f"chat_id: <code>{target['chat_id']}</code>, "
+        f"thread_id: <code>{target['thread_id']}</code>",
+        parse_mode="HTML",
+    )
 
 
 @router.callback_query(F.data.startswith("trnadm:shuffle:"))

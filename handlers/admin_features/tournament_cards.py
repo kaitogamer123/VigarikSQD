@@ -108,21 +108,45 @@ def _tournament_reg_kb(tournament_id: int) -> InlineKeyboardMarkup:
 TOURNAMENT_TEST_TOPIC = {"chat_id": -1002187842577, "thread_id": 405196}
 
 
+def _saved_tournament_topics() -> dict:
+    """Топики турниров, сохранённые командой /set_tournament_topic."""
+    try:
+        import json
+        import sqlite3
+        from database import DB_PATH
+        conn = sqlite3.connect(DB_PATH, timeout=20.0)
+        rows = conn.execute(
+            "SELECT key, value FROM system_settings WHERE key LIKE 'tournament_topic_%'"
+        ).fetchall()
+        conn.close()
+        result = {}
+        for key, value in rows:
+            clan = str(key).replace("tournament_topic_", "", 1)
+            try:
+                target = json.loads(value)
+                if target.get("chat_id"):
+                    result[clan] = target
+            except Exception:
+                continue
+        return result
+    except Exception as e:
+        logger.warning(f"Не удалось прочитать топики турниров: {e}")
+        return {}
+
+
 def _tournament_topics(is_test: bool = False) -> dict:
     """Топики «Турниры» по кланам.
 
-    - Тестовый турнир: только тестовый топик Squad (TOURNAMENT_TEST_TOPIC
-      или config.TOURNAMENT_TEST_TOPIC).
-    - Боевой турнир: config.TOURNAMENT_TOPICS, если заданы, иначе новостные
-      топики из ADMIN_NEWS_TARGETS.
+    - Тестовый турнир: только тестовый топик Squad.
+    - Боевой турнир: config.TOURNAMENT_TOPICS + сохранённые через
+      /set_tournament_topic. Новостные топики больше НЕ используются.
     """
     import config
     if is_test:
         return {"squad": getattr(config, "TOURNAMENT_TEST_TOPIC", None) or TOURNAMENT_TEST_TOPIC}
-    topics = getattr(config, "TOURNAMENT_TOPICS", None)
-    if topics:
-        return topics
-    return getattr(config, "ADMIN_NEWS_TARGETS", {}) or {}
+    topics = dict(getattr(config, "TOURNAMENT_TOPICS", None) or {})
+    topics.update(_saved_tournament_topics())
+    return topics
 
 
 async def _publish_tournament_posts(bot: Bot, tournament_id: int):
