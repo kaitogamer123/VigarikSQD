@@ -103,6 +103,7 @@ async def save_battlelog(
 
     rows = []
     new_ranked_times = []
+    explicit_ranked_change = False
     for item in items:
         battle_time = _battle_time_iso(item.get("battleTime"))
         if not battle_time:
@@ -123,6 +124,8 @@ async def save_battlelog(
                     ranked_elo_change = None
             if ranked_elo_change is None:
                 new_ranked_times.append(battle_time)
+            else:
+                explicit_ranked_change = True
         rows.append((
             tag,
             battle_time,
@@ -165,18 +168,20 @@ async def save_battlelog(
                 current_elo = int(current_ranked_elo)
                 if prev_elo > 0:
                     delta = current_elo - prev_elo
-                    cur = await db.execute(
-                        """
-                        SELECT battle_time FROM battles
-                        WHERE player_tag = ? AND battle_time IN ({})
-                          AND ranked_elo_change IS NULL
-                        ORDER BY battle_time DESC LIMIT 1
-                        """.format(",".join("?" for _ in new_ranked_times)),
-                        (tag, *new_ranked_times),
-                    ) if new_ranked_times else None
-                    if new_ranked_times:
+                    target = None
+                    if new_ranked_times and not explicit_ranked_change:
+                        placeholders = ",".join("?" for _ in new_ranked_times)
+                        cur = await db.execute(
+                            f"""
+                            SELECT battle_time FROM battles
+                            WHERE player_tag = ? AND battle_time IN ({placeholders})
+                              AND ranked_elo_change IS NULL
+                            ORDER BY battle_time DESC LIMIT 1
+                            """,
+                            (tag, *new_ranked_times),
+                        )
                         target = await cur.fetchone()
-                    else:
+                    elif delta != 0 and not explicit_ranked_change:
                         cur = await db.execute(
                             """
                             SELECT battle_time FROM battles
