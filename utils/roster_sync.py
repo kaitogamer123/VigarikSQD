@@ -323,6 +323,12 @@ async def auto_update_trophies_task(bot: Bot) -> None:
                         player_tag=tag,
                         trophies=_safe_int(profile.get("trophies"), 0),
                         ranked_elo=_safe_int(profile.get("ranked_elo"), 0),
+                        ranked_rank_name=profile.get("ranked_rank_name"),
+                        ranked_season_max_rank=profile.get("ranked_season_max_rank"),
+                        ranked_season_max_elo=(
+                            _safe_int(profile.get("ranked_season_max_elo"), 0)
+                            if profile.get("ranked_season_max_elo") is not None else None
+                        ),
                         clan=clan_key,
                         role=member.get("role") or "member",
                         registered=_safe_int(member.get("registered"), 1),

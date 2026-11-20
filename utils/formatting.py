@@ -4,6 +4,31 @@ from aiogram.utils.markdown import html_decoration as hd
 from config import CLAN_DISPLAY, CLAN_HEADER_EMOJI, ROLE_LABELS, ROLES
 
 
+_RANKED_NAMES = {
+    "BRONZE": "Бронза",
+    "SILVER": "Серебро",
+    "GOLD": "Золото",
+    "DIAMOND": "Алмаз",
+    "MYTHIC": "Мифик",
+    "LEGENDARY": "Легенда",
+    "MASTERS": "Мастер",
+    "MASTER": "Мастер",
+}
+_RANKED_ROMAN = {"I": "1", "II": "2", "III": "3", "IV": "4"}
+
+
+def ranked_rank_label(value) -> str:
+    """'MYTHIC II' -> 'Мифик 2'; пустое значение -> пустая строка."""
+    text = str(value or "").strip().upper()
+    if not text:
+        return ""
+    parts = text.replace("-", " ").split()
+    if parts and parts[0] in _RANKED_NAMES:
+        parts[0] = _RANKED_NAMES[parts[0]]
+    parts = [_RANKED_ROMAN.get(part, part) for part in parts]
+    return " ".join(parts)
+
+
 def _safe_int(value, default: int = 0) -> int:
     try:
         return int(value) if value is not None else default

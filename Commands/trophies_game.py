@@ -17,6 +17,7 @@ from aiogram.utils.markdown import html_decoration as hd
 from config import CLAN_DISPLAY
 from database import get_all_members, get_member
 from services.api_service import get_player_battlelog, get_player_profile
+from utils.formatting import ranked_rank_label
 from player_stats_db import (
     ensure_player_tracked,
     get_recent_battles,
@@ -218,6 +219,14 @@ def _header(member: dict, profile: dict) -> str:
     highest = (profile or {}).get("highest_trophies") or trophies
     level = (profile or {}).get("exp_level") or "—"
     brawlers = (profile or {}).get("brawlers_count")
+    rank_now = ranked_rank_label((profile or {}).get("ranked_rank_name"))
+    rank_max = ranked_rank_label((profile or {}).get("ranked_season_max_rank"))
+    rank_bits = []
+    if rank_now:
+        rank_bits.append(f"сейчас {rank_now}")
+    if rank_max:
+        rank_bits.append(f"макс. в сезоне {rank_max}")
+    rank_line = " · ".join(rank_bits) if rank_bits else "—"
 
     return (
         f"🎮 Профиль Brawl Stars\n"
@@ -227,6 +236,7 @@ def _header(member: dict, profile: dict) -> str:
         f"🏰 Клуб: {hd.quote(str(clan_line))}\n"
         f"🏆 Кубки: {_fmt_num(trophies)}\n"
         f"🥇 Рекорд: {_fmt_num(highest)}\n"
+        f"🏅 Ранкед: {rank_line}\n"
         f"⭐ Уровень: {level}   🧸 Бравлеров: {brawlers or '—'}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━"
     )

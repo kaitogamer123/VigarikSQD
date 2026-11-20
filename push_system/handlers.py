@@ -16,7 +16,12 @@ import config
 from database import DB_PATH, get_all_members, get_member, get_push_goals, save_push_goal
 from services.api_service import get_player_profile
 from utils.permissions import can_launch_push_goal, get_admin_rights_from_file, is_any_admin
-from utils.formatting import PUSH_GOAL_TEXTS, PUSH_GOAL_TEXT, build_push_goal_text
+from utils.formatting import (
+    PUSH_GOAL_TEXTS,
+    PUSH_GOAL_TEXT,
+    build_push_goal_text,
+    ranked_rank_label,
+)
 from utils.keyboards import (
     launch_push_confirm_keyboard, push_goal_keyboard, confirm_push_goal_keyboard,
     change_push_goal_keyboard, notify_undecided_keyboard, confirm_notify_keyboard,
@@ -970,11 +975,10 @@ async def _push_report_clan(clan: str) -> str:
                 "target": target, "league": league, "left": left, "start": start,
             })
         else:
-            try:
-                elo = int(m.get("ranked_elo") or 0)
-            except (TypeError, ValueError):
-                elo = 0
-            unvoted.append({"nick": nick, "current": current, "elo": elo})
+            rank_label = ranked_rank_label(
+                m.get("ranked_season_max_rank") or m.get("ranked_rank_name")
+            )
+            unvoted.append({"nick": nick, "current": current, "rank": rank_label})
 
     chosen.sort(key=lambda item: item["left"], reverse=True)
     unvoted.sort(key=lambda item: item["current"], reverse=True)
@@ -1011,13 +1015,13 @@ async def _push_report_clan(clan: str) -> str:
     if not unvoted:
         lines.append("— нет игроков")
     for i, item in enumerate(unvoted, 1):
-        elo_text = f"ELO {fmt_num(item['elo'])}" if item["elo"] else "ELO —"
-        lines.append(f"{i}. {item['nick']} — {fmt_num(item['current'])} 🏆 · {elo_text}")
+        rank_text = f"Ранкед: {item['rank']}" if item["rank"] else "Ранкед: —"
+        lines.append(f"{i}. {item['nick']} — {fmt_num(item['current'])} 🏆 · {rank_text}")
 
     lines += [
         "",
         "ℹ️ Кубки — по последнему обновлению ростера; лигу бот не проверяет.",
-        "ℹ️ ELO показывается из профиля, если Brawl API его отдаёт; «—» — данных нет.",
+        "ℹ️ Ранкед — максимальный ранг за текущий сезон; «—» — API не отдаёт.",
     ]
     return "\n".join(lines)
 
