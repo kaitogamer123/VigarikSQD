@@ -274,6 +274,8 @@ def _summary_block(summary: dict) -> str:
         f"📊 Винрейт: {winrate}%",
         f"{trop_emoji} Кубки по боям: {_fmt_signed(trop)}",
     ]
+    if summary.get("ranked"):
+        lines.append(f"🏅 ELO по боям: {_fmt_signed(summary.get('elo', 0))}")
     if stars:
         lines.append(f"⭐ Звёздный игрок: {stars} раз")
     if top_b:
@@ -285,7 +287,8 @@ async def _period_text(period: str, member: dict, profile: dict, game_stats: dic
     tag = member.get("player_tag")
     title, hours, days = PERIODS[period]
 
-    since_joined = member.get("joined_at") if period in ("clan", "all") else None
+    join_marker = member.get("clan_joined_at") or member.get("joined_at")
+    since_joined = join_marker if period in ("clan", "all") else None
     summary = await get_window_summary(
         tag,
         hours=hours,
@@ -306,7 +309,7 @@ async def _period_text(period: str, member: dict, profile: dict, game_stats: dic
     parts = [_header(member, profile), "", title, _summary_block(summary)]
 
     if period in ("clan", "all"):
-        joined = _parse_db_time(member.get("joined_at"))
+        joined = _parse_db_time(join_marker)
         if joined:
             joined_text = joined.strftime("%d.%m.%Y в %H:%M")
             parts.append(f"🗓 В клане с: {joined_text}")

@@ -269,7 +269,8 @@ async def get_window_summary(
     """
     await init_player_stats_db()
     tag = norm_tag(player_tag)
-    empty = {"count": 0, "wins": 0, "losses": 0, "draws": 0, "other": 0, "trophies": 0}
+    empty = {"count": 0, "wins": 0, "losses": 0, "draws": 0, "other": 0,
+             "trophies": 0, "elo": 0, "ranked": 0}
     if not tag:
         return empty
 
@@ -291,7 +292,10 @@ async def get_window_summary(
                SUM(CASE WHEN result = 'defeat' THEN 1 ELSE 0 END) AS losses,
                SUM(CASE WHEN result = 'draw' THEN 1 ELSE 0 END) AS draws,
                SUM(CASE WHEN result NOT IN ('victory','defeat','draw') THEN 1 ELSE 0 END) AS other,
-               COALESCE(SUM(trophy_change), 0) AS trophies
+               COALESCE(SUM(trophy_change), 0) AS trophies,
+               COALESCE(SUM(ranked_elo_change), 0) AS elo,
+               SUM(CASE WHEN LOWER(COALESCE(battle_type, '')) LIKE '%rank%'
+                        THEN 1 ELSE 0 END) AS ranked
         FROM battles WHERE {where}
     """
     try:
@@ -374,6 +378,7 @@ async def get_players_window_stats(
             SUM(CASE WHEN result = 'defeat' THEN 1 ELSE 0 END) AS losses,
             SUM(CASE WHEN result = 'draw' THEN 1 ELSE 0 END) AS draws,
             COALESCE(SUM(trophy_change), 0) AS trophies,
+            COALESCE(SUM(ranked_elo_change), 0) AS elo,
             MAX(battle_time) AS last_time
         FROM battles WHERE {where}
         GROUP BY player_tag
@@ -390,6 +395,7 @@ async def get_players_window_stats(
                     "losses": int(d.get("losses") or 0),
                     "draws": int(d.get("draws") or 0),
                     "trophies": int(d.get("trophies") or 0),
+                    "elo": int(d.get("elo") or 0),
                     "last_time": d.get("last_time"),
                 }
     except Exception as e:

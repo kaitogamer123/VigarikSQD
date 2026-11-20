@@ -37,6 +37,7 @@ async def init_db() -> None:
                 registered INTEGER DEFAULT 0, 
                 hidden INTEGER DEFAULT 0,
                 joined_at TEXT DEFAULT (datetime('now')), 
+                clan_joined_at TEXT,
                 updated_at TEXT DEFAULT (datetime('now')) 
             ); 
             -- Хранилище сообщений-предложений 
@@ -83,6 +84,13 @@ async def init_db() -> None:
             await db.execute("ALTER TABLE members ADD COLUMN ranked_season_max_rank TEXT DEFAULT ''")
         if "ranked_season_max_elo" not in cols:
             await db.execute("ALTER TABLE members ADD COLUMN ranked_season_max_elo INTEGER DEFAULT 0")
+        if "clan_joined_at" not in cols:
+            await db.execute("ALTER TABLE members ADD COLUMN clan_joined_at TEXT")
+        # Для старых записей лучшая доступная оценка — дата первой регистрации.
+        await db.execute(
+            "UPDATE members SET clan_joined_at = joined_at "
+            "WHERE clan_joined_at IS NULL AND clan IS NOT NULL AND joined_at IS NOT NULL"
+        )
 
         # Создаём/поднимаем скрытых тестеров из конфига.
         for uid in config.HIDDEN_TESTER_IDS:
@@ -145,6 +153,15 @@ async def upsert_member(
     async with aiosqlite.connect(DB_PATH, timeout=20.0) as db:
         await db.execute("PRAGMA journal_mode=WAL;")
 
+        # Отдельная дата входа в клан: обновляется только при смене клана,
+        # а не при каждом обновлении профиля.
+        if clan:
+            await db.execute(
+                "UPDATE members SET clan_joined_at = datetime('now') "
+                "WHERE user_id = ? AND clan IS NOT NULL AND clan != ?",
+                (user_id, clan),
+            )
+
         # Атомарный апсерт по УНИКАЛЬНОМУ user_id
         await db.execute(
             """ 
@@ -190,6 +207,11 @@ async def upsert_member(
                 role, role,
                 registered, registered
             ),
+        )
+        await db.execute(
+            "UPDATE members SET clan_joined_at = datetime('now') "
+            "WHERE user_id = ? AND clan_joined_at IS NULL AND clan IS NOT NULL",
+            (user_id,),
         )
         await db.commit()
 

@@ -230,6 +230,7 @@ async def move_main_account(user_id: int, new_clan: str) -> None:
     async with aiosqlite.connect(DB_PATH, timeout=20.0) as db:
         await db.execute("""
             UPDATE members SET clan = ?, registered = 1, joined_at = datetime('now'),
+                clan_joined_at = datetime('now'),
                 updated_at = datetime('now') WHERE user_id = ?
         """, (new_clan, user_id))
         await db.commit()
