@@ -86,6 +86,7 @@ def admin_push_keyboard() -> ReplyKeyboardMarkup:
         [KeyboardButton(text="🎯 Запустить определение цели"), KeyboardButton(text="❓ Кто не определился с пушем")],
         [KeyboardButton(text="📊 Список кто что пушит"), KeyboardButton(text="⚙️ Настройка игроков")],
         [KeyboardButton(text="📏 Минималки"), KeyboardButton(text="✅ Проверить нормы (оба клана)")],
+        [KeyboardButton(text="📋 Отчёт по минималкам")],
         [KeyboardButton(text="📬 Прочитать предложки")],
         [KeyboardButton(text="🔙 Назад в админку")],
     ], resize_keyboard=True)

@@ -918,6 +918,123 @@ async def push_norms_back(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 
+def _report_target(goal: str, current: int, mins: dict, norms: dict) -> tuple[int, str]:
+    """Целевой порог трофеев и лига для выбранной цели (OR-варианты)."""
+    if goal == "trophies":
+        main, alt = mins["trophies_main"], mins["trophies_alt"]
+        if current >= alt:
+            return alt, norms["trophies_alt"][1]
+        return main, norms["trophies_main"][1]
+    main, alt = mins["league_main"], mins["league_alt"]
+    if current >= main:
+        return main, norms["league_main"][1]
+    return alt, norms["league_alt"][1]
+
+
+def _fmt_delta(value: int) -> str:
+    return f"+{fmt_num(value)}" if value > 0 else fmt_num(value)
+
+
+async def _push_report_clan(clan: str) -> str:
+    """Текстовый отчёт по нормам: выбравшие цель и не выбравшие."""
+    members = [
+        m for m in await get_all_members()
+        if _is_push_player(m) and _clan_of(m) == clan and m.get("user_id")
+    ]
+    all_goals = await get_push_goals()
+    goals = {}
+    for g in all_goals:
+        if g.get("clan") != clan or not g.get("user_id"):
+            continue
+        try:
+            goals[int(g["user_id"])] = g
+        except (TypeError, ValueError):
+            continue
+    snapshot = await get_season_start(clan)
+    mins = await get_push_minimums(clan)
+    norms = _norms(clan)
+    title = CLAN_SHORT.get(clan, clan)
+
+    chosen, unvoted = [], []
+    for m in members:
+        uid = int(m["user_id"])
+        current = int(m.get("trophies") or 0)
+        nick = hd.quote(str(m.get("game_nick") or m.get("username") or uid))
+        goal = (goals.get(uid) or {}).get("goal")
+        if goal in GOAL_LABELS:
+            target, league = _report_target(goal, current, mins, norms)
+            start = season_start_trophies(snapshot, uid)
+            left = target - current
+            chosen.append({
+                "nick": nick, "goal": goal, "current": current,
+                "target": target, "league": league, "left": left, "start": start,
+            })
+        else:
+            try:
+                elo = int(m.get("ranked_elo") or 0)
+            except (TypeError, ValueError):
+                elo = 0
+            unvoted.append({"nick": nick, "current": current, "elo": elo})
+
+    chosen.sort(key=lambda item: item["left"], reverse=True)
+    unvoted.sort(key=lambda item: item["current"], reverse=True)
+
+    lines = [
+        f"📊 <b>Отчёт по минималкам ({title})</b>",
+        f"👑 ТОП-1: {hd.quote(str(mins['top_nick']))} — {fmt_num(mins['top_trophies'])} 🏆",
+        f"🏁 Старт сезона: {hd.quote(str(snapshot.get('started_at')))}"
+        if snapshot.get("started_at") else "🏁 Старт сезона: не зафиксирован (/start_season)",
+        "",
+        f"✅ <b>Выбрали цель ({len(chosen)}):</b>",
+    ]
+    if not chosen:
+        lines.append("— нет игроков")
+    for i, item in enumerate(chosen, 1):
+        lines.append(f"{i}. {item['nick']} — {_goal_label(item['goal'])}")
+        if item["start"] is not None:
+            done = item["current"] - item["start"]
+            lines.append(
+                f"   сделал: {_fmt_delta(done)} 🏆 "
+                f"(старт {fmt_num(item['start'])} → {fmt_num(item['current'])})"
+            )
+        else:
+            lines.append(f"   сделал: — (старт не зафиксирован), сейчас {fmt_num(item['current'])} 🏆")
+        if item["left"] <= 0:
+            lines.append(f"   цель: {fmt_num(item['target'])} 🏆 — ✅ выполнено, проверить лигу: {item['league']}")
+        else:
+            lines.append(
+                f"   цель: {fmt_num(item['target'])} 🏆 ({item['league']}), "
+                f"осталось {_fmt_delta(item['left'])} 🏆"
+            )
+
+    lines += ["", f"❓ <b>Не выбрали цель ({len(unvoted)}):</b>"]
+    if not unvoted:
+        lines.append("— нет игроков")
+    for i, item in enumerate(unvoted, 1):
+        lines.append(f"{i}. {item['nick']} — {fmt_num(item['current'])} 🏆 · ELO {fmt_num(item['elo'])}")
+
+    lines += ["", "ℹ️ Кубки — по последнему обновлению ростера; лигу бот не проверяет."]
+    return "\n".join(lines)
+
+
+@router.message(Command("PushReport", "pushreport", ignore_case=True))
+async def cmd_push_report(message: Message):
+    """Списки по обоим кланам: кто выбрал цель и сколько осталось, кто не выбрал."""
+    if message.from_user.id not in OWNER_IDS:
+        member = await get_member(message.from_user.id)
+        if not _can_manage_push(member):
+            await message.answer("⛔ Нет прав на отчёт по минималкам.")
+            return
+    await message.answer("⏳ Собираю отчёт по минималкам...")
+    for clan in PUSH_CLANS:
+        await _answer_long(message, await _push_report_clan(clan), parse_mode="HTML")
+
+
+@router.message(F.text == "📋 Отчёт по минималкам")
+async def cmd_push_report_button(message: Message):
+    await cmd_push_report(message)
+
+
 @router.message(F.text == "✅ Проверить нормы (оба клана)")
 async def check_norms_both(message: Message, bot: Bot):
     """Проверка выполнения трофейных норм сразу по Основе и Академии."""
