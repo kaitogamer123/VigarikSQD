@@ -189,7 +189,11 @@ async def _load_bundle(user_id: int):
     # Сохраняем новые бои в постоянную player_stats.db.
     try:
         api_battles = await get_player_battlelog(tag)
-        new_count = await save_battlelog(tag, api_battles)
+        ranked_elo = profile.get("ranked_elo")
+        new_count = await save_battlelog(
+            tag, api_battles,
+            current_ranked_elo=int(ranked_elo) if ranked_elo is not None else None,
+        )
         if new_count:
             logger.info(f"[player_stats] {tag}: сохранено новых боёв: {new_count}")
         await ensure_player_tracked(
@@ -227,6 +231,14 @@ def _header(member: dict, profile: dict) -> str:
     if rank_max:
         rank_bits.append(f"макс. в сезоне {rank_max}")
     rank_line = " · ".join(rank_bits) if rank_bits else "—"
+    elo_now = (profile or {}).get("ranked_elo")
+    elo_max = (profile or {}).get("ranked_season_max_elo")
+    elo_bits = []
+    if elo_now is not None:
+        elo_bits.append(f"сейчас {_fmt_num(elo_now)}")
+    if elo_max is not None:
+        elo_bits.append(f"макс. в сезоне {_fmt_num(elo_max)}")
+    elo_line = " · ".join(elo_bits) if elo_bits else "—"
 
     return (
         f"🎮 Профиль Brawl Stars\n"
@@ -237,6 +249,7 @@ def _header(member: dict, profile: dict) -> str:
         f"🏆 Кубки: {_fmt_num(trophies)}\n"
         f"🥇 Рекорд: {_fmt_num(highest)}\n"
         f"🏅 Ранкед: {rank_line}\n"
+        f"📈 ELO: {elo_line}\n"
         f"⭐ Уровень: {level}   🧸 Бравлеров: {brawlers or '—'}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━"
     )
@@ -325,14 +338,25 @@ async def _battles_text(member: dict, profile: dict) -> str:
         emoji = _result_emoji(r)
         mode = MODE_RU.get(r.get("mode") or "", r.get("mode") or "Бой")
         mp = r.get("map") or "Случайная карта"
-        trop = _fmt_signed(r.get("trophy_change"))
         ago = _human_ago(_parse_db_time(r.get("battle_time")))
         brawler = r.get("brawler") or ""
         star = " ⭐" if r.get("star_player") else ""
-        ranked = " 🏅" if "rank" in str(r.get("battle_type") or "").lower() else ""
+        is_ranked = "rank" in str(r.get("battle_type") or "").lower()
         brawler_str = f" · {hd.quote(brawler)}" if brawler else ""
+        if is_ranked:
+            elo = r.get("ranked_elo_change")
+            if elo is None:
+                change = "ELO —"
+            elif int(elo) > 0:
+                change = f"поднял +{int(elo)} ELO 🏅"
+            elif int(elo) < 0:
+                change = f"слил {int(elo)} ELO 🏅"
+            else:
+                change = "ELO ±0 🏅"
+        else:
+            change = f"{_fmt_signed(r.get('trophy_change'))} 🏆"
         lines.append(
-            f"{emoji} {hd.quote(mode)} — {trop} 🏆{brawler_str}{star}{ranked}\n"
+            f"{emoji} {hd.quote(mode)} — {change}{brawler_str}{star}\n"
             f"    └ {hd.quote(str(mp))} · {ago}"
         )
 
