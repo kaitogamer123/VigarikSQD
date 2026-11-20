@@ -57,7 +57,11 @@ async def get_player_profile(player_tag: str) -> Optional[Dict[str, Any]]:
                         "solo_wins": data.get("soloVictories") or 0,
                         "duo_wins": data.get("duoVictories") or 0,
                         "trio_wins": data.get("3vs3Victories") or 0,
-                        "ranked_rank": data.get("rankedSeasonRank"),
+                        # Brawl Stars отдаёт ранкед-эло в rankedElo,
+                        # а не в rankedSeasonRank (такого поля в API нет).
+                        "ranked_elo": data.get("rankedElo") or 0,
+                        "ranked_rank": data.get("rankedRank"),
+                        "ranked_rank_name": data.get("rankedRankName"),
                         "brawlers_count": len(data.get("brawlers") or []),
                     }
                 elif response.status == 404:
