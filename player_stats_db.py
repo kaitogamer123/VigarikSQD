@@ -27,6 +27,14 @@ def _battle_time_iso(raw: str) -> Optional[str]:
             return None
 
 
+def is_ranked_battle(battle_type: str) -> bool:
+    """Ранкед-режим — это только soloRanked/teamRanked.
+
+    Тип "ranked" в battlelog API — обычный бой на кубки, а не Ranked.
+    """
+    return str(battle_type or "").strip().lower() in ("soloranked", "teamranked")
+
+
 def _trophy_change(item: Dict[str, Any], player_tag: str) -> int:
     battle = item.get("battle") or {}
     val = battle.get("trophyChange")
@@ -45,7 +53,13 @@ def _trophy_change(item: Dict[str, Any], player_tag: str) -> int:
     return 0
 
 
-async def init_player_stats_db() -> None:
+_INITIALIZED = False
+
+
+async def init_player_stats_db(force: bool = False) -> None:
+    global _INITIALIZED
+    if _INITIALIZED and not force:
+        return
     async with aiosqlite.connect(STATS_DB_PATH) as db:
         await db.execute("PRAGMA journal_mode=WAL;")
         await db.execute("PRAGMA synchronous=NORMAL;")
@@ -72,29 +86,51 @@ async def init_player_stats_db() -> None:
                 game_nick TEXT,
                 first_seen TEXT DEFAULT (datetime('now')),
                 start_trophies INTEGER DEFAULT 0,
-                last_ranked_elo INTEGER DEFAULT 0
+                last_ranked_elo INTEGER DEFAULT 0,
+                last_trophies INTEGER DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS stats_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT
             );
             """
         )
         for table, column, ddl in (
             ("battles", "ranked_elo_change", "INTEGER"),
             ("players_tracked", "last_ranked_elo", "INTEGER DEFAULT 0"),
+            ("players_tracked", "last_trophies", "INTEGER DEFAULT 0"),
         ):
             async with db.execute(f"PRAGMA table_info({table})") as cur:
                 cols = {row[1] for row in await cur.fetchall()}
             if column not in cols:
                 await db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
-        # Старые ранкед-бои: trophyChange в них был изменением ELO, а не кубков.
-        await db.execute(
-            "UPDATE battles SET ranked_elo_change = trophy_change, trophy_change = 0 "
-            "WHERE LOWER(COALESCE(battle_type, '')) LIKE '%rank%' "
-            "AND ranked_elo_change IS NULL AND COALESCE(trophy_change, 0) != 0"
-        )
+        # Исправление: тип "ranked" — это бой на кубки, а не ранкед-режим.
+        # Его изменение кубков ранее ошибочно уехало в ranked_elo_change.
+        # Выполняем один раз, чтобы не трогать новые корректные записи.
+        async with db.execute(
+            "SELECT 1 FROM stats_meta WHERE key = 'ranked_trophy_fix' LIMIT 1"
+        ) as cur:
+            fix_done = await cur.fetchone()
+        if not fix_done:
+            await db.execute(
+                "UPDATE battles SET trophy_change = ranked_elo_change, "
+                "ranked_elo_change = NULL "
+                "WHERE LOWER(COALESCE(battle_type, '')) = 'ranked' "
+                "AND ranked_elo_change IS NOT NULL"
+            )
+            await db.execute(
+                "INSERT OR REPLACE INTO stats_meta (key, value) "
+                "VALUES ('ranked_trophy_fix', datetime('now'))"
+            )
         await db.commit()
+    _INITIALIZED = True
 
 
 async def save_battlelog(
-    player_tag: str, items: List[Dict[str, Any]], current_ranked_elo: int = None
+    player_tag: str,
+    items: List[Dict[str, Any]],
+    current_ranked_elo: int = None,
+    current_trophies: int = None,
 ) -> int:
     await init_player_stats_db()
     tag = norm_tag(player_tag)
@@ -102,7 +138,9 @@ async def save_battlelog(
         return 0
 
     rows = []
-    new_ranked_times = []
+    new_times = []
+    ranked_candidate_times = []
+    trophy_candidate_times = []
     explicit_ranked_change = False
     for item in items:
         battle_time = _battle_time_iso(item.get("battleTime"))
@@ -111,21 +149,35 @@ async def save_battlelog(
         event = item.get("event") or {}
         battle = item.get("battle") or {}
         battle_type = str(battle.get("type") or "")
-        is_ranked = "rank" in battle_type.lower()
+        ranked_mode = is_ranked_battle(battle_type)
         rank = battle.get("rank")
-        # В ранкеде trophyChange — это изменение ранкед-очков, а не кубков.
-        ranked_elo_change = None
-        if is_ranked:
-            value = battle.get("trophyChange")
-            if value is not None:
-                try:
-                    ranked_elo_change = int(value)
-                except (TypeError, ValueError):
-                    ranked_elo_change = None
+        value = battle.get("trophyChange")
+        api_change = None
+        if value is not None:
+            try:
+                api_change = int(value)
+            except (TypeError, ValueError):
+                api_change = None
+        # В ранкед-режиме trophyChange — это изменение ранкед-очков, а не кубков.
+        ranked_elo_change = api_change if ranked_mode else None
+        if ranked_mode:
             if ranked_elo_change is None:
-                new_ranked_times.append(battle_time)
+                ranked_candidate_times.append(battle_time)
             else:
                 explicit_ranked_change = True
+            trophy_change = 0
+        else:
+            if api_change is not None:
+                trophy_change = api_change
+            else:
+                fallback = _trophy_change(item, tag)
+                if fallback:
+                    trophy_change = fallback
+                else:
+                    # None = «API не сказал», дельту вычислим по профилю.
+                    trophy_change = None
+                    trophy_candidate_times.append(battle_time)
+        new_times.append(battle_time)
         rows.append((
             tag,
             battle_time,
@@ -135,7 +187,7 @@ async def save_battlelog(
             str(battle.get("result") or "").lower(),
             int(rank) if isinstance(rank, (int, float)) else None,
             int(battle.get("duration") or 0),
-            0 if is_ranked else _trophy_change(item, tag),
+            trophy_change,
             ranked_elo_change,
         ))
 
@@ -147,49 +199,129 @@ async def save_battlelog(
             cur = await db.execute("SELECT COUNT(*) FROM battles WHERE player_tag = ?", (tag,))
             before = (await cur.fetchone())[0]
             cur = await db.execute(
-                "SELECT last_ranked_elo FROM players_tracked WHERE player_tag = ?", (tag,)
+                "SELECT last_ranked_elo, last_trophies FROM players_tracked WHERE player_tag = ?",
+                (tag,),
             )
             prev_row = await cur.fetchone()
             prev_elo = int(prev_row[0] or 0) if prev_row else 0
+            prev_trophies = int(prev_row[1] or 0) if prev_row else 0
+
+            # Дельту профиля можно вешать только на реально новые бои.
+            row_placeholders = ",".join("?" for _ in rows)
+            cur = await db.execute(
+                f"SELECT battle_time FROM battles WHERE player_tag = ? "
+                f"AND battle_time IN ({row_placeholders})",
+                (tag, *(r[1] for r in rows)),
+            )
+            existing_times = {r[0] for r in await cur.fetchall()}
+            new_times = [t for t in dict.fromkeys(new_times) if t not in existing_times]
+            ranked_candidate_times = [
+                t for t in dict.fromkeys(ranked_candidate_times) if t not in existing_times
+            ]
+            trophy_candidate_times = [
+                t for t in dict.fromkeys(trophy_candidate_times) if t not in existing_times
+            ]
+
             await db.executemany(
                 """
-                INSERT OR IGNORE INTO battles
+                INSERT INTO battles
                 (player_tag, battle_time, mode, map, battle_type, result, rank,
                  duration, trophy_change, ranked_elo_change)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(player_tag, battle_time, mode, map) DO UPDATE SET
+                    battle_type = excluded.battle_type,
+                    result = excluded.result,
+                    rank = excluded.rank,
+                    duration = excluded.duration,
+                    trophy_change = COALESCE(excluded.trophy_change,
+                                             battles.trophy_change),
+                    ranked_elo_change = COALESCE(excluded.ranked_elo_change,
+                                                 battles.ranked_elo_change)
+                WHERE (excluded.trophy_change IS NOT NULL
+                       AND COALESCE(battles.trophy_change, -999999)
+                           != excluded.trophy_change)
+                   OR (excluded.ranked_elo_change IS NOT NULL
+                       AND COALESCE(battles.ranked_elo_change, -999999)
+                           != excluded.ranked_elo_change)
                 """,
                 rows,
             )
             await db.commit()
 
-            # Если API не отдал изменение по soloRanked — считаем дельту
-            # от последнего известного ELO и вешаем её на самый свежий бой.
-            if current_ranked_elo is not None and int(current_ranked_elo) > 0:
-                current_elo = int(current_ranked_elo)
-                if prev_elo > 0:
-                    delta = current_elo - prev_elo
+            def as_int(value):
+                if value is None:
+                    return None
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    return None
+
+            current_elo = as_int(current_ranked_elo)
+            current_tr = as_int(current_trophies)
+            trophy_target = None
+
+            # Кубки: API не всегда отдаёт trophyChange, поэтому берём реальную
+            # разницу кубков профиля и вешаем её на самый свежий новый бой.
+            if current_tr is not None and prev_trophies > 0 and trophy_candidate_times:
+                delta = current_tr - prev_trophies
+                if delta != 0 and abs(delta) <= 300:
+                    placeholders = ",".join("?" for _ in trophy_candidate_times)
+                    cur = await db.execute(
+                        f"""
+                        SELECT battle_time FROM battles
+                        WHERE player_tag = ? AND battle_time IN ({placeholders})
+                          AND COALESCE(trophy_change, 0) = 0
+                          AND COALESCE(ranked_elo_change, 0) = 0
+                        ORDER BY battle_time DESC LIMIT 1
+                        """,
+                        (tag, *trophy_candidate_times),
+                    )
+                    trophy_target = await cur.fetchone()
+                    if trophy_target:
+                        await db.execute(
+                            "UPDATE battles SET trophy_change = ? "
+                            "WHERE player_tag = ? AND battle_time = ?",
+                            (delta, tag, trophy_target[0]),
+                        )
+
+            # ELO: API не отдаёт изменение ELO за бой, поэтому считаем дельту
+            # от последнего известного ELO и вешаем на новый ранкед-бой.
+            if current_elo is not None and prev_elo > 0 and not explicit_ranked_change:
+                delta = current_elo - prev_elo
+                if delta != 0 and abs(delta) <= 400:
                     target = None
-                    if new_ranked_times and not explicit_ranked_change:
-                        placeholders = ",".join("?" for _ in new_ranked_times)
+                    if ranked_candidate_times:
+                        placeholders = ",".join("?" for _ in ranked_candidate_times)
                         cur = await db.execute(
                             f"""
                             SELECT battle_time FROM battles
                             WHERE player_tag = ? AND battle_time IN ({placeholders})
                               AND ranked_elo_change IS NULL
+                              AND COALESCE(trophy_change, 0) = 0
                             ORDER BY battle_time DESC LIMIT 1
                             """,
-                            (tag, *new_ranked_times),
+                            (tag, *ranked_candidate_times),
                         )
                         target = await cur.fetchone()
-                    elif delta != 0 and not explicit_ranked_change:
+                    if not target:
+                        # Тип "ranked" в API бывает и ранкедом, и кубками.
+                        # Поэтому фоллбек — любой новый бой без изменений.
+                        placeholders = ",".join("?" for _ in new_times)
+                        exclude_sql = ""
+                        params = [tag, *new_times]
+                        if trophy_target:
+                            exclude_sql = " AND battle_time != ?"
+                            params.append(trophy_target[0])
                         cur = await db.execute(
-                            """
+                            f"""
                             SELECT battle_time FROM battles
-                            WHERE player_tag = ? AND ranked_elo_change IS NULL
-                              AND LOWER(battle_type) LIKE '%rank%'
+                            WHERE player_tag = ? AND battle_time IN ({placeholders})
+                              AND ranked_elo_change IS NULL
+                              AND COALESCE(trophy_change, 0) = 0
+                              {exclude_sql}
                             ORDER BY battle_time DESC LIMIT 1
                             """,
-                            (tag,),
+                            tuple(params),
                         )
                         target = await cur.fetchone()
                     if target:
@@ -198,15 +330,21 @@ async def save_battlelog(
                             "WHERE player_tag = ? AND battle_time = ?",
                             (delta, tag, target[0]),
                         )
+
+            if current_elo is not None or current_tr is not None:
                 await db.execute(
                     """
-                    INSERT INTO players_tracked (player_tag, last_ranked_elo)
-                    VALUES (?, ?)
-                    ON CONFLICT(player_tag) DO UPDATE SET last_ranked_elo = excluded.last_ranked_elo
+                    INSERT INTO players_tracked (player_tag, last_ranked_elo, last_trophies)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(player_tag) DO UPDATE SET
+                        last_ranked_elo = COALESCE(excluded.last_ranked_elo,
+                                                   players_tracked.last_ranked_elo),
+                        last_trophies = COALESCE(excluded.last_trophies,
+                                                 players_tracked.last_trophies)
                     """,
-                    (tag, current_elo),
+                    (tag, current_elo, current_tr),
                 )
-                await db.commit()
+            await db.commit()
 
             cur = await db.execute("SELECT COUNT(*) FROM battles WHERE player_tag = ?", (tag,))
             after = (await cur.fetchone())[0]
@@ -294,7 +432,8 @@ async def get_window_summary(
                SUM(CASE WHEN result NOT IN ('victory','defeat','draw') THEN 1 ELSE 0 END) AS other,
                COALESCE(SUM(trophy_change), 0) AS trophies,
                COALESCE(SUM(ranked_elo_change), 0) AS elo,
-               SUM(CASE WHEN LOWER(COALESCE(battle_type, '')) LIKE '%rank%'
+               SUM(CASE WHEN ranked_elo_change IS NOT NULL
+                          OR LOWER(COALESCE(battle_type, '')) IN ('soloranked', 'teamranked')
                         THEN 1 ELSE 0 END) AS ranked
         FROM battles WHERE {where}
     """

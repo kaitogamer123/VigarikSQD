@@ -190,9 +190,11 @@ async def _load_bundle(user_id: int):
     try:
         api_battles = await get_player_battlelog(tag)
         ranked_elo = profile.get("ranked_elo")
+        trophies_now = profile.get("trophies")
         new_count = await save_battlelog(
             tag, api_battles,
             current_ranked_elo=int(ranked_elo) if ranked_elo is not None else None,
+            current_trophies=int(trophies_now) if trophies_now is not None else None,
         )
         if new_count:
             logger.info(f"[player_stats] {tag}: сохранено новых боёв: {new_count}")
@@ -225,19 +227,25 @@ def _header(member: dict, profile: dict) -> str:
     brawlers = (profile or {}).get("brawlers_count")
     rank_now = ranked_rank_label((profile or {}).get("ranked_rank_name"))
     rank_max = ranked_rank_label((profile or {}).get("ranked_season_max_rank"))
+    rank_alltime = ranked_rank_label((profile or {}).get("ranked_alltime_max_rank"))
     rank_bits = []
     if rank_now:
         rank_bits.append(f"сейчас {rank_now}")
     if rank_max:
         rank_bits.append(f"макс. в сезоне {rank_max}")
+    if not rank_bits and rank_alltime:
+        rank_bits.append(f"макс. за всё время {rank_alltime}")
     rank_line = " · ".join(rank_bits) if rank_bits else "—"
-    elo_now = (profile or {}).get("ranked_elo")
-    elo_max = (profile or {}).get("ranked_season_max_elo")
+    elo_now = (profile or {}).get("ranked_elo") or 0
+    elo_max = (profile or {}).get("ranked_season_max_elo") or 0
+    elo_alltime = (profile or {}).get("ranked_alltime_max_elo") or 0
     elo_bits = []
-    if elo_now is not None:
+    if elo_now:
         elo_bits.append(f"сейчас {_fmt_num(elo_now)}")
-    if elo_max is not None:
+    if elo_max:
         elo_bits.append(f"макс. в сезоне {_fmt_num(elo_max)}")
+    if not elo_bits and elo_alltime:
+        elo_bits.append(f"макс. за всё время {_fmt_num(elo_alltime)}")
     elo_line = " · ".join(elo_bits) if elo_bits else "—"
 
     return (
@@ -344,26 +352,24 @@ async def _battles_text(member: dict, profile: dict) -> str:
         ago = _human_ago(_parse_db_time(r.get("battle_time")))
         brawler = r.get("brawler") or ""
         star = " ⭐" if r.get("star_player") else ""
-        is_ranked = "rank" in str(r.get("battle_type") or "").lower()
         brawler_str = f" · {hd.quote(brawler)}" if brawler else ""
-        if is_ranked:
-            elo = r.get("ranked_elo_change")
-            try:
-                elo_value = int(elo) if elo is not None else 0
-            except (TypeError, ValueError):
-                elo_value = 0
-            if elo_value > 0:
-                change = f"поднял +{elo_value} ELO 🏅"
-            elif elo_value < 0:
-                change = f"слил {elo_value} ELO 🏅"
-            else:
-                change = "+0"
+        try:
+            trophy_value = int(r.get("trophy_change") or 0)
+        except (TypeError, ValueError):
+            trophy_value = 0
+        try:
+            elo_value = int(r.get("ranked_elo_change") or 0)
+        except (TypeError, ValueError):
+            elo_value = 0
+        # Показываем то, что реально изменилось: сначала кубки, потом ELO.
+        if trophy_value:
+            change = f"{_fmt_signed(trophy_value)} 🏆"
+        elif elo_value > 0:
+            change = f"поднял +{elo_value} ELO 🏅"
+        elif elo_value < 0:
+            change = f"слил {elo_value} ELO 🏅"
         else:
-            try:
-                trophy_value = int(r.get("trophy_change") or 0)
-            except (TypeError, ValueError):
-                trophy_value = 0
-            change = f"{_fmt_signed(trophy_value)} 🏆" if trophy_value else "+0"
+            change = "+0"
         lines.append(
             f"{emoji} {hd.quote(mode)} — {change}{brawler_str}{star}\n"
             f"    └ {hd.quote(str(mp))} · {ago}"

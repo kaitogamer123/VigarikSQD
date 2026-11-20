@@ -215,6 +215,38 @@ async def upsert_member(
         )
         await db.commit()
 
+async def update_member_ranked(
+        user_id: int,
+        ranked_elo: int = None,
+        ranked_rank_name: str = None,
+        ranked_season_max_rank: str = None,
+        ranked_season_max_elo: int = None,
+) -> None:
+    """Точечно обновляет ранкед-поля, не трогая остальные данные участника."""
+    if not user_id:
+        return
+    async with aiosqlite.connect(DB_PATH, timeout=20.0) as db:
+        await db.execute(
+            """
+            UPDATE members SET
+                ranked_elo = CASE WHEN ? IS NOT NULL THEN ? ELSE ranked_elo END,
+                ranked_rank_name = CASE WHEN ? IS NOT NULL THEN ? ELSE ranked_rank_name END,
+                ranked_season_max_rank = CASE WHEN ? IS NOT NULL
+                    THEN ? ELSE ranked_season_max_rank END,
+                ranked_season_max_elo = CASE WHEN ? IS NOT NULL
+                    THEN ? ELSE ranked_season_max_elo END,
+                updated_at = datetime('now')
+            WHERE user_id = ?
+            """,
+            (ranked_elo, ranked_elo,
+             ranked_rank_name, ranked_rank_name,
+             ranked_season_max_rank, ranked_season_max_rank,
+             ranked_season_max_elo, ranked_season_max_elo,
+             int(user_id)),
+        )
+        await db.commit()
+
+
 async def get_clan_members(clan: str) -> List[dict]:
     """Возвращает упорядоченный список участников клана. Сортировка: Роль -> Кубки."""
     async with aiosqlite.connect(DB_PATH, timeout=20.0) as db:

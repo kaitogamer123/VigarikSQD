@@ -64,6 +64,8 @@ async def get_player_profile(player_tag: str) -> Optional[Dict[str, Any]]:
                         "ranked_rank_name": data.get("rankedRankName"),
                         "ranked_season_max_rank": data.get("highestSeasonRankedRankName"),
                         "ranked_season_max_elo": data.get("highestSeasonRankedElo"),
+                        "ranked_alltime_max_rank": data.get("highestAllTimeRankedRankName"),
+                        "ranked_alltime_max_elo": data.get("highestAllTimeRankedElo"),
                         "brawlers_count": len(data.get("brawlers") or []),
                     }
                 elif response.status == 404:
