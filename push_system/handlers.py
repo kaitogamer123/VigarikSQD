@@ -918,6 +918,21 @@ async def push_norms_back(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 
+@router.message(F.text == "✅ Проверить нормы (оба клана)")
+async def check_norms_both(message: Message, bot: Bot):
+    """Проверка выполнения трофейных норм сразу по Основе и Академии."""
+    if not await _can_edit_norms(message.from_user.id):
+        await message.answer("⛔ Нет прав на проверку норм.")
+        return
+    await message.answer(
+        "⏳ Проверяю нормы по Основе и Академии. Опрашиваю Brawl Stars API — "
+        "это может занять до пары минут, подожди."
+    )
+    for clan in PUSH_CLANS:
+        report = await check_season_results(bot, clan)
+        await _answer_long(message, report, parse_mode="HTML")
+
+
 # ─── 6. МИНИМАЛКИ НА ТЕКУЩИЙ МОМЕНТ ───
 
 @router.message(Command("MinTop", "mintop", ignore_case=True))
@@ -956,7 +971,7 @@ async def cmd_min_top(message: Message):
 @router.message(Command("start_season"))
 async def cmd_start_season(message: Message):
     """Фиксирует текущие кубки кланов как стартовую точку сезона (без рассылки)."""
-    if message.from_user.id != 7899153362:
+    if message.from_user.id not in OWNER_IDS:
         return
     await message.answer("⏳ Фиксирую стартовые трофеи сезона по основе и академии...")
     lines = []
@@ -975,7 +990,7 @@ async def cmd_start_season(message: Message):
 @router.message(Command("check_season"))
 async def cmd_check_season(message: Message, bot: Bot):
     """Запрашивает API, проверяет трофейные нормы и выдает отчет по штрафникам."""
-    if message.from_user.id != 7899153362:
+    if message.from_user.id not in OWNER_IDS:
         return
     await message.answer(
         "⏳ Запуск проверки выполнения норм сезона... \n"
