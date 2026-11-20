@@ -336,7 +336,9 @@ async def save_battlelog(
                             (delta, tag, target[0]),
                         )
 
-            if current_elo is not None or current_tr is not None:
+            # Базу отсчёта двигаем только когда реально сохранили новые бои.
+            # Иначе профиль может обновиться раньше battlelog, и дельта потеряется.
+            if new_times and (current_elo is not None or current_tr is not None):
                 await db.execute(
                     """
                     INSERT INTO players_tracked (player_tag, last_ranked_elo, last_trophies)
