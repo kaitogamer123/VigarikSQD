@@ -278,6 +278,11 @@ def _mintop_progress_text(
     lines = ["━━━━━━━", "🎯 Твой прогресс "]
     if goal not in GOAL_VARIANTS:
         lines.append(f"У тебя {fmt_num(trophies)} 🏆{source}, цель ещё не выбрана.")
+        rank_label = ranked_rank_label(rank_value)
+        if rank_label:
+            lines.append(f"🏅 Ранкед: макс. в сезоне {rank_label}")
+        else:
+            lines.append("🏅 Ранкед: API пока не отдал данные")
         lines.append("Выбери её кнопкой «🎯 Выбрать цель пуша» — и я посчитаю, сколько тебе осталось.")
         return "\n".join(lines)
     lines.append(f"У тебя {fmt_num(trophies)} 🏆{source}, выбрано: {_goal_label(goal)} ")

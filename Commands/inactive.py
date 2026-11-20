@@ -17,6 +17,7 @@ from aiogram.utils.markdown import html_decoration as hd
 from config import CLAN_CHATS
 from database import get_clan_members, get_member
 from player_stats_db import STATS_DB_PATH, norm_tag
+from utils.permissions import is_any_admin
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -176,16 +177,28 @@ async def _send_report(target: Message, clan_type: str) -> None:
         await target.answer("❌ Не удалось вывести список активности. Попробуй позже.")
 
 
-@router.message(Command(commands=["inactive", "InActive", "in_active"]))
+@router.message(Command(commands=["inactive", "InActive", "in_active"], ignore_case=True))
 async def inactive_handler(message: Message):
     clan_type = get_clan_type_by_chat(message.chat.id)
 
-    if not clan_type and message.chat.type == "private":
-        member = await get_member(message.from_user.id)
-        own_clan = (member or {}).get("clan")
-        if own_clan in (CLAN_CHATS or {}):
-            clan_type = own_clan
+    if not clan_type:
+        if message.chat.type == "private":
+            member = await get_member(message.from_user.id)
+            own_clan = (member or {}).get("clan")
+            if own_clan in (CLAN_CHATS or {}):
+                clan_type = own_clan
+            else:
+                await message.answer(
+                    "📊 Выбери клан, чтобы посмотреть активность:",
+                    reply_markup=_clan_choice_keyboard(),
+                )
+                return
         else:
+            # В группе, которая не привязана к клану (например, админ-чат),
+            # показываем выбор клана только администрации.
+            member = await get_member(message.from_user.id)
+            if not (member and is_any_admin(member)):
+                return
             await message.answer(
                 "📊 Выбери клан, чтобы посмотреть активность:",
                 reply_markup=_clan_choice_keyboard(),
