@@ -345,16 +345,22 @@ async def _battles_text(member: dict, profile: dict) -> str:
         brawler_str = f" · {hd.quote(brawler)}" if brawler else ""
         if is_ranked:
             elo = r.get("ranked_elo_change")
-            if elo is None:
-                change = "ELO —"
-            elif int(elo) > 0:
-                change = f"поднял +{int(elo)} ELO 🏅"
-            elif int(elo) < 0:
-                change = f"слил {int(elo)} ELO 🏅"
+            try:
+                elo_value = int(elo) if elo is not None else 0
+            except (TypeError, ValueError):
+                elo_value = 0
+            if elo_value > 0:
+                change = f"поднял +{elo_value} ELO 🏅"
+            elif elo_value < 0:
+                change = f"слил {elo_value} ELO 🏅"
             else:
-                change = "ELO ±0 🏅"
+                change = "+0"
         else:
-            change = f"{_fmt_signed(r.get('trophy_change'))} 🏆"
+            try:
+                trophy_value = int(r.get("trophy_change") or 0)
+            except (TypeError, ValueError):
+                trophy_value = 0
+            change = f"{_fmt_signed(trophy_value)} 🏆" if trophy_value else "+0"
         lines.append(
             f"{emoji} {hd.quote(mode)} — {change}{brawler_str}{star}\n"
             f"    └ {hd.quote(str(mp))} · {ago}"
