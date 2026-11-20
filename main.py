@@ -42,6 +42,7 @@ from league.competitive import scrim_watchdog_task
 from game_database import init_game_db
 from player_stats_db import init_player_stats_db
 from utils.stats_collector import auto_collect_active_task, auto_collect_stats_task
+from utils.command_menu import setup_command_menu
 from Commands.trophies_game import router as trophies_router
 from Commands.inactive import router as inactive_router
 from Commands.clan_stats import router as clan_stats_router
@@ -211,6 +212,9 @@ async def main():
         logging.warning("Active webhook detected; removing it before polling.")
         await bot.delete_webhook(drop_pending_updates=False)
         logging.info("Webhook removed; pending updates preserved.")
+
+    # Подсказки команд при вводе «/» в личке и группах.
+    await setup_command_menu(bot)
 
     # start_polling invokes @dp.startup automatically; don't initialize twice.
     logging.info("Starting bot polling.")
