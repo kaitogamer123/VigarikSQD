@@ -41,7 +41,7 @@ from league.competitive import router as competitive_router
 from league.competitive import scrim_watchdog_task
 from game_database import init_game_db
 from player_stats_db import init_player_stats_db
-from utils.stats_collector import auto_collect_stats_task
+from utils.stats_collector import auto_collect_active_task, auto_collect_stats_task
 from Commands.trophies_game import router as trophies_router
 from Commands.inactive import router as inactive_router
 from Commands.clan_stats import router as clan_stats_router
@@ -198,6 +198,8 @@ async def main():
     asyncio.create_task(auto_refresh_timer_task(bot))
     # Фоновый сборщик истории боёв всех игроков (каждые 10 минут)
     asyncio.create_task(auto_collect_stats_task(bot))
+    # Быстрый дозор по активным игрокам (раз в минуту)
+    asyncio.create_task(auto_collect_active_task(bot))
     asyncio.create_task(composition_departure_monitor_task(bot))
     asyncio.create_task(scrim_watchdog_task(bot))
     asyncio.create_task(lft_watchdog_task(bot))

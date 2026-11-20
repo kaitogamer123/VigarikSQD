@@ -455,6 +455,27 @@ async def get_window_summary(
         return empty
 
 
+async def get_active_tags(minutes: int = 45, limit: int = 30) -> List[str]:
+    """Теги игроков, у которых был бой за последние N минут."""
+    await init_player_stats_db()
+    try:
+        async with aiosqlite.connect(STATS_DB_PATH, timeout=20.0) as db:
+            cur = await db.execute(
+                """
+                SELECT player_tag FROM battles
+                GROUP BY player_tag
+                HAVING MAX(battle_time) >= datetime('now', ?)
+                ORDER BY MAX(battle_time) DESC
+                LIMIT ?
+                """,
+                (f"-{int(minutes)} minutes", int(limit)),
+            )
+            return [row[0] for row in await cur.fetchall()]
+    except Exception as e:
+        logger.error(f"get_active_tags error: {e}")
+        return []
+
+
 async def get_recent_battles(player_tag: str, limit: int = 15) -> List[dict]:
     await init_player_stats_db()
     tag = norm_tag(player_tag)

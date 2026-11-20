@@ -9,6 +9,8 @@ import logging
 from database import get_all_members, update_member_ranked
 from player_stats_db import (
     ensure_player_tracked,
+    get_active_tags,
+    get_tracked_player,
     init_player_stats_db,
     save_battlelog,
 )
@@ -18,6 +20,13 @@ logger = logging.getLogger(__name__)
 
 COLLECT_INTERVAL_SECONDS = 10 * 60
 PAUSE_BETWEEN_PLAYERS = 0.6
+
+# Быстрый дозор за теми, кто играет прямо сейчас: раз в минуту проверяем
+# только недавно активных игроков, чтобы не долбить API по всей базе.
+ACTIVE_INTERVAL_SECONDS = 60
+ACTIVE_WINDOW_MINUTES = 45
+ACTIVE_TAGS_LIMIT = 30
+ACTIVE_PAUSE = 0.25
 
 
 def _safe_int(value):
@@ -72,6 +81,65 @@ async def collect_once() -> tuple[int, int]:
         await asyncio.sleep(PAUSE_BETWEEN_PLAYERS)
 
     return processed, new_total
+
+
+async def collect_active_once() -> int:
+    """
+    Быстрый проход по недавно активным игрокам.
+
+    Сначала тянем профиль (1 запрос). Battlelog запрашиваем только если
+    изменились кубки или ELO — так на каждого активного игрока уходит
+    1–2 запроса в минуту вместо постоянных двух.
+    """
+    tags = await get_active_tags(ACTIVE_WINDOW_MINUTES, ACTIVE_TAGS_LIMIT)
+    updated = 0
+    for tag in tags:
+        try:
+            tracked = await get_tracked_player(tag)
+            profile = await get_player_profile(tag)
+            if not profile:
+                await asyncio.sleep(ACTIVE_PAUSE)
+                continue
+
+            elo_now = _safe_int(profile.get("ranked_elo")) or 0
+            tr_now = _safe_int(profile.get("trophies")) or 0
+            elo_prev = int((tracked or {}).get("last_ranked_elo") or 0)
+            tr_prev = int((tracked or {}).get("last_trophies") or 0)
+
+            # Ничего не поменялось — новый бой маловероятен, battlelog не тратим.
+            if tracked and elo_now == elo_prev and tr_now == tr_prev:
+                await asyncio.sleep(ACTIVE_PAUSE)
+                continue
+
+            battles = await get_player_battlelog(tag)
+            await save_battlelog(
+                tag,
+                battles,
+                current_ranked_elo=elo_now,
+                current_trophies=tr_now,
+            )
+            updated += 1
+        except Exception as e:
+            logger.error(f"[stats_active] {tag}: {e}")
+        await asyncio.sleep(ACTIVE_PAUSE)
+
+    return updated
+
+
+async def auto_collect_active_task(bot=None) -> None:
+    """Проверка активных игроков раз в минуту (ELO/кубки почти по каждому бою)."""
+    await init_player_stats_db()
+    await asyncio.sleep(25)
+
+    while True:
+        try:
+            updated = await collect_active_once()
+            if updated:
+                logger.info(f"[stats_active] обновлено игроков: {updated}")
+        except Exception as e:
+            logger.error(f"[stats_active] сбой прохода: {e}")
+
+        await asyncio.sleep(ACTIVE_INTERVAL_SECONDS)
 
 
 async def auto_collect_stats_task(bot=None) -> None:
