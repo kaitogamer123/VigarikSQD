@@ -8,6 +8,9 @@ from utils.secrets import BRAWL_API_TOKEN, TELEGRAM_TOKEN, get_secret
 
 TOKEN = TELEGRAM_TOKEN
 
+# Владельцы бота: видят админские команды в подсказках Telegram.
+OWNER_IDS = frozenset({7899153362, 5281584435})
+
 # Скрытые тестовые аккаунты (твинки): полный доступ, но их нет в списках.
 # Задаётся в server_secrets.env: HIDDEN_TESTER_IDS=123456789,987654321
 HIDDEN_TESTER_IDS = frozenset(

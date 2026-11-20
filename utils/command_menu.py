@@ -7,8 +7,11 @@ from aiogram.types import (
     BotCommandScopeAllChatAdministrators,
     BotCommandScopeAllGroupChats,
     BotCommandScopeAllPrivateChats,
+    BotCommandScopeChat,
     BotCommandScopeDefault,
 )
+
+from config import OWNER_IDS
 
 logger = logging.getLogger(__name__)
 
@@ -21,19 +24,15 @@ BASE_COMMANDS = [
     BotCommand(command="pushreport", description="Отчёт по минималкам обоих кланов"),
 ]
 
-# Только в личке с ботом.
+# Личка обычных участников: только личные команды.
 PRIVATE_COMMANDS = BASE_COMMANDS + [
     BotCommand(command="start", description="Главное меню"),
     BotCommand(command="notify_on", description="Включить уведомления"),
     BotCommand(command="notify_off", description="Выключить уведомления"),
-    BotCommand(command="eventstarted", description="Запустить выбор цели пуша"),
-    BotCommand(command="start_season", description="Зафиксировать старт пуш-сезона"),
-    BotCommand(command="check_season", description="Проверить итоги сезона"),
-    BotCommand(command="set_tournament_topic", description="Настроить топик турниров"),
 ]
 
-# В группах админам показываем расширенный список.
-GROUP_ADMIN_COMMANDS = BASE_COMMANDS + [
+# Личка владельцев: плюс админские команды.
+OWNER_COMMANDS = PRIVATE_COMMANDS + [
     BotCommand(command="eventstarted", description="Запустить выбор цели пуша"),
     BotCommand(command="start_season", description="Зафиксировать старт пуш-сезона"),
     BotCommand(command="check_season", description="Проверить итоги сезона"),
@@ -47,11 +46,28 @@ async def setup_command_menu(bot: Bot) -> None:
         (BotCommandScopeDefault(), BASE_COMMANDS),
         (BotCommandScopeAllPrivateChats(), PRIVATE_COMMANDS),
         (BotCommandScopeAllGroupChats(), BASE_COMMANDS),
-        (BotCommandScopeAllChatAdministrators(), GROUP_ADMIN_COMMANDS),
     ]
     for scope, commands in scopes:
         try:
             await bot.set_my_commands(commands=commands, scope=scope)
         except Exception as e:
             logger.warning(f"Не удалось обновить меню команд ({type(scope).__name__}): {e}")
+
+    # Админские команды — только в личке владельцев.
+    for owner_id in OWNER_IDS:
+        try:
+            await bot.set_my_commands(
+                commands=OWNER_COMMANDS,
+                scope=BotCommandScopeChat(chat_id=int(owner_id)),
+            )
+        except Exception as e:
+            logger.warning(f"Не удалось обновить меню команд владельца {owner_id}: {e}")
+
+    # Убираем старый общий админский набор, если он был выставлен раньше.
+    try:
+        await bot.delete_my_commands(scope=BotCommandScopeAllChatAdministrators())
+    except Exception as e:
+        logger.warning(f"Не удалось очистить меню команд админов чатов: {e}")
+
     logger.info("Меню команд Telegram обновлено")
+
