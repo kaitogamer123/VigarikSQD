@@ -141,7 +141,8 @@ async def save_battlelog(
     new_times = []
     ranked_candidate_times = []
     trophy_candidate_times = []
-    explicit_ranked_change = False
+    explicit_trophy_by_time = {}
+    explicit_elo_by_time = {}
     for item in items:
         battle_time = _battle_time_iso(item.get("battleTime"))
         if not battle_time:
@@ -164,11 +165,12 @@ async def save_battlelog(
             if ranked_elo_change is None:
                 ranked_candidate_times.append(battle_time)
             else:
-                explicit_ranked_change = True
+                explicit_elo_by_time[battle_time] = ranked_elo_change
             trophy_change = 0
         else:
             if api_change is not None:
                 trophy_change = api_change
+                explicit_trophy_by_time[battle_time] = api_change
             else:
                 fallback = _trophy_change(item, tag)
                 if fallback:
@@ -221,6 +223,8 @@ async def save_battlelog(
             trophy_candidate_times = [
                 t for t in dict.fromkeys(trophy_candidate_times) if t not in existing_times
             ]
+            explicit_trophy_sum = sum(explicit_trophy_by_time.get(t, 0) for t in new_times)
+            explicit_elo_sum = sum(explicit_elo_by_time.get(t, 0) for t in new_times)
 
             await db.executemany(
                 """
@@ -263,7 +267,8 @@ async def save_battlelog(
             # Кубки: API не всегда отдаёт trophyChange, поэтому берём реальную
             # разницу кубков профиля и вешаем её на самый свежий новый бой.
             if current_tr is not None and prev_trophies > 0 and trophy_candidate_times:
-                delta = current_tr - prev_trophies
+                # Вычитаем изменения, которые API уже отдал сам, чтобы не задвоить.
+                delta = current_tr - prev_trophies - explicit_trophy_sum
                 if delta != 0 and abs(delta) <= 300:
                     placeholders = ",".join("?" for _ in trophy_candidate_times)
                     cur = await db.execute(
@@ -286,8 +291,8 @@ async def save_battlelog(
 
             # ELO: API не отдаёт изменение ELO за бой, поэтому считаем дельту
             # от последнего известного ELO и вешаем на новый ранкед-бой.
-            if current_elo is not None and prev_elo > 0 and not explicit_ranked_change:
-                delta = current_elo - prev_elo
+            if current_elo is not None and prev_elo > 0:
+                delta = current_elo - prev_elo - explicit_elo_sum
                 if delta != 0 and abs(delta) <= 400:
                     target = None
                     if ranked_candidate_times:
