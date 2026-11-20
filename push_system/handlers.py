@@ -34,7 +34,7 @@ from .services import (
 from .control import (
     GOAL_LABELS, PUSH_NORMS, PUSH_NORMS_BY_CLAN, PUSH_CLANS,
     check_season_results, fmt_num, get_norms, get_push_minimums,
-    get_season_start, reset_push_norms, season_start_trophies,
+    get_season_start, league_check, reset_push_norms, season_start_trophies,
     set_push_norm, start_new_push_season,
 )
 
@@ -43,7 +43,7 @@ router = Router()
 
 OWNER_IDS = {7899153362, 5281584435}
 MINTOP_HINT = "📏 Минималки и сколько тебе осталось до нормы — команда /MinTop"
-LEAGUE_REMINDER = "⚠️ А также не забывай про лигу! К сожалению, бот не может её посмотреть :("
+LEAGUE_REMINDER = "ℹ️ Лига сверяется по максимальному рангу за текущий сезон."
 
 CLAN_SHORT = {"squad": "Основа", "academy": "Академия"}
 
@@ -251,8 +251,8 @@ def _mintop_text(mins: dict) -> str:
     )
 
 
-async def _player_trophies(member: dict) -> tuple[int, bool]:
-    """(кубки игрока, live): актуальные из Brawl Stars API, при сбое API — из базы."""
+async def _player_trophies(member: dict) -> tuple[int, bool, dict]:
+    """(кубки игрока, live, профиль API): при сбое API — кубки из базы."""
     tag = member.get("player_tag")
     if tag:
         try:
@@ -261,16 +261,18 @@ async def _player_trophies(member: dict) -> tuple[int, bool]:
             profile = None
         if profile:
             try:
-                return int(profile.get("trophies") or 0), True
+                return int(profile.get("trophies") or 0), True, profile
             except (TypeError, ValueError):
                 pass
     try:
-        return int(member.get("trophies") or 0), False
+        return int(member.get("trophies") or 0), False, {}
     except (TypeError, ValueError):
-        return 0, False
+        return 0, False, {}
 
 
-def _mintop_progress_text(trophies: int, live: bool, goal, mins: dict, clan: str) -> str:
+def _mintop_progress_text(
+    trophies: int, live: bool, goal, mins: dict, clan: str, rank_value=None
+) -> str:
     """Личный блок /MinTop: сколько трофеев осталось до нормы выбранной цели."""
     source = "" if live else " (по данным последнего обновления) "
     lines = ["━━━━━━━", "🎯 Твой прогресс "]
@@ -286,7 +288,7 @@ def _mintop_progress_text(trophies: int, live: bool, goal, mins: dict, clan: str
         target = int(mins.get(key) or 0)
         variants.append((target, league, target - trophies))
     if all(left <= 0 for _, _, left in variants):
-        lines.append("✅ Обе нормы по кубкам добраны — остаётся проверить лигу вручную.")
+        lines.append("✅ Обе нормы по кубкам добраны.")
     else:
         for target, league, left in variants:
             if left <= 0:
@@ -294,6 +296,11 @@ def _mintop_progress_text(trophies: int, live: bool, goal, mins: dict, clan: str
             else:
                 status = f"осталось добрать {fmt_num(left)} 🏆"
             lines.append(f"• до {fmt_num(target)} 🏆 (вариант с лигой {league}) — {status}")
+    for _, league, _ in variants:
+        league_ok, league_note = league_check(league, rank_value)
+        if league_ok is None:
+            league_note = f"⚠️ проверить вручную (нужна {league})"
+        lines.append(f"   лига {league}: {league_note}")
     lines.append("")
     lines.append(LEAGUE_REMINDER)
     return "\n".join(lines)
@@ -973,6 +980,7 @@ async def _push_report_clan(clan: str) -> str:
             chosen.append({
                 "nick": nick, "goal": goal, "current": current,
                 "target": target, "league": league, "left": left, "start": start,
+                "rank": m.get("ranked_season_max_rank") or m.get("ranked_rank_name"),
             })
         else:
             rank_label = ranked_rank_label(
@@ -1004,12 +1012,17 @@ async def _push_report_clan(clan: str) -> str:
         else:
             lines.append(f"   сделал: — (старт не зафиксирован), сейчас {fmt_num(item['current'])} 🏆")
         if item["left"] <= 0:
-            lines.append(f"   цель: {fmt_num(item['target'])} 🏆 — ✅ выполнено, проверить лигу: {item['league']}")
+            lines.append(f"   цель: {fmt_num(item['target'])} 🏆 — ✅ выполнено")
         else:
             lines.append(
                 f"   цель: {fmt_num(item['target'])} 🏆 ({item['league']}), "
                 f"осталось {_fmt_delta(item['left'])} 🏆"
             )
+        league_ok, league_note = league_check(item["league"], item["rank"])
+        if league_ok is None:
+            lines.append(f"   ⚠️ лига: проверить вручную (нужна {item['league']})")
+        else:
+            lines.append(f"   {league_note}")
 
     lines += ["", f"❓ <b>Не выбрали цель ({len(unvoted)}):</b>"]
     if not unvoted:
@@ -1020,8 +1033,8 @@ async def _push_report_clan(clan: str) -> str:
 
     lines += [
         "",
-        "ℹ️ Кубки — по последнему обновлению ростера; лигу бот не проверяет.",
-        "ℹ️ Ранкед — максимальный ранг за текущий сезон; «—» — API не отдаёт.",
+        "ℹ️ Кубки — по последнему обновлению ростера; лига — по максимальному рангу за сезон.",
+        "ℹ️ Ранкед: «—» — API не отдал данные, тогда лигу проверяет администрация вручную.",
     ]
     return "\n".join(lines)
 
@@ -1074,7 +1087,7 @@ async def cmd_min_top(message: Message):
     if mins["top_trophies"] <= 0:
         await message.answer("Пока нет данных по кубкам топ-1 клана — подожди обновление ростера.")
         return
-    trophies, live = await _player_trophies(member or {})
+    trophies, live, profile = await _player_trophies(member or {})
     goal = None
     for g in await get_push_goals():
         gw = g.get("user_id")
@@ -1087,8 +1100,11 @@ async def cmd_min_top(message: Message):
         except (TypeError, ValueError):
             continue
     text = _mintop_text(mins)
-    text += "\n" + _mintop_progress_text(trophies, live, goal, mins, clan)
-    text += "\nЛигу бот не видит — её администрация проверяет вручную. "
+    rank_value = (
+        (profile or {}).get("ranked_season_max_rank")
+        or (profile or {}).get("ranked_rank_name")
+    )
+    text += "\n" + _mintop_progress_text(trophies, live, goal, mins, clan, rank_value)
     await message.answer(text, parse_mode="HTML")
 
 

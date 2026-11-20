@@ -1,20 +1,22 @@
 """ Модуль контроля сезонных норм пуша.
 Нормы по трофеям = трофеи ТОП-1 участника клана / коэффициент (коэффициенты — по кланам:
 у Основы свои, у Академии свои; тексты анкет для игроков — в utils/formatting.py).
-Минималки по лиге бот НЕ проверяет — администрация сверяет их вручную,
-в отчёте для каждого игрока написано, какую лигу проверить.
+Лига сверяется автоматически по максимальному рангу за текущий сезон;
+если API не отдал ранг, в отчёте остаётся пометка «проверить вручную».
 """
 import asyncio
 import json
 import logging
 import sqlite3
 from datetime import datetime
+from typing import Optional, Tuple
 
 from aiogram import Bot
 from aiogram.utils.markdown import html_decoration as hd
 
 from database import DB_PATH, get_all_members, get_push_goals, get_setting, set_setting
 from services.api_service import get_player_profile
+from utils.formatting import ranked_rank_label
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +29,56 @@ RANKED_LABELS = {
     16: "Легенда I", 17: "Легенда II", 18: "Легенда III",
     19: "Мастер",
 }
+
+# Первое слово ранга -> номер уровня, с которого начинается лига.
+_RANK_BASES = {
+    "БРОНЗА": 0, "BRONZE": 0,
+    "СЕРЕБРО": 3, "SILVER": 3,
+    "ЗОЛОТО": 6, "GOLD": 6,
+    "АЛМАЗ": 9, "DIAMOND": 9,
+    "МИФИК": 12, "MYTHIC": 12,
+    "ЛЕГЕНДА": 15, "ЛЕГА": 15, "LEGENDARY": 15, "LEGEND": 15,
+    "МАСТЕР": 18, "МАСТЕРС": 18, "MASTER": 18, "MASTERS": 18,
+}
+_RANK_TIERS = {"I": 1, "II": 2, "III": 3, "IV": 4}
+
+
+def rank_level(value) -> Optional[int]:
+    """'MYTHIC II' / 'Мифик 2' / 'Лега 3' -> 14 / 14 / 18."""
+    parts = str(value or "").strip().upper().replace("-", " ").split()
+    if not parts:
+        return None
+    base = _RANK_BASES.get(parts[0])
+    if base is None:
+        return None
+    tier = 1
+    if len(parts) > 1:
+        token = parts[1]
+        if token in _RANK_TIERS:
+            tier = _RANK_TIERS[token]
+        else:
+            try:
+                tier = int(token)
+            except (TypeError, ValueError):
+                tier = 1
+    return min(base + tier, 19)
+
+
+def league_check(required, rank_value) -> Tuple[Optional[bool], str]:
+    """
+    Сверяет требуемую лигу с максимальным рангом игрока за сезон.
+
+    Возвращает (True/False/None, текст). None — API не отдал ранг.
+    """
+    need = rank_level(required)
+    have = rank_level(rank_value)
+    if need is None or have is None:
+        return None, ""
+    have_label = ranked_rank_label(rank_value) or str(rank_value)
+    if have >= need:
+        return True, f"✅ лига есть ({have_label})"
+    return False, f"❌ лига не добрана: сейчас {have_label}, нужно {required}"
+
 
 # Кланы, для которых работает пуш-сезон (Основа + Академия)
 PUSH_CLANS = ("squad", "academy")
@@ -271,9 +323,9 @@ async def start_new_push_season(clan: str = "squad") -> dict:
 # ─── Финиш сезона ────────────────────────────────────────────────────────────
 
 async def check_season_results(bot: Bot, clan: str = "squad") -> str:
-    """Вызывается В КОНЦЕ сезона. Автоматически проверяются только трофеи
-    (по актуальным данным Brawl Stars API). Для каждого, кто добрал трофеи,
-    указано, какую минимальную лигу проверить вручную.
+    """Вызывается В КОНЦЕ сезона. Трофеи и лига проверяются автоматически
+    по актуальным данным Brawl Stars API (лига — по максимуму за сезон).
+    Если API не отдал ранг, остаётся пометка «проверить вручную».
     """
     goals_map = {}
     for g in await get_push_goals():
@@ -290,7 +342,7 @@ async def check_season_results(bot: Bot, clan: str = "squad") -> str:
     x = mins["top_trophies"]
     clan_title = clan.upper()
 
-    done, failed, api_errors, unvoted = [], [], [], []
+    done, failed, league_failed, api_errors, unvoted = [], [], [], [], []
     for m in members:
         uid = _safe_int(m.get("user_id"))
         nick = hd.quote(str(m.get("game_nick") or m.get("username") or f"ID {uid}"))
@@ -333,10 +385,29 @@ async def check_season_results(bot: Bot, clan: str = "squad") -> str:
                          f"или {fmt_num(mins['league_alt'])} (+ {norms['league_alt'][1]})")
 
         label = GOAL_LABELS[goal]
-        if need:
-            done.append(f"• {nick} ({label}) — {fmt_num(trophies)} 🏆 → проверить лигу: минимум {need} ")
+        if not need:
+            failed.append(
+                f"• {nick} ({label}) — {fmt_num(trophies)} 🏆, {fail_hint}"
+            )
+            continue
+
+        # Лигу сверяем по максимальному рангу за текущий сезон.
+        rank_value = (
+            profile.get("ranked_season_max_rank")
+            or profile.get("ranked_rank_name")
+        )
+        league_ok, league_note = league_check(need, rank_value)
+        if league_ok is True:
+            done.append(f"• {nick} ({label}) — {fmt_num(trophies)} 🏆 · {league_note}")
+        elif league_ok is False:
+            league_failed.append(
+                f"• {nick} ({label}) — {fmt_num(trophies)} 🏆, {league_note}"
+            )
         else:
-            failed.append(f"• {nick} ({label}) — {fmt_num(trophies)} 🏆, {fail_hint}")
+            done.append(
+                f"• {nick} ({label}) — {fmt_num(trophies)} 🏆 → "
+                f"проверить лигу вручную: минимум {need}"
+            )
 
     norm_line = " · ".join(
         f"X/{norms[key][0]} = {fmt_num(mins[key])}" for key in
@@ -346,14 +417,21 @@ async def check_season_results(bot: Bot, clan: str = "squad") -> str:
         f"📊 ИТОГИ СЕЗОНА ПУША ({clan_title}) ",
         f"👑 ТОП-1 клана (X): {hd.quote(mins['top_nick'])} — {fmt_num(x)} 🏆",
         f"Нормы: {norm_line}",
-        "⚠️ Лигу бот не проверяет — сверьте вручную по пометке «проверить лигу». ",
+        "ℹ️ Лига сверяется по максимальному рангу за текущий сезон; "
+        "где API не отдал ранг — проверьте вручную.",
         "━━━━━━━",
-        "✅ ТРОФЕИ ВЫПОЛНЕНЫ: ",
+        "✅ ТРОФЕИ И ЛИГА ВЫПОЛНЕНЫ: ",
         *(done or [" — нет игроков"]),
         "",
         "❌ НЕ ДОБРАЛИ ТРОФЕИ (ШТРАФНИКИ): ",
         *(failed or [" — нет игроков"]),
     ]
+    if league_failed:
+        lines += [
+            "",
+            "⚖️ ТРОФЕИ ЕСТЬ, ЛИГА НЕ ДОБРАНА: ",
+            *league_failed,
+        ]
     if api_errors:
         lines += ["", "⚠️ ОШИБКА API: ", *api_errors]
     if unvoted:
