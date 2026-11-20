@@ -1011,9 +1011,14 @@ async def _push_report_clan(clan: str) -> str:
     if not unvoted:
         lines.append("— нет игроков")
     for i, item in enumerate(unvoted, 1):
-        lines.append(f"{i}. {item['nick']} — {fmt_num(item['current'])} 🏆 · ELO {fmt_num(item['elo'])}")
+        elo_text = f"ELO {fmt_num(item['elo'])}" if item["elo"] else "ELO —"
+        lines.append(f"{i}. {item['nick']} — {fmt_num(item['current'])} 🏆 · {elo_text}")
 
-    lines += ["", "ℹ️ Кубки — по последнему обновлению ростера; лигу бот не проверяет."]
+    lines += [
+        "",
+        "ℹ️ Кубки — по последнему обновлению ростера; лигу бот не проверяет.",
+        "ℹ️ ELO показывается из профиля, если Brawl API его отдаёт; «—» — данных нет.",
+    ]
     return "\n".join(lines)
 
 
