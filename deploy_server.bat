@@ -16,7 +16,7 @@ echo.
 echo ==============================================
 echo [2/2] Updating and restarting bot on server...
 echo ==============================================
-ssh root@185.251.38.246 "cd ~/VigarikSQD && chmod +x update.sh && ./update.sh"
+ssh root@45.130.254.28 "cd ~/VigarikSQD && chmod +x update.sh && ./update.sh"
 if errorlevel 1 (
     echo.
     echo ERROR: server update script failed. Check the output above.
@@ -31,7 +31,7 @@ echo ==============================================
 
 set /p show_logs="Open bot logs console (screen -r vigarik_bot)? (Y/N): "
 if /i "%show_logs%"=="Y" (
-    ssh -t root@185.251.38.246 "screen -r vigarik_bot"
+    ssh -t root@45.130.254.28 "screen -r vigarik_bot"
 )
 
 pause
